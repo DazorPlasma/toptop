@@ -1,0 +1,17 @@
+[package]
+name = "btop-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+dlmalloc = { version = "0.2.6", features = ["global"] }
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
+strip = true
