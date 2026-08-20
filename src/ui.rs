@@ -15,8 +15,8 @@ use ratatui::{
 use crate::{
     process::{ProcessInfo, ProcessSortColumn},
     system::{
-        BatteryInfo, DiskIoInfo, DockerStorageInfo, GpuMetrics, MemoryMetrics, MountInfo,
-        NetInterfaceInfo, SystemGeneralInfo,
+        BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetInterfaceInfo,
+        PackageStorageCategory, SystemGeneralInfo,
     },
     theme::{darken_color, gradient_color, io_gradient_pct, process_cpu_color},
     utils::{format_bytes_dyn, format_freq, format_percent, format_uptime, fuzzy_match},
@@ -1131,8 +1131,7 @@ pub fn render_network_tab(
     }
 }
 
-/// Renders the Disks & Storage (Tab 6) read/write throughput graphs, disk devices, and partition usage bars.
-/// Renders the Disks & Storage (Tab 6) read/write throughput graphs, physical drives, Docker volume space usage, and partition usage bars.
+/// Renders the Disks & Storage (Tab 6) read/write throughput graphs, physical drives, package storage categories, and partition usage bars.
 ///
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
@@ -1141,7 +1140,10 @@ pub fn render_network_tab(
 /// * `disk_mounts` - List of mounted partition usage statistics.
 /// * `disk_read_history` - Historical read speed samples for Braille graphing.
 /// * `disk_write_history` - Historical write speed samples for Braille graphing.
-/// * `docker_info` - Docker / Container engine volume and storage metrics.
+/// * `storage_categories` - Detected package and runtime storage categories.
+/// * `active_cat_idx` - Selected sub-tab category index.
+/// * `scroll_offset` - Vertical scroll offset within the active category's item list.
+#[allow(clippy::too_many_arguments)]
 pub fn render_disks_tab(
     frame: &mut Frame,
     area: Rect,
@@ -1149,7 +1151,9 @@ pub fn render_disks_tab(
     disk_mounts: &[MountInfo],
     disk_read_history: &[Option<f64>],
     disk_write_history: &[Option<f64>],
-    docker_info: &DockerStorageInfo,
+    storage_categories: &[PackageStorageCategory],
+    active_cat_idx: usize,
+    scroll_offset: usize,
 ) {
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1250,147 +1254,143 @@ pub fn render_disks_tab(
         }
     }
 
-    // Bottom-Left: Docker Volume Space Usage
-    let docker_block = Block::default()
-        .title(" Docker Volume Storage ".fg(Color::Rgb(170, 170, 170)))
+    // Bottom-Left: Package & Application Storage Sub-Tabs
+    let card_title = if storage_categories.is_empty() {
+        " Storage ".to_string()
+    } else {
+        let cat_idx = active_cat_idx.min(storage_categories.len().saturating_sub(1));
+        format!(" {} ", storage_categories[cat_idx].name)
+    };
+    let pkg_block = Block::default()
+        .title(card_title.fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let docker_inner = docker_block.inner(bottom_chunks[0]);
-    frame.render_widget(docker_block, bottom_chunks[0]);
+    let pkg_inner = pkg_block.inner(bottom_chunks[0]);
+    frame.render_widget(pkg_block, bottom_chunks[0]);
 
-    if docker_inner.height > 0 && docker_inner.width > 0 {
-        if !docker_info.is_available {
-            let msg = "Docker daemon inactive or not accessible";
-            let sub = "Start Docker daemon to inspect volume and container storage";
-            let row = docker_inner.y + 1;
+    if pkg_inner.height > 0 && pkg_inner.width > 0 {
+        if storage_categories.is_empty() {
+            let msg = "Scanning package and runtime storage in background...";
+            let sub = "(Supported: Docker, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm • 20s refresh)";
+            let row = pkg_inner.y + 1;
             for (c_idx, ch) in msg.chars().enumerate() {
-                let col = docker_inner.x + 2 + c_idx as u16;
-                if col < docker_inner.right() {
+                let col = pkg_inner.x + 2 + c_idx as u16;
+                if col < pkg_inner.right() {
                     frame.buffer_mut()[(col, row)]
                         .set_char(ch)
                         .set_style(Style::default().fg(Color::Rgb(120, 120, 120)));
                 }
             }
-            let row2 = docker_inner.y + 2;
+            let row2 = pkg_inner.y + 2;
             for (c_idx, ch) in sub.chars().enumerate() {
-                let col = docker_inner.x + 2 + c_idx as u16;
-                if col < docker_inner.right() {
-                    frame.buffer_mut()[(col, row2)]
-                        .set_char(ch)
-                        .set_style(Style::default().fg(Color::Rgb(80, 80, 80)));
-                }
-            }
-        } else if docker_info.volumes.is_empty() {
-            let msg = "No local Docker volumes found";
-            let sub = if !docker_info.total_build_cache_str.is_empty() {
-                format!("Build Cache: {}", docker_info.total_build_cache_str)
-            } else {
-                "0 volumes created".to_string()
-            };
-            let row = docker_inner.y + 1;
-            for (c_idx, ch) in msg.chars().enumerate() {
-                let col = docker_inner.x + 2 + c_idx as u16;
-                if col < docker_inner.right() {
-                    frame.buffer_mut()[(col, row)]
-                        .set_char(ch)
-                        .set_style(Style::default().fg(Color::Rgb(120, 120, 120)));
-                }
-            }
-            let row2 = docker_inner.y + 2;
-            for (c_idx, ch) in sub.chars().enumerate() {
-                let col = docker_inner.x + 2 + c_idx as u16;
-                if col < docker_inner.right() {
+                let col = pkg_inner.x + 2 + c_idx as u16;
+                if col < pkg_inner.right() {
                     frame.buffer_mut()[(col, row2)]
                         .set_char(ch)
                         .set_style(Style::default().fg(Color::Rgb(80, 80, 80)));
                 }
             }
         } else {
-            let mut summary_line = format!(
-                "Total Volumes: {} ({} volume{})",
-                docker_info.total_volumes_str,
-                docker_info.volumes.len(),
-                if docker_info.volumes.len() == 1 {
-                    ""
+            let cat_idx = active_cat_idx.min(storage_categories.len().saturating_sub(1));
+            let active_cat = &storage_categories[cat_idx];
+            let total_items = active_cat.items.len();
+            let start_idx = scroll_offset.min(total_items.saturating_sub(1));
+
+            // 1. Render Sub-Tabs Header Line
+            let mut tab_col = pkg_inner.x;
+            for (i, cat) in storage_categories.iter().enumerate() {
+                let is_active = i == cat_idx;
+                let tab_label = if is_active {
+                    format!("[ ▶ {} ({}) ] ", cat.name, cat.total_str)
                 } else {
-                    "s"
-                }
-            );
-            if !docker_info.total_build_cache_str.is_empty() {
-                summary_line.push_str(&format!(
-                    "  •  Build Cache: {}",
-                    docker_info.total_build_cache_str
-                ));
-            }
-            let row0 = docker_inner.y;
-            for (c_idx, ch) in summary_line.chars().enumerate() {
-                let col = docker_inner.x + c_idx as u16;
-                if col < docker_inner.right() {
-                    frame.buffer_mut()[(col, row0)]
-                        .set_char(ch)
-                        .set_style(Style::default().fg(Color::Rgb(220, 220, 220)).bold());
+                    format!("[ {} ({}) ] ", cat.name, cat.total_str)
+                };
+
+                let style = if is_active {
+                    Style::default()
+                        .fg(Color::Rgb(255, 255, 255))
+                        .bold()
+                        .bg(Color::Rgb(40, 40, 40))
+                } else {
+                    Style::default().fg(Color::Rgb(130, 130, 130))
+                };
+
+                for ch in tab_label.chars() {
+                    if tab_col < pkg_inner.right() {
+                        frame.buffer_mut()[(tab_col, pkg_inner.y)]
+                            .set_char(ch)
+                            .set_style(style);
+                        tab_col += 1;
+                    }
                 }
             }
 
-            let max_vol_bytes = docker_info
-                .volumes
+            // 2. Items list with scroll offset
+            let max_item_bytes = active_cat
+                .items
                 .iter()
-                .map(|v| v.size_bytes)
+                .map(|it| it.size_bytes)
                 .max()
                 .unwrap_or(1)
                 .max(1);
 
             let mut row_offset = 2;
-            for vol in &docker_info.volumes {
-                if row_offset + 2 > docker_inner.height {
+            for item in active_cat.items.iter().skip(start_idx) {
+                if row_offset + 2 > pkg_inner.height {
                     break;
                 }
-                let links_label = if vol.links == 1 {
-                    "1 link".to_string()
+                let display_name = if item.name.len() > 42 {
+                    format!("{}…", &item.name[..41])
                 } else {
-                    format!("{} links", vol.links)
+                    item.name.clone()
                 };
-                let display_name = if vol.name.len() > 42 {
-                    format!("{}…", &vol.name[..41])
+                let header = if item.detail.is_empty() {
+                    format!("• {}", display_name)
                 } else {
-                    vol.name.clone()
+                    format!("• {} [{}]", display_name, item.detail)
                 };
-                let header = format!("• {} [{}]", display_name, links_label);
-                let row1 = docker_inner.y + row_offset;
-                let row2 = row1 + 1;
+                let row_h = pkg_inner.y + row_offset;
+                let row_b = row_h + 1;
 
                 for (c_idx, ch) in header.chars().enumerate() {
-                    let col = docker_inner.x + c_idx as u16;
-                    if col < docker_inner.right() {
-                        let color = if vol.links > 0 {
-                            Color::Rgb(255, 255, 255)
-                        } else {
-                            Color::Rgb(160, 160, 160)
-                        };
-                        frame.buffer_mut()[(col, row1)]
+                    let col = pkg_inner.x + c_idx as u16;
+                    if col < pkg_inner.right() {
+                        frame.buffer_mut()[(col, row_h)]
                             .set_char(ch)
-                            .set_style(Style::default().fg(color).bold());
+                            .set_style(Style::default().fg(Color::Rgb(240, 240, 240)).bold());
                     }
                 }
 
-                let vol_pct = (vol.size_bytes as f64 / max_vol_bytes as f64) * 100.0;
-                let right_label = format!("{} ({} links)", vol.size_str, vol.links);
-                let bar_area = Rect::new(
-                    docker_inner.x + 2,
-                    row2,
-                    docker_inner.width.saturating_sub(2),
-                    1,
-                );
-                draw_labeled_bar(
-                    frame.buffer_mut(),
-                    bar_area,
-                    "Size: ",
-                    &right_label,
-                    vol_pct,
-                );
-
-                row_offset += 3;
+                if item.size_bytes > 0 {
+                    let item_pct = (item.size_bytes as f64 / max_item_bytes as f64) * 100.0;
+                    let right_label = item.size_str.clone();
+                    let bar_area =
+                        Rect::new(pkg_inner.x + 2, row_b, pkg_inner.width.saturating_sub(2), 1);
+                    draw_labeled_bar(
+                        frame.buffer_mut(),
+                        bar_area,
+                        "Size: ",
+                        &right_label,
+                        item_pct,
+                    );
+                    row_offset += 3;
+                } else {
+                    let right_label = item.size_str.clone();
+                    let row_sub = row_h;
+                    let r_col = pkg_inner
+                        .right()
+                        .saturating_sub(right_label.len() as u16 + 1);
+                    for (c_idx, ch) in right_label.chars().enumerate() {
+                        let col = r_col + c_idx as u16;
+                        if col < pkg_inner.right() {
+                            frame.buffer_mut()[(col, row_sub)]
+                                .set_char(ch)
+                                .set_style(Style::default().fg(Color::Rgb(140, 140, 140)));
+                        }
+                    }
+                    row_offset += 2;
+                }
             }
         }
     }

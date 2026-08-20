@@ -25,6 +25,7 @@ mod utils;
 use std::{
     collections::HashMap,
     io,
+    sync::mpsc::{Receiver, Sender, channel},
     time::{Duration, Instant},
 };
 
@@ -51,9 +52,10 @@ use crate::{
         sort_processes,
     },
     system::{
-        calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery, read_cpu_freq_info,
-        read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts, read_docker_storage,
-        read_gpu_metrics, read_memory, read_network_interfaces, read_system_general_info,
+        PackageStorageCategory, calculate_usage, get_cpu_model, get_ram_info, get_users,
+        read_battery, read_cpu_freq_info, read_cpu_temp, read_cpu_ticks, read_disk_io,
+        read_disk_mounts, read_gpu_metrics, read_memory, read_network_interfaces,
+        read_package_storage_categories, read_system_general_info,
     },
     theme::io_gradient_pct,
     ui::{
@@ -134,7 +136,29 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut prev_disk = HashMap::new();
     let mut disk_mounts = read_disk_mounts();
     let mut disk_io = read_disk_io(&mut prev_disk, 0.0);
-    let mut docker_info = read_docker_storage();
+
+    let (storage_tx, storage_rx): (
+        Sender<Vec<PackageStorageCategory>>,
+        Receiver<Vec<PackageStorageCategory>>,
+    ) = channel();
+
+    // Spawn background worker for async 20-second package storage scans
+    std::thread::Builder::new()
+        .name("storage-scanner".to_string())
+        .spawn(move || {
+            loop {
+                let cats = read_package_storage_categories();
+                if storage_tx.send(cats).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(20));
+            }
+        })
+        .expect("failed to spawn storage scanner thread");
+
+    let mut storage_categories = Vec::new();
+    let mut disks_sub_tab = 0;
+    let mut disks_scroll_offset = 0;
 
     let cpu_model = get_cpu_model();
     let mut io_buf = String::with_capacity(8192);
@@ -182,6 +206,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut copy_feedback_until: Option<Instant> = None;
 
     loop {
+        while let Ok(new_cats) = storage_rx.try_recv() {
+            storage_categories = new_cats;
+            if !storage_categories.is_empty() && disks_sub_tab >= storage_categories.len() {
+                disks_sub_tab = storage_categories.len() - 1;
+            }
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
 
@@ -310,7 +341,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         &disk_mounts,
                         &disk_read_history,
                         &disk_write_history,
-                        &docker_info,
+                        &storage_categories,
+                        disks_sub_tab,
+                        disks_scroll_offset,
                     );
                 }
                 _ => {}
@@ -554,6 +587,44 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 };
                                 table_state.select(Some(i));
                             }
+                            _ => {}
+                        }
+                    } else if current_tab == 5 {
+                        match key.code {
+                            KeyCode::Left | KeyCode::Char('h') => {
+                                if !storage_categories.is_empty() {
+                                    disks_sub_tab = if disks_sub_tab == 0 {
+                                        storage_categories.len() - 1
+                                    } else {
+                                        disks_sub_tab - 1
+                                    };
+                                    disks_scroll_offset = 0;
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Char('l') => {
+                                if !storage_categories.is_empty() {
+                                    disks_sub_tab = (disks_sub_tab + 1) % storage_categories.len();
+                                    disks_scroll_offset = 0;
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                disks_scroll_offset = disks_scroll_offset.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                disks_scroll_offset = disks_scroll_offset.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                disks_scroll_offset = disks_scroll_offset.saturating_sub(5);
+                            }
+                            KeyCode::PageDown => {
+                                disks_scroll_offset = disks_scroll_offset.saturating_add(5);
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                disks_scroll_offset = 0;
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                disks_scroll_offset = usize::MAX;
+                            }
                             KeyCode::Char(' ') => {
                                 is_paused = !is_paused;
                             }
@@ -664,6 +735,42 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             }
                             _ => {}
                         }
+                    } else if current_tab == 5 {
+                        let bottom_y = table_area.y + table_area.height / 2;
+                        let tab_row_y = bottom_y + 1;
+                        let left_w = (table_area.width * 70) / 100;
+                        match mouse_event.kind {
+                            MouseEventKind::ScrollDown => {
+                                disks_scroll_offset = disks_scroll_offset.saturating_add(2);
+                            }
+                            MouseEventKind::ScrollUp => {
+                                disks_scroll_offset = disks_scroll_offset.saturating_sub(2);
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let mx = mouse_event.column;
+                                let my = mouse_event.row;
+                                if my == tab_row_y
+                                    && mx > table_area.x
+                                    && mx < table_area.x + left_w
+                                {
+                                    let mut cur_x = table_area.x + 1;
+                                    for (i, cat) in storage_categories.iter().enumerate() {
+                                        let tab_len =
+                                            format!("[ ▶ {} ({}) ] ", cat.name, cat.total_str)
+                                                .chars()
+                                                .count()
+                                                as u16;
+                                        if mx >= cur_x && mx < cur_x + tab_len {
+                                            disks_sub_tab = i;
+                                            disks_scroll_offset = 0;
+                                            break;
+                                        }
+                                        cur_x += tab_len;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
@@ -714,7 +821,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
             disk_mounts = read_disk_mounts();
             disk_io = read_disk_io(&mut prev_disk, dt);
-            docker_info = read_docker_storage();
             let d_read_pct = io_gradient_pct(disk_io.read_speed);
             let d_write_pct = io_gradient_pct(disk_io.write_speed);
 
