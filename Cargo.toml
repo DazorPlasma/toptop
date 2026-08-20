@@ -1,5 +1,5 @@
 [package]
-name = "btop-rs"
+name = "toptop"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,6 +7,7 @@ edition = "2024"
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 dlmalloc = { version = "0.2.6", features = ["global"] }
+rustix = { version = "0.38", features = ["fs", "process"] }
 
 
 [profile.release]
@@ -15,3 +16,4 @@ codegen-units = 1
 panic = "abort"
 opt-level = "z"
 strip = true
+

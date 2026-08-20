@@ -1,270 +1,146 @@
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+#![deny(clippy::missing_docs_in_private_items)]
+
+//! # toptop
+//!
+//! A fast, memory-efficient, real-time Linux terminal system monitor and resource visualizer
+//! written in Rust with Ratatui and Unicode Braille graphics.
+
+/// Global memory allocator using `dlmalloc` to minimize heap metadata overhead.
 #[global_allocator]
 static ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
 
+/// Process metrics and table sorting module.
+mod process;
+/// System telemetry and hardware probe module.
+mod system;
+/// Theme, multi-stop linear gradient, and color calculation module.
+mod theme;
+/// User interface layout and Ratatui rendering engine.
+mod ui;
+/// Formatter utilities, fuzzy searching, and clipboard helpers.
+mod utils;
+
 use std::{
     collections::HashMap,
-    fs, io,
+    io,
     time::{Duration, Instant},
 };
 
 use crossterm::{
     ExecutableCommand,
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton,
+        MouseEventKind,
+    },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style, Stylize},
-    symbols,
-    widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, Gauge, GraphType, LineGauge, Tabs, Table, Row, Cell, TableState},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
     text::Line,
+    widgets::{Block, BorderType, Borders, TableState, Tabs},
 };
 
-#[derive(Default, Clone, Copy)]
-struct CpuTicks {
-    user: u64,
-    nice: u64,
-    system: u64,
-    idle: u64,
-    iowait: u64,
-    irq: u64,
-    softirq: u64,
-    steal: u64,
-}
+use crate::{
+    process::{
+        ADVANCED_SORT_COLUMNS, NORMAL_SORT_COLUMNS, ProcessInfo, ProcessSortColumn, read_processes,
+        sort_processes,
+    },
+    system::{
+        calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery, read_cpu_freq_info,
+        read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts, read_docker_storage,
+        read_gpu_metrics, read_memory, read_network_interfaces, read_system_general_info,
+    },
+    theme::io_gradient_pct,
+    ui::{
+        format_system_overview_copy_text, render_cpu_ram_tab, render_disks_tab, render_general_tab,
+        render_gpu_tab, render_network_tab, render_process_tab,
+    },
+    utils::{copy_to_clipboard, fuzzy_match},
+};
 
-impl CpuTicks {
-    fn total(&self) -> u64 {
-        self.user
-            + self.nice
-            + self.system
-            + self.idle
-            + self.iowait
-            + self.irq
-            + self.softirq
-            + self.steal
-    }
-    fn idle_time(&self) -> u64 {
-        self.idle + self.iowait
-    }
-}
-
-fn read_cpu_ticks(buf: &mut String, cpus: &mut Vec<CpuTicks>) {
-    cpus.clear();
-    buf.clear();
-    if let Ok(mut file) = fs::File::open("/proc/stat") {
-        use std::io::Read;
-        if file.read_to_string(buf).is_ok() {
-            for line in buf.lines() {
-                if line.starts_with("cpu") {
-                    let mut parts = line.split_whitespace();
-                    parts.next(); // skip "cpu..."
-                    let user = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    let nice = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    let system = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    let idle = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    let iowait = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    let irq = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    let softirq = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    let steal = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                    cpus.push(CpuTicks {
-                        user, nice, system, idle, iowait, irq, softirq, steal
-                    });
-                }
-            }
-        }
-    }
-}
-
-fn calculate_usage(prev: &CpuTicks, curr: &CpuTicks) -> f64 {
-    let prev_total = prev.total();
-    let curr_total = curr.total();
-    let total_diff = curr_total.saturating_sub(prev_total);
-    if total_diff == 0 {
-        return 0.0;
-    }
-    let prev_idle = prev.idle_time();
-    let curr_idle = curr.idle_time();
-    let idle_diff = curr_idle.saturating_sub(prev_idle);
-
-    100.0 * (total_diff as f64 - idle_diff as f64) / total_diff as f64
-}
-
-fn read_memory(buf: &mut String) -> (u64, u64) {
-    let mut total = 0;
-    let mut available = 0;
-    buf.clear();
-    if let Ok(mut file) = fs::File::open("/proc/meminfo") {
-        use std::io::Read;
-        if file.read_to_string(buf).is_ok() {
-            for line in buf.lines() {
-                if line.starts_with("MemTotal:") {
-                    total = line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("0")
-                        .parse()
-                        .unwrap_or(0);
-                } else if line.starts_with("MemAvailable:") {
-                    available = line
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or("0")
-                        .parse()
-                        .unwrap_or(0);
-                }
-            }
-        }
-    }
-    // Convert KB to MB
-    ((total / 1024), ((total.saturating_sub(available)) / 1024))
-}
-#[derive(Clone, Default)]
-struct ProcessInfo {
-    pid: u32,
-    name: String,
-    state: String,
-    rss_kb: u64,
-    utime: u64,
-    stime: u64,
-    read_bytes: u64,
-    write_bytes: u64,
-    threads: u32,
-    uid: u32,
-    user: String,
-    cpu_percent: f64,
-    read_speed: f64,
-    write_speed: f64,
-}
-
-fn get_users() -> HashMap<u32, String> {
-    let mut users = HashMap::new();
-    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
-        for line in passwd.lines() {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() >= 3 {
-                if let Ok(uid) = parts[2].parse::<u32>() {
-                    users.insert(uid, parts[0].to_string());
-                }
-            }
-        }
-    }
-    users
-}
-
-fn format_bytes_dyn(bytes: f64) -> String {
-    if bytes < 1024.0 {
-        format!("{:.0} B", bytes)
-    } else if bytes < 1024.0 * 1024.0 {
-        format!("{:.1} KB", bytes / 1024.0)
-    } else if bytes < 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} MB", bytes / 1048576.0)
-    } else if bytes < 1024.0 * 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.1} GB", bytes / 1073741824.0)
-    } else {
-        format!("{:.1} TB", bytes / 1099511627776.0)
-    }
-}
-
-fn read_processes(prev_procs: &mut HashMap<u32, ProcessInfo>, users: &HashMap<u32, String>, dt: f64) -> Vec<ProcessInfo> {
-    let mut procs = Vec::new();
-    let mut new_prev_procs = HashMap::new();
-    
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.filter_map(Result::ok) {
-            let file_name = entry.file_name();
-            let file_name_str = file_name.to_string_lossy();
-            if let Ok(pid) = file_name_str.parse::<u32>() {
-                let mut p = ProcessInfo { pid, ..Default::default() };
-                
-                if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
-                    for line in status.lines() {
-                        if line.starts_with("Name:") {
-                            p.name = line.trim_start_matches("Name:").trim().to_string();
-                        } else if line.starts_with("State:") {
-                            p.state = line.trim_start_matches("State:").trim().to_string();
-                        } else if line.starts_with("VmRSS:") {
-                            let mut parts = line.split_whitespace();
-                            parts.next();
-                            p.rss_kb = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                        } else if line.starts_with("Uid:") {
-                            let mut parts = line.split_whitespace();
-                            parts.next();
-                            p.uid = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                        }
-                    }
-                }
-                
-                p.user = users.get(&p.uid).cloned().unwrap_or_else(|| p.uid.to_string());
-                
-                if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) {
-                    if let Some(rparen) = stat.rfind(')') {
-                        let rest = &stat[rparen + 1..];
-                        let parts: Vec<&str> = rest.split_whitespace().collect();
-                        if parts.len() >= 18 {
-                            p.utime = parts[11].parse().unwrap_or(0);
-                            p.stime = parts[12].parse().unwrap_or(0);
-                            p.threads = parts[17].parse().unwrap_or(0);
-                        }
-                    }
-                }
-                
-                if let Ok(io) = fs::read_to_string(format!("/proc/{}/io", pid)) {
-                    for line in io.lines() {
-                        if line.starts_with("read_bytes:") {
-                            p.read_bytes = line.trim_start_matches("read_bytes:").trim().parse().unwrap_or(0);
-                        } else if line.starts_with("write_bytes:") {
-                            p.write_bytes = line.trim_start_matches("write_bytes:").trim().parse().unwrap_or(0);
-                        }
-                    }
-                }
-                
-                if let Some(prev) = prev_procs.get(&pid) {
-                    if dt > 0.0 {
-                        let delta_ticks = (p.utime + p.stime).saturating_sub(prev.utime + prev.stime);
-                        p.cpu_percent = (delta_ticks as f64) / dt;
-                        p.read_speed = p.read_bytes.saturating_sub(prev.read_bytes) as f64 / dt;
-                        p.write_speed = p.write_bytes.saturating_sub(prev.write_bytes) as f64 / dt;
-                    }
-                }
-                
-                if p.rss_kb > 0 || !p.name.is_empty() {
-                    new_prev_procs.insert(pid, p.clone());
-                    procs.push(p);
-                }
-            }
-        }
-    }
-    *prev_procs = new_prev_procs;
-    procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb));
-    procs
-}
-
-fn get_color(usage: f64) -> Color {
-    if usage < 50.0 {
-        Color::Rgb(0, 255, 0)
-    } else if usage < 85.0 {
-        Color::Rgb(255, 255, 0)
-    } else {
-        Color::Rgb(255, 0, 0)
-    }
-}
-
+/// Entry point for `toptop`. Initializes terminal raw mode, sets up panic hooks,
+/// runs the event loop, and cleanly restores terminal state on exit.
+///
+/// # Errors
+/// Returns an `io::Result` if terminal initialization or restoration fails.
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
-    io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout()
+        .execute(EnterAlternateScreen)?
+        .execute(EnableMouseCapture)?;
+
+    let original_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(DisableMouseCapture);
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        original_panic(info);
+    }));
+
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let res = run_app(&mut terminal);
 
-    let tick_rate = Duration::from_secs(2);
+    disable_raw_mode()?;
+    io::stdout()
+        .execute(DisableMouseCapture)?
+        .execute(LeaveAlternateScreen)?;
+
+    res
+}
+
+/// Main application event loop and telemetry coordinator.
+///
+/// Manages tab switching, background polling ticks, keyboard navigation,
+/// mouse click/scroll events, and UI redraw triggers.
+///
+/// # Arguments
+/// * `terminal` - Active Ratatui crossterm terminal backend instance.
+///
+/// # Errors
+/// Returns an `io::Result` if frame rendering or event polling fails.
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+    let tick_rate = Duration::from_millis(2000);
     let mut last_tick = Instant::now();
-    let mut cpu_history: Vec<(f64, f64)> = (0..100).map(|i| (i as f64, 0.0)).collect();
-    let mut mem_history: Vec<(f64, f64)> = (0..100).map(|i| (i as f64, 0.0)).collect();
+    let mut is_paused = false;
 
+    let mut sys_info = read_system_general_info();
+    let mut battery = read_battery();
+
+    let mut cpu_history: Vec<Option<f64>> = vec![None; 100];
+    let mut mem_history: Vec<Option<f64>> = vec![None; 100];
+    let mut gpu_history: Vec<Option<f64>> = vec![None; 100];
+    let mut gpu_vram_history: Vec<Option<f64>> = vec![None; 100];
+    let mut gpu_metrics = read_gpu_metrics();
+    gpu_history[99] = Some(gpu_metrics.utilization_pct);
+    let initial_vram_pct = if gpu_metrics.vram_total_mb > 0 {
+        (gpu_metrics.vram_used_mb as f64 / gpu_metrics.vram_total_mb as f64) * 100.0
+    } else {
+        0.0
+    };
+    gpu_vram_history[99] = Some(initial_vram_pct);
+
+    let mut net_rx_history: Vec<Option<f64>> = vec![None; 100];
+    let mut net_tx_history: Vec<Option<f64>> = vec![None; 100];
+    let mut prev_net = HashMap::new();
+    let mut net_ifaces = read_network_interfaces(&mut prev_net, 0.0);
+
+    let mut disk_read_history: Vec<Option<f64>> = vec![None; 100];
+    let mut disk_write_history: Vec<Option<f64>> = vec![None; 100];
+    let mut prev_disk = HashMap::new();
+    let mut disk_mounts = read_disk_mounts();
+    let mut disk_io = read_disk_io(&mut prev_disk, 0.0);
+    let mut docker_info = read_docker_storage();
+
+    let cpu_model = get_cpu_model();
     let mut io_buf = String::with_capacity(8192);
     let mut prev_ticks = Vec::with_capacity(32);
     let mut curr_ticks = Vec::with_capacity(32);
-    
+
     read_cpu_ticks(&mut io_buf, &mut prev_ticks);
 
     // Warmup delay to get initial CPU readings
@@ -273,12 +149,18 @@ fn main() -> io::Result<()> {
 
     let mut global_usage = 0.0;
     let mut core_usages = Vec::new();
-    let (mut total_mem, mut used_mem) = read_memory(&mut io_buf);
+    let mut mem = read_memory(&mut io_buf);
 
-    let mut current_tab = 1;
+    let mut current_tab = 0;
+    let mut advanced_view = false;
+    let mut current_sort_col = ProcessSortColumn::Mem;
+    let mut sort_ascending = false;
+    let mut is_searching = false;
+    let mut search_query = String::new();
     let mut prev_procs = HashMap::new();
     let users = get_users();
     let mut processes = read_processes(&mut prev_procs, &users, 0.0);
+    sort_processes(&mut processes, current_sort_col, sort_ascending);
     let mut table_state = TableState::default();
     table_state.select(Some(0));
 
@@ -288,9 +170,18 @@ fn main() -> io::Result<()> {
             core_usages.push(calculate_usage(&prev_ticks[i], &curr_ticks[i]));
         }
     }
+    cpu_history[99] = Some(global_usage);
+    let m_pct = if mem.total_mem_mb > 0 {
+        (mem.used_mem_mb as f64 / mem.total_mem_mb as f64) * 100.0
+    } else {
+        0.0
+    };
+    mem_history[99] = Some(m_pct);
+
+    let mut table_area = Rect::default();
+    let mut copy_feedback_until: Option<Instant> = None;
 
     loop {
-
         terminal.draw(|frame| {
             let area = frame.area();
 
@@ -300,150 +191,129 @@ fn main() -> io::Result<()> {
                 .constraints([Constraint::Length(3), Constraint::Min(0)])
                 .split(area);
 
-            let titles = vec![Line::from(" Processes (1) "), Line::from(" System (2) ")];
+            table_area = chunks[1];
+
+            let titles = vec![
+                Line::from(" General (1) "),
+                Line::from(" Processes (2) "),
+                Line::from(" CPU & RAM (3) "),
+                Line::from(" GPU (4) "),
+                Line::from(" Network (5) "),
+                Line::from(" Disks (6) "),
+            ];
+            let pause_badge = if is_paused { " [PAUSED] " } else { "" };
+            let tabs_title = format!(
+                " Rust System Monitor (toptop) - 'q' to quit, Space to pause{} ",
+                pause_badge
+            );
             let tabs = Tabs::new(titles)
-                .style(Style::default().fg(Color::Rgb(255, 255, 255)))
+                .style(Style::default().not_bold().fg(Color::Rgb(170, 170, 170)))
                 .select(current_tab)
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Rust System Monitor (btop-rs) - 'q' to quit "))
-                .highlight_style(Style::default().fg(Color::Rgb(0, 255, 255)).bold())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                        .title(tabs_title),
+                )
+                .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold())
                 .divider("|");
-            
+
             frame.render_widget(tabs, chunks[0]);
 
-            if current_tab == 1 {
-                let body_chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(chunks[1]);
+            let (cpu_cur_mhz, cpu_min_mhz, cpu_max_mhz) = read_cpu_freq_info();
+            let cpu_temp = read_cpu_temp();
+            let ram_info = get_ram_info(mem.total_mem_mb, &cpu_model);
+            let is_copied = copy_feedback_until
+                .map(|t| Instant::now() < t)
+                .unwrap_or(false);
 
-                let cpu_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(80), Constraint::Percentage(20)])
-                    .split(body_chunks[0]);
-
-                let dataset = Dataset::default()
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(get_color(global_usage)))
-                    .data(&cpu_history);
-
-                let chart = Chart::new(vec![dataset])
-                    .block(Block::default().title("CPU History".fg(Color::Rgb(255, 255, 255))).borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(0, 100, 0))))
-                    .x_axis(
-                        Axis::default()
-                            .bounds([0.0, 99.0])
-                            .style(Style::default().fg(Color::Rgb(255, 255, 255)))
-                            .labels(vec!["Older".bold().fg(Color::Rgb(255, 255, 255)), "Newer".bold().fg(Color::Rgb(255, 255, 255))]),
-                    )
-                    .y_axis(
-                        Axis::default()
-                            .bounds([0.0, 100.0])
-                            .style(Style::default().fg(Color::Rgb(255, 255, 255)))
-                            .labels(vec!["0%".bold().fg(Color::Rgb(255, 255, 255)), "50%".bold().fg(Color::Rgb(255, 255, 255)), "100%".bold().fg(Color::Rgb(255, 255, 255))]),
+            match current_tab {
+                0 => {
+                    render_general_tab(
+                        frame,
+                        chunks[1],
+                        &sys_info,
+                        battery.as_ref(),
+                        global_usage,
+                        &core_usages,
+                        cpu_cur_mhz,
+                        cpu_min_mhz,
+                        cpu_max_mhz,
+                        cpu_temp,
+                        &cpu_model,
+                        &mem,
+                        &ram_info,
+                        &gpu_metrics,
+                        &net_ifaces,
+                        &disk_io,
+                        &disk_mounts,
+                        &processes,
+                        is_copied,
                     );
-                frame.render_widget(chart, cpu_chunks[0]);
-
-                let cores_block = Block::default()
-                    .title("Cores".fg(Color::Rgb(255, 255, 255)))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Rgb(0, 100, 0)));
-                let cores_inner = cores_block.inner(cpu_chunks[1]);
-                frame.render_widget(cores_block, cpu_chunks[1]);
-
-                let cores_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(vec![Constraint::Ratio(1, core_usages.len().max(1) as u32); core_usages.len().max(1)])
-                    .split(cores_inner);
-
-                for (i, &usage) in core_usages.iter().enumerate() {
-                    let usage_percent = usage.clamp(0.0, 100.0);
-                    let core_gauge = LineGauge::default()
-                        .block(Block::default())
-                        .filled_style(Style::default().fg(get_color(usage)))
-                        .style(Style::default().fg(Color::Rgb(80, 80, 80)))
-                        .ratio(usage_percent / 100.0)
-                        .label(Line::from(format!("C{:<2} {:>3.0}%", i, usage).fg(Color::Rgb(255, 255, 255))));
-                    
-                    if i < cores_layout.len() {
-                        frame.render_widget(core_gauge, cores_layout[i]);
-                    }
                 }
-
-                let mem_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(0), Constraint::Length(3)])
-                    .split(body_chunks[1]);
-
-                let mem_percent_f64 = if total_mem > 0 { (used_mem as f64 / total_mem as f64) * 100.0 } else { 0.0 };
-                let mem_percent = mem_percent_f64 as u16;
-
-                let mem_dataset = Dataset::default()
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(get_color(mem_percent_f64)))
-                    .data(&mem_history);
-
-                let mem_chart = Chart::new(vec![mem_dataset])
-                    .block(Block::default().title("Memory History".fg(Color::Rgb(255, 255, 255))).borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(150, 150, 0))))
-                    .x_axis(
-                        Axis::default()
-                            .bounds([0.0, 99.0])
-                            .style(Style::default().fg(Color::Rgb(255, 255, 255)))
-                            .labels(vec!["Older".bold().fg(Color::Rgb(255, 255, 255)), "Newer".bold().fg(Color::Rgb(255, 255, 255))]),
-                    )
-                    .y_axis(
-                        Axis::default()
-                            .bounds([0.0, 100.0])
-                            .style(Style::default().fg(Color::Rgb(255, 255, 255)))
-                            .labels(vec!["0%".bold().fg(Color::Rgb(255, 255, 255)), "50%".bold().fg(Color::Rgb(255, 255, 255)), "100%".bold().fg(Color::Rgb(255, 255, 255))]),
+                1 => {
+                    let num_cores = core_usages.len().max(1);
+                    render_process_tab(
+                        frame,
+                        chunks[1],
+                        &processes,
+                        advanced_view,
+                        &search_query,
+                        is_searching,
+                        current_sort_col,
+                        sort_ascending,
+                        mem.total_mem_mb,
+                        num_cores,
+                        &mut table_state,
                     );
-                frame.render_widget(mem_chart, mem_layout[0]);
-
-                let mem_gauge = Gauge::default()
-                    .block(Block::default().title("Memory Usage".fg(Color::Rgb(255, 255, 255))).borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(Color::Rgb(150, 150, 0))))
-                    .style(Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(30, 30, 30)))
-                    .gauge_style(Style::default().fg(get_color(mem_percent_f64)))
-                    .percent(mem_percent.clamp(0, 100))
-                    .label(format!("{} MB / {} MB", used_mem, total_mem).fg(Color::Rgb(255, 255, 255)));
-
-                frame.render_widget(mem_gauge, mem_layout[1]);
-            } else {
-                let header_cells = ["PID", "User", "Name", "State", "Threads", "CPU %", "Mem", "IO Read/s", "IO Write/s"].iter().map(|h| Cell::from(*h).style(Style::default().fg(Color::Rgb(0, 255, 255))));
-                let header = Row::new(header_cells).style(Style::default().bold()).height(1).bottom_margin(1);
-                
-                let rows = processes.iter().map(|p| {
-                    let cells = vec![
-                        Cell::from(p.pid.to_string()),
-                        Cell::from(p.user.clone()),
-                        Cell::from(p.name.clone()),
-                        Cell::from(p.state.clone()),
-                        Cell::from(p.threads.to_string()),
-                        Cell::from(format!("{:.1}%", p.cpu_percent)),
-                        Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64)),
-                        Cell::from(format_bytes_dyn(p.read_speed)),
-                        Cell::from(format_bytes_dyn(p.write_speed)),
-                    ];
-                    Row::new(cells).height(1)
-                });
-                
-                let table = Table::new(rows, [
-                    Constraint::Length(8),   // PID
-                    Constraint::Length(12),  // User
-                    Constraint::Min(20),     // Name
-                    Constraint::Length(8),   // State
-                    Constraint::Length(8),   // Threads
-                    Constraint::Length(10),  // CPU %
-                    Constraint::Length(10),  // Mem
-                    Constraint::Length(12),  // IO Read/s
-                    Constraint::Length(12),  // IO Write/s
-                ])
-                    .header(header)
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Processes "))
-                    .row_highlight_style(Style::default().bg(Color::Rgb(50, 50, 50)).fg(Color::Rgb(255, 255, 255)))
-                    .style(Style::default().fg(Color::Rgb(255, 255, 255)));
-                    
-                frame.render_stateful_widget(table, chunks[1], &mut table_state);
+                }
+                2 => {
+                    render_cpu_ram_tab(
+                        frame,
+                        chunks[1],
+                        &cpu_history,
+                        &core_usages,
+                        cpu_cur_mhz,
+                        cpu_min_mhz,
+                        cpu_max_mhz,
+                        cpu_temp,
+                        &cpu_model,
+                        &mem,
+                        &mem_history,
+                        &ram_info,
+                    );
+                }
+                3 => {
+                    render_gpu_tab(
+                        frame,
+                        chunks[1],
+                        &gpu_metrics,
+                        &gpu_history,
+                        &gpu_vram_history,
+                    );
+                }
+                4 => {
+                    render_network_tab(
+                        frame,
+                        chunks[1],
+                        &net_ifaces,
+                        &net_rx_history,
+                        &net_tx_history,
+                    );
+                }
+                5 => {
+                    render_disks_tab(
+                        frame,
+                        chunks[1],
+                        &disk_io,
+                        &disk_mounts,
+                        &disk_read_history,
+                        &disk_write_history,
+                        &docker_info,
+                    );
+                }
+                _ => {}
             }
         })?;
 
@@ -452,41 +322,370 @@ fn main() -> io::Result<()> {
             .unwrap_or_else(|| Duration::from_secs(0));
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')) {
-                    break;
-                } else if key.code == KeyCode::Tab || key.code == KeyCode::Right {
-                    current_tab = (current_tab + 1) % 2;
-                } else if key.code == KeyCode::BackTab || key.code == KeyCode::Left {
-                    current_tab = (current_tab + 1) % 2;
-                } else if key.code == KeyCode::Char('1') {
-                    current_tab = 0;
-                } else if key.code == KeyCode::Char('2') {
-                    current_tab = 1;
-                } else if key.code == KeyCode::Down {
-                    let i = match table_state.selected() {
-                        Some(i) => if i >= processes.len().saturating_sub(1) { i } else { i + 1 },
-                        None => 0,
-                    };
-                    table_state.select(Some(i));
-                } else if key.code == KeyCode::Up {
-                    let i = match table_state.selected() {
-                        Some(i) => if i == 0 { 0 } else { i - 1 },
-                        None => 0,
-                    };
-                    table_state.select(Some(i));
+            match event::read()? {
+                Event::Key(key) => {
+                    if is_searching {
+                        let num_procs = processes
+                            .iter()
+                            .filter(|p| advanced_view || p.rss_kb > 0)
+                            .filter(|p| {
+                                search_query.is_empty()
+                                    || fuzzy_match(&search_query, &p.name)
+                                    || fuzzy_match(&search_query, &p.pid.to_string())
+                                    || fuzzy_match(&search_query, &p.user)
+                            })
+                            .count();
+                        match key.code {
+                            KeyCode::Esc => {
+                                is_searching = false;
+                                search_query.clear();
+                            }
+                            KeyCode::Enter => {
+                                is_searching = false;
+                            }
+                            KeyCode::Backspace => {
+                                search_query.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                search_query.push(c);
+                            }
+                            KeyCode::Up => {
+                                let i = match table_state.selected() {
+                                    Some(i) => i.saturating_sub(1),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            KeyCode::Down => {
+                                let i = match table_state.selected() {
+                                    Some(i) => (i + 1).min(num_procs.saturating_sub(1)),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            KeyCode::PageUp => {
+                                let i = match table_state.selected() {
+                                    Some(i) => i.saturating_sub(10),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            KeyCode::PageDown => {
+                                let i = match table_state.selected() {
+                                    Some(i) => (i + 10).min(num_procs.saturating_sub(1)),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            _ => {}
+                        }
+                    } else if key.code == KeyCode::Char('q')
+                        || (key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c'))
+                    {
+                        break;
+                    } else if key.code == KeyCode::Tab {
+                        current_tab = (current_tab + 1) % 6;
+                    } else if key.code == KeyCode::BackTab {
+                        current_tab = (current_tab + 5) % 6;
+                    } else if key.code == KeyCode::Char('1') {
+                        current_tab = 0;
+                    } else if key.code == KeyCode::Char('2') {
+                        current_tab = 1;
+                    } else if key.code == KeyCode::Char('3') {
+                        current_tab = 2;
+                    } else if key.code == KeyCode::Char('4') {
+                        current_tab = 3;
+                    } else if key.code == KeyCode::Char('5') {
+                        current_tab = 4;
+                    } else if key.code == KeyCode::Char('6') {
+                        current_tab = 5;
+                    } else if current_tab == 0 {
+                        if key.code == KeyCode::Char('c') || key.code == KeyCode::Char('y') {
+                            let ram_info = get_ram_info(mem.total_mem_mb, &cpu_model);
+                            let text = format_system_overview_copy_text(
+                                &sys_info,
+                                &cpu_model,
+                                &gpu_metrics,
+                                &ram_info,
+                            );
+                            copy_to_clipboard(&text);
+                            copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
+                        } else if key.code == KeyCode::Char(' ') {
+                            is_paused = !is_paused;
+                        }
+                    } else if current_tab == 1 {
+                        let cols: &[ProcessSortColumn] = if advanced_view {
+                            &ADVANCED_SORT_COLUMNS
+                        } else {
+                            &NORMAL_SORT_COLUMNS
+                        };
+                        let num_procs = processes
+                            .iter()
+                            .filter(|p| advanced_view || p.rss_kb > 0)
+                            .filter(|p| {
+                                search_query.is_empty()
+                                    || fuzzy_match(&search_query, &p.name)
+                                    || fuzzy_match(&search_query, &p.pid.to_string())
+                                    || fuzzy_match(&search_query, &p.user)
+                            })
+                            .count();
+                        match key.code {
+                            KeyCode::Char('/') => {
+                                is_searching = true;
+                            }
+                            KeyCode::Esc => {
+                                search_query.clear();
+                            }
+                            KeyCode::Left => {
+                                let cur_idx = cols
+                                    .iter()
+                                    .position(|&c| c == current_sort_col)
+                                    .unwrap_or(0);
+                                let new_idx = if cur_idx == 0 {
+                                    cols.len() - 1
+                                } else {
+                                    cur_idx - 1
+                                };
+                                current_sort_col = cols[new_idx];
+                                sort_processes(&mut processes, current_sort_col, sort_ascending);
+                            }
+                            KeyCode::Right => {
+                                let cur_idx = cols
+                                    .iter()
+                                    .position(|&c| c == current_sort_col)
+                                    .unwrap_or(0);
+                                let new_idx = (cur_idx + 1) % cols.len();
+                                current_sort_col = cols[new_idx];
+                                sort_processes(&mut processes, current_sort_col, sort_ascending);
+                            }
+                            KeyCode::Char('r') => {
+                                sort_ascending = !sort_ascending;
+                                sort_processes(&mut processes, current_sort_col, sort_ascending);
+                            }
+                            KeyCode::Char('a') => {
+                                advanced_view = !advanced_view;
+                                if !advanced_view
+                                    && !NORMAL_SORT_COLUMNS.contains(&current_sort_col)
+                                {
+                                    current_sort_col = ProcessSortColumn::Mem;
+                                }
+                                sort_processes(&mut processes, current_sort_col, sort_ascending);
+                            }
+                            KeyCode::Char('c') => {
+                                if let Some(sel) = table_state.selected() {
+                                    let displayed: Vec<&ProcessInfo> = processes
+                                        .iter()
+                                        .filter(|p| advanced_view || p.rss_kb > 0)
+                                        .filter(|p| {
+                                            search_query.is_empty()
+                                                || fuzzy_match(&search_query, &p.name)
+                                                || fuzzy_match(&search_query, &p.pid.to_string())
+                                                || fuzzy_match(&search_query, &p.user)
+                                        })
+                                        .collect();
+                                    if let Some(target) = displayed.get(sel)
+                                        && let Some(pid) =
+                                            rustix::process::Pid::from_raw(target.pid as i32)
+                                    {
+                                        let _ = rustix::process::kill_process(
+                                            pid,
+                                            rustix::process::Signal::Term,
+                                        );
+                                    }
+                                }
+                            }
+                            KeyCode::Char('k') => {
+                                if let Some(sel) = table_state.selected() {
+                                    let displayed: Vec<&ProcessInfo> = processes
+                                        .iter()
+                                        .filter(|p| advanced_view || p.rss_kb > 0)
+                                        .filter(|p| {
+                                            search_query.is_empty()
+                                                || fuzzy_match(&search_query, &p.name)
+                                                || fuzzy_match(&search_query, &p.pid.to_string())
+                                                || fuzzy_match(&search_query, &p.user)
+                                        })
+                                        .collect();
+                                    if let Some(target) = displayed.get(sel)
+                                        && let Some(pid) =
+                                            rustix::process::Pid::from_raw(target.pid as i32)
+                                    {
+                                        let _ = rustix::process::kill_process(
+                                            pid,
+                                            rustix::process::Signal::Kill,
+                                        );
+                                    }
+                                }
+                            }
+                            KeyCode::Up => {
+                                let i = match table_state.selected() {
+                                    Some(i) => i.saturating_sub(1),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let i = match table_state.selected() {
+                                    Some(i) => (i + 1).min(num_procs.saturating_sub(1)),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            KeyCode::Char('g') | KeyCode::Home => {
+                                table_state.select(Some(0));
+                            }
+                            KeyCode::Char('G') | KeyCode::End => {
+                                if num_procs > 0 {
+                                    table_state.select(Some(num_procs - 1));
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                let i = match table_state.selected() {
+                                    Some(i) => i.saturating_sub(10),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            KeyCode::PageDown => {
+                                let i = match table_state.selected() {
+                                    Some(i) => (i + 10).min(num_procs.saturating_sub(1)),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            KeyCode::Char(' ') => {
+                                is_paused = !is_paused;
+                            }
+                            _ => {}
+                        }
+                    } else if key.code == KeyCode::Char(' ') {
+                        is_paused = !is_paused;
+                    }
                 }
+                Event::Mouse(mouse_event) => {
+                    if current_tab == 0 {
+                        if let MouseEventKind::Down(MouseButton::Left) = mouse_event.kind {
+                            let mx = mouse_event.column;
+                            let my = mouse_event.row;
+                            let top_box_w = table_area.width / 2;
+                            let top_box_right = table_area.x + top_box_w;
+                            let top_box_bottom = table_area.y + 15;
+                            if mx >= top_box_right.saturating_sub(18)
+                                && mx <= top_box_right
+                                && my >= top_box_bottom.saturating_sub(3)
+                                && my <= top_box_bottom
+                            {
+                                let ram_info = get_ram_info(mem.total_mem_mb, &cpu_model);
+                                let text = format_system_overview_copy_text(
+                                    &sys_info,
+                                    &cpu_model,
+                                    &gpu_metrics,
+                                    &ram_info,
+                                );
+                                copy_to_clipboard(&text);
+                                copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
+                            }
+                        }
+                    } else if current_tab == 1 {
+                        let num_procs = processes
+                            .iter()
+                            .filter(|p| advanced_view || p.rss_kb > 0)
+                            .filter(|p| {
+                                search_query.is_empty()
+                                    || fuzzy_match(&search_query, &p.name)
+                                    || fuzzy_match(&search_query, &p.pid.to_string())
+                                    || fuzzy_match(&search_query, &p.user)
+                            })
+                            .count();
+                        match mouse_event.kind {
+                            MouseEventKind::ScrollDown => {
+                                let i = match table_state.selected() {
+                                    Some(i) => (i + 3).min(num_procs.saturating_sub(1)),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            MouseEventKind::ScrollUp => {
+                                let i = match table_state.selected() {
+                                    Some(i) => i.saturating_sub(3),
+                                    None => 0,
+                                };
+                                table_state.select(Some(i));
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                let my = mouse_event.row;
+                                let header_y = table_area.y + 1;
+                                if my == header_y {
+                                    let mx = mouse_event.column;
+                                    let (col_widths, cols): (Vec<u16>, &[ProcessSortColumn]) =
+                                        if advanced_view {
+                                            let base_w = 8 + 10 + 7 + 8 + 8 + 10 + 8 + 10 + 23 + 23;
+                                            let name_w =
+                                                table_area.width.saturating_sub(base_w).max(10);
+                                            (
+                                                vec![8, 10, name_w, 7, 8, 8, 10, 8, 10, 23, 23],
+                                                &ADVANCED_SORT_COLUMNS,
+                                            )
+                                        } else {
+                                            let base_w = 8 + 8 + 10 + 8 + 10 + 23 + 23;
+                                            let name_w =
+                                                table_area.width.saturating_sub(base_w).max(10);
+                                            (
+                                                vec![8, name_w, 8, 10, 8, 10, 23, 23],
+                                                &NORMAL_SORT_COLUMNS,
+                                            )
+                                        };
+
+                                    let mut current_x = table_area.x + 1;
+                                    for (i, &w) in col_widths.iter().enumerate() {
+                                        if mx >= current_x && mx < current_x + w {
+                                            if current_sort_col == cols[i] {
+                                                sort_ascending = !sort_ascending;
+                                            } else {
+                                                current_sort_col = cols[i];
+                                            }
+                                            sort_processes(
+                                                &mut processes,
+                                                current_sort_col,
+                                                sort_ascending,
+                                            );
+                                            break;
+                                        }
+                                        current_x += w;
+                                    }
+                                } else if my > header_y + 1 && my < table_area.bottom() {
+                                    let clicked_row = (my - (header_y + 2)) as usize;
+                                    let proc_idx = table_state.offset() + clicked_row;
+                                    if proc_idx < num_procs {
+                                        table_state.select(Some(proc_idx));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
-        if last_tick.elapsed() >= tick_rate {
-            processes = read_processes(&mut prev_procs, &users, last_tick.elapsed().as_secs_f64());
+        if !is_paused && last_tick.elapsed() >= tick_rate {
+            let dt = last_tick.elapsed().as_secs_f64();
+            sys_info = read_system_general_info();
+            battery = read_battery();
+
+            processes = read_processes(&mut prev_procs, &users, dt);
+            sort_processes(&mut processes, current_sort_col, sort_ascending);
+
             std::mem::swap(&mut prev_ticks, &mut curr_ticks);
             read_cpu_ticks(&mut io_buf, &mut curr_ticks);
-            let (tm, um) = read_memory(&mut io_buf);
-            total_mem = tm;
-            used_mem = um;
-            let m_pct = if tm > 0 { (um as f64 / tm as f64) * 100.0 } else { 0.0 };
+            mem = read_memory(&mut io_buf);
+            let m_pct = if mem.total_mem_mb > 0 {
+                (mem.used_mem_mb as f64 / mem.total_mem_mb as f64) * 100.0
+            } else {
+                0.0
+            };
 
             if !prev_ticks.is_empty() && !curr_ticks.is_empty() {
                 global_usage = calculate_usage(&prev_ticks[0], &curr_ticks[0]);
@@ -496,19 +695,51 @@ fn main() -> io::Result<()> {
                 }
             }
 
+            gpu_metrics = read_gpu_metrics();
+            let v_pct = if gpu_metrics.vram_total_mb > 0 {
+                (gpu_metrics.vram_used_mb as f64 / gpu_metrics.vram_total_mb as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            net_ifaces = read_network_interfaces(&mut prev_net, dt);
+            let primary_iface = net_ifaces
+                .iter()
+                .find(|i| i.operstate == "up")
+                .or_else(|| net_ifaces.first());
+            let rx_spd = primary_iface.map(|i| i.rx_speed).unwrap_or(0.0);
+            let tx_spd = primary_iface.map(|i| i.tx_speed).unwrap_or(0.0);
+            let rx_pct = io_gradient_pct(rx_spd);
+            let tx_pct = io_gradient_pct(tx_spd);
+
+            disk_mounts = read_disk_mounts();
+            disk_io = read_disk_io(&mut prev_disk, dt);
+            docker_info = read_docker_storage();
+            let d_read_pct = io_gradient_pct(disk_io.read_speed);
+            let d_write_pct = io_gradient_pct(disk_io.write_speed);
+
             for i in 0..99 {
-                cpu_history[i].1 = cpu_history[i + 1].1;
-                mem_history[i].1 = mem_history[i + 1].1;
+                cpu_history[i] = cpu_history[i + 1];
+                mem_history[i] = mem_history[i + 1];
+                gpu_history[i] = gpu_history[i + 1];
+                gpu_vram_history[i] = gpu_vram_history[i + 1];
+                net_rx_history[i] = net_rx_history[i + 1];
+                net_tx_history[i] = net_tx_history[i + 1];
+                disk_read_history[i] = disk_read_history[i + 1];
+                disk_write_history[i] = disk_write_history[i + 1];
             }
-            cpu_history[99].1 = global_usage;
-            mem_history[99].1 = m_pct;
+            cpu_history[99] = Some(global_usage);
+            mem_history[99] = Some(m_pct);
+            gpu_history[99] = Some(gpu_metrics.utilization_pct);
+            gpu_vram_history[99] = Some(v_pct);
+            net_rx_history[99] = Some(rx_pct);
+            net_tx_history[99] = Some(tx_pct);
+            disk_read_history[99] = Some(d_read_pct);
+            disk_write_history[99] = Some(d_write_pct);
 
             last_tick = Instant::now();
         }
     }
-
-    disable_raw_mode()?;
-    io::stdout().execute(LeaveAlternateScreen)?;
 
     Ok(())
 }

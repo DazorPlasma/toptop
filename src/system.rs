@@ -1,0 +1,1371 @@
+//! System metrics and hardware telemetry collectors.
+//!
+//! Provides readers for `/proc/stat`, `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg`,
+//! `/sys/class/power_supply`, `/sys/class/drm`, `/sys/class/hwmon`, `/sys/class/thermal`,
+//! `/sys/class/net`, and `/proc/diskstats`.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::Read,
+};
+
+use crate::utils::{format_bytes_dyn, parse_size_to_bytes};
+
+/// Raw CPU accounting time ticks parsed from `/proc/stat`.
+#[derive(Default, Clone, Copy)]
+pub struct CpuTicks {
+    /// Time spent in user mode.
+    pub user: u64,
+    /// Time spent in user mode with low priority (nice).
+    pub nice: u64,
+    /// Time spent in system (kernel) mode.
+    pub system: u64,
+    /// Time spent in the idle task.
+    pub idle: u64,
+    /// Time waiting for I/O to complete.
+    pub iowait: u64,
+    /// Time servicing hardware interrupts.
+    pub irq: u64,
+    /// Time servicing software interrupts.
+    pub softirq: u64,
+    /// Stolen time spent in other operating systems when in a virtualized environment.
+    pub steal: u64,
+}
+
+impl CpuTicks {
+    /// Calculates the sum of all CPU tick categories.
+    ///
+    /// # Returns
+    /// Total cumulative ticks.
+    pub fn total(&self) -> u64 {
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
+    }
+
+    /// Calculates total idle time (idle + iowait).
+    ///
+    /// # Returns
+    /// Cumulative idle ticks.
+    pub fn idle_time(&self) -> u64 {
+        self.idle + self.iowait
+    }
+}
+
+/// Reads `/proc/stat` and populates a vector of `CpuTicks` for total and per-core CPU accounting.
+///
+/// # Arguments
+/// * `buf` - Scratch string buffer to avoid heap allocations.
+/// * `cpus` - Output vector populated with `CpuTicks` (index 0 is total, 1..N are per-core).
+pub fn read_cpu_ticks(buf: &mut String, cpus: &mut Vec<CpuTicks>) {
+    cpus.clear();
+    buf.clear();
+    if let Ok(mut file) = fs::File::open("/proc/stat")
+        && file.read_to_string(buf).is_ok()
+    {
+        for line in buf.lines() {
+            if line.starts_with("cpu") {
+                let mut parts = line.split_whitespace();
+                parts.next(); // skip "cpu..."
+                let user = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let nice = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let system = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let idle = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let iowait = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let irq = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let softirq = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                let steal = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                cpus.push(CpuTicks {
+                    user,
+                    nice,
+                    system,
+                    idle,
+                    iowait,
+                    irq,
+                    softirq,
+                    steal,
+                });
+            }
+        }
+    }
+}
+
+/// Calculates CPU usage percentage between two consecutive `CpuTicks` sample points.
+///
+/// # Arguments
+/// * `prev` - Earlier CPU ticks sample.
+/// * `curr` - Current CPU ticks sample.
+///
+/// # Returns
+/// Utilization percentage (0.0 to 100.0).
+pub fn calculate_usage(prev: &CpuTicks, curr: &CpuTicks) -> f64 {
+    let prev_total = prev.total();
+    let curr_total = curr.total();
+    let total_diff = curr_total.saturating_sub(prev_total);
+    if total_diff == 0 {
+        return 0.0;
+    }
+    let prev_idle = prev.idle_time();
+    let curr_idle = curr.idle_time();
+    let idle_diff = curr_idle.saturating_sub(prev_idle);
+
+    100.0 * (total_diff as f64 - idle_diff as f64) / total_diff as f64
+}
+
+/// System memory and swap utilization metrics in megabytes.
+#[derive(Clone, Copy, Default)]
+pub struct MemoryMetrics {
+    /// Total physical RAM available in megabytes.
+    pub total_mem_mb: u64,
+    /// Used physical RAM in megabytes.
+    pub used_mem_mb: u64,
+    /// Total swap space in megabytes.
+    pub total_swap_mb: u64,
+    /// Used swap space in megabytes.
+    pub used_swap_mb: u64,
+}
+
+/// Reads `/proc/meminfo` to calculate used/total physical memory and swap metrics.
+///
+/// # Arguments
+/// * `buf` - Scratch buffer used to read `/proc/meminfo`.
+///
+/// # Returns
+/// A populated `MemoryMetrics` structure.
+pub fn read_memory(buf: &mut String) -> MemoryMetrics {
+    let mut total = 0;
+    let mut available = 0;
+    let mut swap_total = 0;
+    let mut swap_free = 0;
+    buf.clear();
+    if let Ok(mut file) = fs::File::open("/proc/meminfo")
+        && file.read_to_string(buf).is_ok()
+    {
+        for line in buf.lines() {
+            if line.starts_with("MemTotal:") {
+                total = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+            } else if line.starts_with("MemAvailable:") {
+                available = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+            } else if line.starts_with("SwapTotal:") {
+                swap_total = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+            } else if line.starts_with("SwapFree:") {
+                swap_free = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+            }
+        }
+    }
+    MemoryMetrics {
+        total_mem_mb: total / 1024,
+        used_mem_mb: total.saturating_sub(available) / 1024,
+        total_swap_mb: swap_total / 1024,
+        used_swap_mb: swap_total.saturating_sub(swap_free) / 1024,
+    }
+}
+
+/// Power supply and battery status metrics.
+#[derive(Clone, Default)]
+pub struct BatteryInfo {
+    /// Battery device identifier name (e.g. `BAT0`).
+    pub name: String,
+    /// Current power status (e.g. `Charging`, `Discharging`, `Full`, `Not charging`).
+    pub status: String,
+    /// Current battery capacity percentage (0 to 100).
+    pub capacity_pct: u8,
+    /// Current remaining energy in Watt-hours.
+    pub energy_now_wh: Option<f64>,
+    /// Full capacity energy in Watt-hours.
+    pub energy_full_wh: Option<f64>,
+    /// Live power draw or charging rate in Watts.
+    pub power_w: Option<f64>,
+    /// Reported battery health state (e.g. `Good`).
+    pub health: String,
+}
+
+/// Reads `/sys/class/power_supply` to query laptop battery state, capacity, energy, and wattage.
+///
+/// # Returns
+/// `Some(BatteryInfo)` if a physical battery exists, or `None` on desktop systems.
+pub fn read_battery() -> Option<BatteryInfo> {
+    if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let p_type = fs::read_to_string(path.join("type"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if p_type == "battery" {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let status = fs::read_to_string(path.join("status"))
+                    .unwrap_or_else(|_| "Unknown".to_string())
+                    .trim()
+                    .to_string();
+                let capacity_pct = fs::read_to_string(path.join("capacity"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok())
+                    .unwrap_or(0);
+                let health = fs::read_to_string(path.join("health"))
+                    .unwrap_or_else(|_| "Good".to_string())
+                    .trim()
+                    .to_string();
+                let voltage_u_v = fs::read_to_string(path.join("voltage_now"))
+                    .or_else(|_| fs::read_to_string(path.join("voltage_min_design")))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok());
+
+                let energy_now_wh = fs::read_to_string(path.join("energy_now"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .map(|v| v / 1_000_000.0)
+                    .or_else(|| {
+                        let charge = fs::read_to_string(path.join("charge_now"))
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f64>().ok())?;
+                        let v = voltage_u_v?;
+                        Some((charge * v) / 1_000_000_000_000.0)
+                    });
+
+                let energy_full_wh = fs::read_to_string(path.join("energy_full"))
+                    .or_else(|_| fs::read_to_string(path.join("energy_full_design")))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .map(|v| v / 1_000_000.0)
+                    .or_else(|| {
+                        let charge = fs::read_to_string(path.join("charge_full"))
+                            .or_else(|_| fs::read_to_string(path.join("charge_full_design")))
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f64>().ok())?;
+                        let v = voltage_u_v?;
+                        Some((charge * v) / 1_000_000_000_000.0)
+                    });
+
+                let power_w = fs::read_to_string(path.join("power_now"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .map(|v| (v / 1_000_000.0).abs())
+                    .or_else(|| {
+                        let current = fs::read_to_string(path.join("current_now"))
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f64>().ok())?;
+                        let v = voltage_u_v?;
+                        Some(((current * v) / 1_000_000_000_000.0).abs())
+                    });
+
+                return Some(BatteryInfo {
+                    name,
+                    status,
+                    capacity_pct,
+                    energy_now_wh,
+                    energy_full_wh,
+                    power_w,
+                    health,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Information describing a connected visual monitor or display panel.
+#[derive(Clone, Default)]
+pub struct DisplayInfo {
+    /// Monitor model descriptor parsed from EDID (tag 0xFC).
+    pub name: String,
+    /// Current video mode resolution (e.g. `2560x1440`).
+    pub resolution: String,
+    /// Physical screen diagonal length in inches.
+    pub diagonal_inch: Option<u32>,
+    /// Maximum vertical refresh rate in Hertz.
+    pub refresh_rate_hz: Option<u32>,
+    /// `true` for external displays (HDMI/DP), `false` for embedded laptop panels (eDP/LVDS).
+    pub is_external: bool,
+}
+
+/// Reads `/sys/class/drm` and parses binary EDID data to discover connected monitors and specs.
+///
+/// # Returns
+/// A list of `DisplayInfo` representing active connected outputs.
+pub fn read_drm_displays() -> Vec<DisplayInfo> {
+    let mut displays = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if let Ok(status) = fs::read_to_string(path.join("status"))
+                && status.trim() == "connected"
+            {
+                let conn_name = entry.file_name().to_string_lossy().to_string();
+                let is_external = !conn_name.contains("eDP")
+                    && !conn_name.contains("LVDS")
+                    && !conn_name.contains("DSI");
+                let mut resolution = String::new();
+                if let Ok(modes) = fs::read_to_string(path.join("modes"))
+                    && let Some(first_mode) = modes.lines().next()
+                {
+                    resolution = first_mode.trim().to_string();
+                }
+                let mut name = String::new();
+                let mut max_hz = None;
+                let mut diagonal = None;
+
+                if let Ok(edid) = fs::read(path.join("edid"))
+                    && edid.len() >= 128
+                {
+                    let w_cm = edid[21] as f64;
+                    let h_cm = edid[22] as f64;
+                    if w_cm > 0.0 && h_cm > 0.0 {
+                        let diag_in = ((w_cm * w_cm + h_cm * h_cm).sqrt() / 2.54).round() as u32;
+                        diagonal = Some(diag_in);
+                    }
+
+                    for desc_offset in [54, 72, 90, 108] {
+                        if desc_offset + 18 <= edid.len() {
+                            let desc = &edid[desc_offset..desc_offset + 18];
+                            if desc[0] == 0 && desc[1] == 0 && desc[2] == 0 {
+                                if desc[3] == 0xFC {
+                                    let s = String::from_utf8_lossy(&desc[5..18])
+                                        .replace('\0', " ")
+                                        .trim()
+                                        .to_string();
+                                    if !s.is_empty() {
+                                        name = s;
+                                    }
+                                } else if desc[3] == 0xFD {
+                                    let hz = desc[6] as u32;
+                                    if hz > 0 {
+                                        max_hz = Some(hz);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !resolution.is_empty() || !name.is_empty() {
+                    displays.push(DisplayInfo {
+                        name,
+                        resolution,
+                        diagonal_inch: diagonal,
+                        refresh_rate_hz: max_hz,
+                        is_external,
+                    });
+                }
+            }
+        }
+    }
+    displays
+}
+
+/// Determines the primary outbound local IPv4 address of the host machine.
+///
+/// # Returns
+/// IP address string such as `"192.168.1.150"`.
+pub fn get_local_ip() -> String {
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && socket.connect("8.8.8.8:80").is_ok()
+        && let Ok(addr) = socket.local_addr()
+    {
+        let ip = addr.ip();
+        if !ip.is_loopback() && !ip.is_unspecified() {
+            return ip.to_string();
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
+/// Detects the active Desktop Environment / Window Manager and session display server.
+///
+/// # Returns
+/// Formatted string like `"KDE Plasma (Wayland)"` or `"i3 (X11)"`.
+pub fn get_desktop_environment() -> String {
+    let raw_de = std::env::var("XDG_CURRENT_DESKTOP")
+        .or_else(|_| std::env::var("DESKTOP_SESSION"))
+        .or_else(|_| std::env::var("XDG_SESSION_DESKTOP"))
+        .unwrap_or_default();
+
+    let raw_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
+    let type_formatted = match raw_type.to_lowercase().as_str() {
+        "wayland" => "Wayland",
+        "x11" => "X11",
+        "tty" => "TTY",
+        _ => "",
+    };
+
+    if !raw_de.is_empty() {
+        if !type_formatted.is_empty() {
+            format!("{} ({})", raw_de, type_formatted)
+        } else {
+            raw_de
+        }
+    } else if !type_formatted.is_empty() {
+        type_formatted.to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
+/// Aggregated system overview metadata and hardware identity.
+#[derive(Clone, Default)]
+pub struct SystemGeneralInfo {
+    /// Host machine name.
+    pub hostname: String,
+    /// OS distribution name.
+    pub os_name: String,
+    /// Linux kernel release version.
+    pub kernel: String,
+    /// System uptime in seconds.
+    pub uptime_secs: u64,
+    /// 1-minute system load average.
+    pub load_1: f64,
+    /// 5-minute system load average.
+    pub load_5: f64,
+    /// 15-minute system load average.
+    pub load_15: f64,
+    /// Active Desktop Environment and session type.
+    pub desktop: String,
+    /// Current shell executable name.
+    pub shell: String,
+    /// Outbound local network IP address.
+    pub local_ip: String,
+    /// Primary network interface name.
+    pub net_interface: String,
+    /// Primary network interface link speed in Mbps.
+    pub net_speed_mbps: u32,
+    /// Primary network interface duplex mode (e.g. `Full`, `Half`).
+    pub net_duplex: String,
+    /// Active system locale code.
+    pub locale: String,
+    /// List of connected DRM displays.
+    pub displays: Vec<DisplayInfo>,
+}
+
+/// Reads host system telemetry, OS version, kernel, uptime, load averages, and desktop environment.
+///
+/// # Returns
+/// A populated `SystemGeneralInfo` structure.
+pub fn read_system_general_info() -> SystemGeneralInfo {
+    let hostname = fs::read_to_string("/etc/hostname")
+        .or_else(|_| fs::read_to_string("/proc/sys/kernel/hostname"))
+        .unwrap_or_else(|_| "localhost".to_string())
+        .trim()
+        .to_string();
+
+    let mut os_name = "Linux".to_string();
+    if let Ok(os_release) = fs::read_to_string("/etc/os-release") {
+        for line in os_release.lines() {
+            if line.starts_with("PRETTY_NAME=") {
+                os_name = line
+                    .trim_start_matches("PRETTY_NAME=")
+                    .trim_matches('"')
+                    .to_string();
+                break;
+            }
+        }
+    }
+
+    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    let uptime_secs = fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .next()
+                .and_then(|u| u.parse::<f64>().ok())
+        })
+        .map(|s| s.round() as u64)
+        .unwrap_or(0);
+
+    let mut load_1 = 0.0;
+    let mut load_5 = 0.0;
+    let mut load_15 = 0.0;
+    if let Ok(loadavg) = fs::read_to_string("/proc/loadavg") {
+        let parts: Vec<&str> = loadavg.split_whitespace().collect();
+        if parts.len() >= 3 {
+            load_1 = parts[0].parse().unwrap_or(0.0);
+            load_5 = parts[1].parse().unwrap_or(0.0);
+            load_15 = parts[2].parse().unwrap_or(0.0);
+        }
+    }
+
+    let desktop = get_desktop_environment();
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let shell_name = if let Some(pos) = shell.rfind('/') {
+        shell[pos + 1..].to_string()
+    } else if !shell.is_empty() {
+        shell
+    } else {
+        "Unknown".to_string()
+    };
+    let local_ip = get_local_ip();
+
+    let mut net_interface = String::new();
+    let mut net_speed_mbps = 0;
+    let mut net_duplex = String::new();
+    if let Ok(entries) = fs::read_dir("/sys/class/net") {
+        for entry in entries.filter_map(Result::ok) {
+            let ifname = entry.file_name().to_string_lossy().to_string();
+            if ifname == "lo" {
+                continue;
+            }
+            let operstate = fs::read_to_string(entry.path().join("operstate"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let is_up = operstate == "up";
+            if is_up || net_interface.is_empty() {
+                let speed = fs::read_to_string(entry.path().join("speed"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                let raw_duplex = fs::read_to_string(entry.path().join("duplex"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let duplex = match raw_duplex.to_lowercase().as_str() {
+                    "full" => "Full".to_string(),
+                    "half" => "Half".to_string(),
+                    _ => "Unknown".to_string(),
+                };
+                net_interface = ifname;
+                net_speed_mbps = speed;
+                net_duplex = duplex;
+                if is_up {
+                    break;
+                }
+            }
+        }
+    }
+
+    let locale = std::env::var("LANG")
+        .or_else(|_| std::env::var("LC_ALL"))
+        .unwrap_or_else(|_| "en_US.UTF-8".to_string());
+    let displays = read_drm_displays();
+
+    SystemGeneralInfo {
+        hostname,
+        os_name,
+        kernel,
+        uptime_secs,
+        load_1,
+        load_5,
+        load_15,
+        desktop,
+        shell: shell_name,
+        local_ip,
+        net_interface,
+        net_speed_mbps,
+        net_duplex,
+        locale,
+        displays,
+    }
+}
+
+/// Reads `/etc/passwd` to build a map of UID to human-readable username.
+///
+/// # Returns
+/// A `HashMap<u32, String>` mapping UID to username.
+pub fn get_users() -> HashMap<u32, String> {
+    let mut users = HashMap::new();
+    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+        for line in passwd.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3
+                && let Ok(uid) = parts[2].parse::<u32>()
+            {
+                users.insert(uid, parts[0].to_string());
+            }
+        }
+    }
+    users
+}
+
+/// GPU core utilization, VRAM metrics, clocks, and temperature.
+#[derive(Clone, Default)]
+pub struct GpuMetrics {
+    /// Human-readable GPU device model name.
+    pub name: String,
+    /// GPU core busy percentage (0.0 to 100.0).
+    pub utilization_pct: f64,
+    /// Allocated VRAM memory in megabytes.
+    pub vram_used_mb: u64,
+    /// Total available VRAM capacity in megabytes.
+    pub vram_total_mb: u64,
+    /// GPU junction/core temperature in degrees Celsius.
+    pub temp_c: u32,
+    /// Current GPU core clock speed in MHz.
+    pub cur_mhz: f64,
+    /// Minimum base core clock in MHz.
+    pub min_mhz: f64,
+    /// Maximum boost core clock in MHz.
+    pub max_mhz: f64,
+}
+
+/// Reads `/sys/class/drm` and `/sys/class/hwmon` to query AMD, NVIDIA, or Intel GPU metrics.
+///
+/// # Returns
+/// A populated `GpuMetrics` structure.
+pub fn read_gpu_metrics() -> GpuMetrics {
+    let mut metrics = GpuMetrics {
+        name: "GPU".to_string(),
+        utilization_pct: 0.0,
+        vram_used_mb: 0,
+        vram_total_mb: 0,
+        temp_c: 0,
+        cur_mhz: 0.0,
+        min_mhz: 0.0,
+        max_mhz: 0.0,
+    };
+
+    if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+        for entry in entries.filter_map(Result::ok) {
+            let fname = entry.file_name();
+            let name = fname.to_string_lossy();
+            if name.starts_with("card") && !name.contains('-') {
+                let dev_path = entry.path().join("device");
+                if dev_path.exists() {
+                    if let Ok(uevent) = fs::read_to_string(dev_path.join("uevent")) {
+                        for line in uevent.lines() {
+                            if line.starts_with("DRIVER=") {
+                                metrics.name =
+                                    format!("GPU ({})", line.trim_start_matches("DRIVER="));
+                            }
+                        }
+                    }
+
+                    let mut vendor_id = String::new();
+                    let mut device_id = String::new();
+                    if let Ok(v) = fs::read_to_string(dev_path.join("vendor")) {
+                        vendor_id = v.trim().to_lowercase();
+                    }
+                    if let Ok(d) = fs::read_to_string(dev_path.join("device")) {
+                        device_id = d.trim().to_lowercase();
+                    }
+
+                    if vendor_id.contains("1002") {
+                        if device_id.contains("7480") {
+                            metrics.name = "AMD Radeon RX 7600".to_string();
+                        } else {
+                            metrics.name = "AMD Radeon Graphics".to_string();
+                        }
+                    } else if vendor_id.contains("10de") {
+                        metrics.name = "NVIDIA GeForce GPU".to_string();
+                    } else if vendor_id.contains("8086") {
+                        metrics.name = "Intel Graphics".to_string();
+                    }
+
+                    if let Ok(busy_str) = fs::read_to_string(dev_path.join("gpu_busy_percent"))
+                        && let Ok(busy) = busy_str.trim().parse::<f64>()
+                    {
+                        metrics.utilization_pct = busy;
+                    }
+
+                    if let Ok(total_str) = fs::read_to_string(dev_path.join("mem_info_vram_total"))
+                        && let Ok(total_bytes) = total_str.trim().parse::<u64>()
+                    {
+                        metrics.vram_total_mb = total_bytes / (1024 * 1024);
+                    }
+                    if let Ok(used_str) = fs::read_to_string(dev_path.join("mem_info_vram_used"))
+                        && let Ok(used_bytes) = used_str.trim().parse::<u64>()
+                    {
+                        metrics.vram_used_mb = used_bytes / (1024 * 1024);
+                    }
+
+                    if let Ok(pp_sclk) = fs::read_to_string(dev_path.join("pp_dpm_sclk")) {
+                        let mut first_mhz = None;
+                        let mut last_mhz = None;
+                        for line in pp_sclk.lines() {
+                            let mut parts = line.split_whitespace();
+                            if let Some(_idx) = parts.next()
+                                && let Some(freq_str) = parts.next()
+                            {
+                                let num_str: String =
+                                    freq_str.chars().filter(|c| c.is_ascii_digit()).collect();
+                                if let Ok(freq) = num_str.parse::<f64>() {
+                                    if first_mhz.is_none() {
+                                        first_mhz = Some(freq);
+                                    }
+                                    last_mhz = Some(freq);
+                                    if line.contains('*') {
+                                        metrics.cur_mhz = freq;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(f) = first_mhz {
+                            metrics.min_mhz = f;
+                        }
+                        if let Some(l) = last_mhz {
+                            metrics.max_mhz = l;
+                        }
+                    }
+
+                    if let Ok(hwmon_entries) = fs::read_dir(dev_path.join("hwmon")) {
+                        for h_entry in hwmon_entries.filter_map(Result::ok) {
+                            if let Ok(temp_str) =
+                                fs::read_to_string(h_entry.path().join("temp1_input"))
+                                && let Ok(temp_milli) = temp_str.trim().parse::<u32>()
+                            {
+                                metrics.temp_c = temp_milli / 1000;
+                            }
+                            if metrics.cur_mhz <= 0.0
+                                && let Ok(freq_str) =
+                                    fs::read_to_string(h_entry.path().join("freq1_input"))
+                                && let Ok(freq_hz) = freq_str.trim().parse::<f64>()
+                            {
+                                metrics.cur_mhz = freq_hz / 1_000_000.0;
+                            }
+                        }
+                    }
+
+                    if metrics.min_mhz <= 0.0 {
+                        metrics.min_mhz = 200.0;
+                    }
+                    if metrics.max_mhz <= metrics.min_mhz {
+                        metrics.max_mhz = 2500.0;
+                    }
+
+                    if metrics.vram_total_mb > 0 || metrics.utilization_pct > 0.0 {
+                        return metrics;
+                    }
+                }
+            }
+        }
+    }
+
+    metrics
+}
+
+/// Reads the current average, minimum base, and maximum boost CPU frequencies across all online cores.
+///
+/// # Returns
+/// A tuple `(current_mhz, min_mhz, max_mhz)`.
+pub fn read_cpu_freq_info() -> (f64, f64, f64) {
+    let mut cur_sum = 0.0;
+    let mut count = 0.0;
+
+    if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
+        for entry in entries.filter_map(Result::ok) {
+            let fname = entry.file_name();
+            let name = fname.to_string_lossy();
+            if name.starts_with("cpu")
+                && name[3..].chars().all(|c| c.is_ascii_digit())
+                && let Ok(cur_str) =
+                    fs::read_to_string(entry.path().join("cpufreq/scaling_cur_freq"))
+                && let Ok(cur_khz) = cur_str.trim().parse::<f64>()
+            {
+                cur_sum += cur_khz / 1000.0;
+                count += 1.0;
+            }
+        }
+    }
+
+    if count == 0.0
+        && let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo")
+    {
+        for line in cpuinfo.lines() {
+            if line.starts_with("cpu MHz")
+                && let Some(pos) = line.find(':')
+                && let Ok(mhz) = line[pos + 1..].trim().parse::<f64>()
+            {
+                cur_sum += mhz;
+                count += 1.0;
+            }
+        }
+    }
+
+    let cur_mhz = if count > 0.0 { cur_sum / count } else { 0.0 };
+
+    let min_mhz = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq")
+        .or_else(|_| fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|khz| khz / 1000.0)
+        .unwrap_or(800.0);
+
+    let max_mhz = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        .or_else(|_| fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|khz| khz / 1000.0)
+        .unwrap_or(4500.0);
+
+    (cur_mhz, min_mhz, max_mhz)
+}
+
+/// Reads the package/die CPU temperature from `/sys/class/hwmon` or `/sys/class/thermal`.
+///
+/// # Returns
+/// Temperature in degrees Celsius (or 0 if unavailable).
+pub fn read_cpu_temp() -> u32 {
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = fs::read_to_string(path.join("name"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if name.contains("k10temp")
+                || name.contains("coretemp")
+                || name.contains("zenpower")
+                || name.contains("cpu")
+                || name.contains("k8temp")
+            {
+                for temp_file in &["temp1_input", "temp2_input", "temp3_input"] {
+                    if let Ok(temp_str) = fs::read_to_string(path.join(temp_file))
+                        && let Ok(milli) = temp_str.trim().parse::<u32>()
+                        && milli > 0
+                        && milli < 150_000
+                    {
+                        return milli / 1000;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let t_type = fs::read_to_string(path.join("type"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if (t_type.contains("pkg")
+                || t_type.contains("cpu")
+                || t_type.contains("x86")
+                || t_type.contains("acpi"))
+                && let Ok(temp_str) = fs::read_to_string(path.join("temp"))
+                && let Ok(milli) = temp_str.trim().parse::<u32>()
+                && milli > 0
+                && milli < 150_000
+            {
+                return milli / 1000;
+            }
+        }
+    }
+
+    0
+}
+
+/// Reads `/proc/cpuinfo` to extract the official marketing model name of the CPU.
+///
+/// # Returns
+/// Model string such as `"AMD Ryzen 5 3600X 6-Core Processor"`.
+pub fn get_cpu_model() -> String {
+    if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+        for line in cpuinfo.lines() {
+            if line.starts_with("model name")
+                && let Some(pos) = line.find(':')
+            {
+                return line[pos + 1..].trim().to_string();
+            }
+        }
+    }
+    "CPU".to_string()
+}
+
+/// Queries hardware DMI table 17 via `dmidecode` or uses CPU architecture heuristics
+/// to determine RAM generation (DDR4/DDR5) and rated clock speed in MHz.
+///
+/// # Arguments
+/// * `total_mb` - Total RAM in megabytes.
+/// * `cpu_model` - Processor model string used for heuristic fallback.
+///
+/// # Returns
+/// Formatted string like `"16GB DDR4@3200MHz"` or `"32GB DDR5@5600MHz"`.
+pub fn get_ram_info(total_mb: u64, cpu_model: &str) -> String {
+    let total_gb = ((total_mb as f64) / 1024.0).round() as u64;
+
+    for bin in &["dmidecode", "/usr/sbin/dmidecode", "/sbin/dmidecode"] {
+        if let Ok(output) = std::process::Command::new(bin).args(["-t", "17"]).output()
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut ram_type = String::new();
+            let mut speed = String::new();
+
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("Type:")
+                    && !trimmed.contains("Error")
+                    && !trimmed.contains("Unknown")
+                {
+                    let t = trimmed.trim_start_matches("Type:").trim();
+                    if t.starts_with("DDR") || t.starts_with("LPDDR") {
+                        ram_type = t.to_string();
+                    }
+                }
+                if (trimmed.starts_with("Speed:")
+                    || trimmed.starts_with("Configured Memory Speed:"))
+                    && !trimmed.contains("Unknown")
+                {
+                    let s = if trimmed.starts_with("Configured Memory Speed:") {
+                        trimmed
+                            .trim_start_matches("Configured Memory Speed:")
+                            .trim()
+                    } else {
+                        trimmed.trim_start_matches("Speed:").trim()
+                    };
+                    let s_num: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if !s_num.is_empty() {
+                        speed = format!("{}MHz", s_num);
+                    }
+                }
+            }
+
+            if !ram_type.is_empty() {
+                if !speed.is_empty() {
+                    return format!("{}GB {}@{}", total_gb, ram_type.to_uppercase(), speed);
+                } else {
+                    return format!("{}GB {}", total_gb, ram_type.to_uppercase());
+                }
+            }
+        }
+    }
+
+    let cpu_lower = cpu_model.to_lowercase();
+    let (ram_type, speed) = if cpu_lower.contains("ryzen") {
+        if cpu_lower.contains("7000")
+            || cpu_lower.contains("8000")
+            || cpu_lower.contains("9000")
+            || cpu_lower.contains("79")
+            || cpu_lower.contains("78")
+            || cpu_lower.contains("77")
+            || cpu_lower.contains("76")
+        {
+            ("DDR5", "5600MHz")
+        } else {
+            ("DDR4", "3200MHz")
+        }
+    } else if cpu_lower.contains("intel") || cpu_lower.contains("core") {
+        if cpu_lower.contains("13th")
+            || cpu_lower.contains("14th")
+            || cpu_lower.contains("ultra")
+            || cpu_lower.contains("15th")
+        {
+            ("DDR5", "5600MHz")
+        } else if cpu_lower.contains("2nd")
+            || cpu_lower.contains("3rd")
+            || cpu_lower.contains("4th")
+            || cpu_lower.contains("i7-2")
+            || cpu_lower.contains("i7-3")
+            || cpu_lower.contains("i7-4")
+            || cpu_lower.contains("i5-2")
+            || cpu_lower.contains("i5-3")
+            || cpu_lower.contains("i5-4")
+        {
+            ("DDR3", "1600MHz")
+        } else {
+            ("DDR4", "3200MHz")
+        }
+    } else {
+        ("DDR4", "3200MHz")
+    };
+
+    format!("{}GB {}@{}", total_gb, ram_type, speed)
+}
+
+/// Real-time throughput metrics and hardware metadata for a network interface.
+#[derive(Clone, Default)]
+pub struct NetInterfaceInfo {
+    /// Interface name (e.g. `eth0`, `wlan0`, `enp5s0`).
+    pub name: String,
+    /// Cumulative received bytes.
+    pub rx_bytes: u64,
+    /// Cumulative transmitted bytes.
+    pub tx_bytes: u64,
+    /// Real-time receive speed in bytes per second.
+    pub rx_speed: f64,
+    /// Real-time transmit speed in bytes per second.
+    pub tx_speed: f64,
+    /// Hardware MAC address.
+    pub mac: String,
+    /// Interface operational state (e.g. `up`, `down`).
+    pub operstate: String,
+    /// Link speed in megabits per second (Mbps).
+    pub speed_mbps: u32,
+    /// Link duplex mode (e.g. `Full`, `Half`, `Unknown`).
+    pub duplex: String,
+}
+
+/// Reads `/proc/net/dev` and `/sys/class/net` to query network interface throughput and state.
+///
+/// # Arguments
+/// * `prev` - Map caching previous byte counters keyed by interface name.
+/// * `dt` - Time delta in seconds since the last measurement.
+///
+/// # Returns
+/// A vector of `NetInterfaceInfo` for all physical and virtual interfaces.
+pub fn read_network_interfaces(
+    prev: &mut HashMap<String, (u64, u64)>,
+    dt: f64,
+) -> Vec<NetInterfaceInfo> {
+    let mut ifaces = Vec::new();
+    if let Ok(content) = fs::read_to_string("/proc/net/dev") {
+        for line in content.lines().skip(2) {
+            let mut parts = line.split_whitespace();
+            if let Some(name_part) = parts.next() {
+                let name = name_part.trim_end_matches(':').to_string();
+                if name == "lo" {
+                    continue;
+                }
+                let rx_bytes = parts
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                for _ in 0..7 {
+                    parts.next();
+                }
+                let tx_bytes = parts
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let (rx_speed, tx_speed) = if let Some(&(prev_rx, prev_tx)) = prev.get(&name) {
+                    if dt > 0.0 {
+                        (
+                            rx_bytes.saturating_sub(prev_rx) as f64 / dt,
+                            tx_bytes.saturating_sub(prev_tx) as f64 / dt,
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    }
+                } else {
+                    (0.0, 0.0)
+                };
+                prev.insert(name.clone(), (rx_bytes, tx_bytes));
+
+                let mac = fs::read_to_string(format!("/sys/class/net/{}/address", name))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let operstate = fs::read_to_string(format!("/sys/class/net/{}/operstate", name))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                let speed_mbps = fs::read_to_string(format!("/sys/class/net/{}/speed", name))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+                let raw_duplex = fs::read_to_string(format!("/sys/class/net/{}/duplex", name))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let duplex = match raw_duplex.to_lowercase().as_str() {
+                    "full" => "Full".to_string(),
+                    "half" => "Half".to_string(),
+                    _ => "Unknown".to_string(),
+                };
+
+                ifaces.push(NetInterfaceInfo {
+                    name,
+                    rx_bytes,
+                    tx_bytes,
+                    rx_speed,
+                    tx_speed,
+                    mac,
+                    operstate,
+                    speed_mbps,
+                    duplex,
+                });
+            }
+        }
+    }
+    ifaces
+}
+
+/// Mounted filesystem partition capacity and usage information.
+#[derive(Clone, Default)]
+pub struct MountInfo {
+    /// Underlying block device path (e.g. `/dev/nvme0n1p2`).
+    pub device: String,
+    /// Destination mount point path (e.g. `/` or `/home`).
+    pub mount_point: String,
+    /// Filesystem type name (e.g. `ext4`, `btrfs`, `zfs`).
+    pub fs_type: String,
+    /// Total storage capacity in bytes.
+    pub total_bytes: u64,
+    /// Used storage in bytes.
+    pub used_bytes: u64,
+    /// Free storage available to unprivileged users in bytes.
+    pub free_bytes: u64,
+    /// Storage utilization percentage (0.0 to 100.0).
+    pub used_pct: f64,
+}
+
+/// Individual block device model and real-time I/O throughput.
+#[derive(Clone, Default)]
+pub struct DiskDeviceInfo {
+    /// Kernel device name (e.g. `nvme0n1` or `sda`).
+    pub name: String,
+    /// Disk model identifier from sysfs.
+    pub model: String,
+    /// Read throughput speed in bytes per second.
+    pub read_speed: f64,
+    /// Write throughput speed in bytes per second.
+    pub write_speed: f64,
+}
+
+/// Aggregated and per-device disk I/O metrics.
+#[derive(Clone, Default)]
+pub struct DiskIoInfo {
+    /// Aggregate read throughput in bytes per second.
+    pub read_speed: f64,
+    /// Aggregate write throughput in bytes per second.
+    pub write_speed: f64,
+    /// Total cumulative read bytes across all physical disks.
+    pub total_read_bytes: u64,
+    /// Total cumulative written bytes across all physical disks.
+    pub total_write_bytes: u64,
+    /// List of physical block devices and their individual metrics.
+    pub disks: Vec<DiskDeviceInfo>,
+}
+
+/// Reads `/proc/mounts` and queries safe filesystem statistics via `rustix::fs::statvfs`.
+///
+/// # Returns
+/// A list of `MountInfo` for physical mounted partitions.
+pub fn read_disk_mounts() -> Vec<MountInfo> {
+    let mut mounts = Vec::new();
+    let mut seen_mounts = HashSet::new();
+    if let Ok(content) = fs::read_to_string("/proc/mounts") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let device = parts[0];
+                let mount_point = parts[1];
+                let fs_type = parts[2];
+
+                if !device.starts_with("/dev/") {
+                    continue;
+                }
+                if fs_type == "squashfs"
+                    || fs_type == "tmpfs"
+                    || fs_type == "devtmpfs"
+                    || fs_type == "overlay"
+                {
+                    continue;
+                }
+                if seen_mounts.contains(mount_point) {
+                    continue;
+                }
+                seen_mounts.insert(mount_point.to_string());
+
+                if let Ok(stat) = rustix::fs::statvfs(mount_point)
+                    && stat.f_blocks > 0
+                {
+                    let bsize = stat.f_frsize;
+                    let total_bytes = stat.f_blocks * bsize;
+                    let free_bytes = stat.f_bavail * bsize;
+                    let used_bytes = total_bytes.saturating_sub(stat.f_bfree * bsize);
+                    let used_pct = if total_bytes > 0 {
+                        (used_bytes as f64 / total_bytes as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
+                    mounts.push(MountInfo {
+                        device: device.to_string(),
+                        mount_point: mount_point.to_string(),
+                        fs_type: fs_type.to_string(),
+                        total_bytes,
+                        used_bytes,
+                        free_bytes,
+                        used_pct,
+                    });
+                }
+            }
+        }
+    }
+    mounts.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    mounts
+}
+
+/// Reads `/proc/diskstats` and `/sys/block` to track global and per-drive disk throughput.
+///
+/// # Arguments
+/// * `prev` - Map caching previous sector counts keyed by device name.
+/// * `dt` - Time delta in seconds since the last measurement.
+///
+/// # Returns
+/// A populated `DiskIoInfo` structure.
+pub fn read_disk_io(prev: &mut HashMap<String, (u64, u64)>, dt: f64) -> DiskIoInfo {
+    let mut info = DiskIoInfo::default();
+    if let Ok(content) = fs::read_to_string("/proc/diskstats") {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 10 {
+                let name = parts[2];
+                let is_disk = (name.starts_with("nvme") && !name.contains('p'))
+                    || ((name.starts_with("sd")
+                        || name.starts_with("vd")
+                        || name.starts_with("hd"))
+                        && !name.chars().last().unwrap_or(' ').is_ascii_digit());
+
+                if !is_disk {
+                    continue;
+                }
+
+                let read_sectors = parts[5].parse::<u64>().unwrap_or(0);
+                let write_sectors = parts[9].parse::<u64>().unwrap_or(0);
+                let read_bytes = read_sectors * 512;
+                let write_bytes = write_sectors * 512;
+
+                info.total_read_bytes += read_bytes;
+                info.total_write_bytes += write_bytes;
+
+                let (d_rx_speed, d_tx_speed) = if let Some(&(prev_r, prev_w)) = prev.get(name) {
+                    if dt > 0.0 {
+                        (
+                            read_bytes.saturating_sub(prev_r) as f64 / dt,
+                            write_bytes.saturating_sub(prev_w) as f64 / dt,
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    }
+                } else {
+                    (0.0, 0.0)
+                };
+                prev.insert(name.to_string(), (read_bytes, write_bytes));
+
+                info.read_speed += d_rx_speed;
+                info.write_speed += d_tx_speed;
+
+                let model = fs::read_to_string(format!("/sys/block/{}/device/model", name))
+                    .or_else(|_| fs::read_to_string(format!("/sys/block/{}/device/name", name)))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| name.to_string());
+
+                info.disks.push(DiskDeviceInfo {
+                    name: name.to_string(),
+                    model,
+                    read_speed: d_rx_speed,
+                    write_speed: d_tx_speed,
+                });
+            }
+        }
+    }
+    info
+}
+
+/// Detailed information about a Docker named or anonymous storage volume.
+#[derive(Clone, Default)]
+pub struct DockerVolumeInfo {
+    /// Volume name or hash identifier.
+    pub name: String,
+    /// Number of active container links/mounts.
+    pub links: u32,
+    /// Storage space used by the volume in bytes.
+    pub size_bytes: u64,
+    /// Formatted human-readable size string.
+    pub size_str: String,
+}
+
+/// Overall Docker / Container engine disk space telemetry.
+#[derive(Clone, Default)]
+pub struct DockerStorageInfo {
+    /// Whether Docker daemon is available and responding.
+    pub is_available: bool,
+    /// Total storage used across all local volumes in bytes.
+    pub total_volumes_bytes: u64,
+    /// Formatted total volumes size string.
+    pub total_volumes_str: String,
+    /// Formatted total build cache size string.
+    pub total_build_cache_str: String,
+    /// Individual volume details.
+    pub volumes: Vec<DockerVolumeInfo>,
+}
+
+/// Queries Docker daemon via `docker system df -v` to extract image, container,
+/// build cache, and per-volume disk space usage metrics.
+///
+/// # Returns
+/// A populated `DockerStorageInfo` structure.
+pub fn read_docker_storage() -> DockerStorageInfo {
+    let mut info = DockerStorageInfo::default();
+
+    for bin in &[
+        "docker",
+        "/run/current-system/sw/bin/docker",
+        "/usr/bin/docker",
+        "/usr/local/bin/docker",
+    ] {
+        if let Ok(output) = std::process::Command::new(bin)
+            .args(["system", "df", "-v"])
+            .output()
+            && output.status.success()
+        {
+            info.is_available = true;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut section = "";
+
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("Images space usage:") {
+                    section = "images";
+                    continue;
+                } else if trimmed.starts_with("Containers space usage:") {
+                    section = "containers";
+                    continue;
+                } else if trimmed.starts_with("Local Volumes space usage:") {
+                    section = "volumes";
+                    continue;
+                } else if trimmed.starts_with("Build cache usage:") {
+                    section = "cache";
+                    let cache_str = trimmed.trim_start_matches("Build cache usage:").trim();
+                    info.total_build_cache_str = cache_str.to_string();
+                    continue;
+                }
+
+                if section == "volumes" {
+                    if trimmed.is_empty() || trimmed.starts_with("VOLUME NAME") {
+                        continue;
+                    }
+                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                    if parts.len() >= 3 {
+                        let name = parts[0].to_string();
+                        let links = parts[1].parse::<u32>().unwrap_or(0);
+                        let size_str = parts[2].to_string();
+                        let size_bytes = parse_size_to_bytes(&size_str);
+                        info.total_volumes_bytes += size_bytes;
+                        info.volumes.push(DockerVolumeInfo {
+                            name,
+                            links,
+                            size_bytes,
+                            size_str,
+                        });
+                    }
+                }
+            }
+
+            info.total_volumes_str = format_bytes_dyn(info.total_volumes_bytes as f64);
+            return info;
+        }
+    }
+
+    info
+}
