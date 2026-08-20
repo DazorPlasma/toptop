@@ -8,6 +8,11 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::Read,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
+    },
 };
 
 use crate::utils::{format_bytes_dyn, parse_size_to_bytes};
@@ -438,12 +443,6 @@ pub struct SystemGeneralInfo {
     pub kernel: String,
     /// System uptime in seconds.
     pub uptime_secs: u64,
-    /// 1-minute system load average.
-    pub load_1: f64,
-    /// 5-minute system load average.
-    pub load_5: f64,
-    /// 15-minute system load average.
-    pub load_15: f64,
     /// Active Desktop Environment and session type.
     pub desktop: String,
     /// Current shell executable name.
@@ -500,18 +499,6 @@ pub fn read_system_general_info() -> SystemGeneralInfo {
         })
         .map(|s| s.round() as u64)
         .unwrap_or(0);
-
-    let mut load_1 = 0.0;
-    let mut load_5 = 0.0;
-    let mut load_15 = 0.0;
-    if let Ok(loadavg) = fs::read_to_string("/proc/loadavg") {
-        let parts: Vec<&str> = loadavg.split_whitespace().collect();
-        if parts.len() >= 3 {
-            load_1 = parts[0].parse().unwrap_or(0.0);
-            load_5 = parts[1].parse().unwrap_or(0.0);
-            load_15 = parts[2].parse().unwrap_or(0.0);
-        }
-    }
 
     let desktop = get_desktop_environment();
     let shell = std::env::var("SHELL").unwrap_or_default();
@@ -572,9 +559,6 @@ pub fn read_system_general_info() -> SystemGeneralInfo {
         os_name,
         kernel,
         uptime_secs,
-        load_1,
-        load_5,
-        load_15,
         desktop,
         shell: shell_name,
         local_ip,
@@ -2043,4 +2027,431 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
     }
 
     categories
+}
+
+/// Represents an active network socket connection (TCP / UDP) parsed from `/proc/net/`.
+#[derive(Debug, Clone)]
+pub struct NetConnectionInfo {
+    /// Protocol type ("TCP", "TCP6", "UDP", "UDP6").
+    pub proto: &'static str,
+    /// Local bound IP address.
+    pub local_ip: IpAddr,
+    /// Local bound port number.
+    pub local_port: u16,
+    /// Resolved reverse DNS local hostname if available.
+    pub local_host: Option<String>,
+    /// Remote peer IP address.
+    pub remote_ip: IpAddr,
+    /// Remote peer port number.
+    pub remote_port: u16,
+    /// Connection state (e.g. "ESTABLISHED", "LISTEN", "TIME_WAIT").
+    pub state: &'static str,
+    /// Owning Process PID if resolvable.
+    pub pid: Option<u32>,
+    /// Owning Process name/command if resolvable.
+    pub process_name: Option<String>,
+    /// Resolved reverse DNS hostname if available.
+    pub remote_host: Option<String>,
+    /// Socket inode identifier.
+    #[allow(dead_code)]
+    pub inode: u64,
+}
+
+impl Default for NetConnectionInfo {
+    fn default() -> Self {
+        Self {
+            proto: "TCP",
+            local_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            local_port: 0,
+            local_host: None,
+            remote_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            remote_port: 0,
+            state: "UNKNOWN",
+            pid: None,
+            process_name: None,
+            remote_host: None,
+            inode: 0,
+        }
+    }
+}
+
+/// Asynchronous non-blocking reverse DNS resolver with thread-safe cache and local host mapping.
+pub struct DnsResolver {
+    /// Static IP-to-hostname map loaded from `/etc/hostname`, `/etc/hosts`, and `/proc/net/fib_trie`.
+    static_hosts: HashMap<IpAddr, String>,
+    /// Thread-safe map of cached resolved hostnames.
+    cache: Arc<Mutex<HashMap<IpAddr, Option<String>>>>,
+    /// Channel sender for requesting async reverse DNS resolution.
+    req_tx: Sender<IpAddr>,
+}
+
+impl Default for DnsResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DnsResolver {
+    /// Creates a new background DNS resolver worker.
+    pub fn new() -> Self {
+        let static_hosts = get_local_hosts_map();
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let (req_tx, req_rx): (Sender<IpAddr>, Receiver<IpAddr>) = channel();
+        let cache_clone = Arc::clone(&cache);
+
+        std::thread::Builder::new()
+            .name("dns-resolver".to_string())
+            .spawn(move || {
+                let mut requested: HashSet<IpAddr> = HashSet::new();
+                while let Ok(ip) = req_rx.recv() {
+                    if requested.contains(&ip) {
+                        continue;
+                    }
+                    requested.insert(ip);
+
+                    if ip.is_loopback() || ip.is_unspecified() {
+                        if let Ok(mut c) = cache_clone.lock() {
+                            c.insert(ip, Some("localhost".to_string()));
+                        }
+                        continue;
+                    }
+
+                    let resolved = reverse_dns_lookup(ip);
+                    if let Ok(mut c) = cache_clone.lock() {
+                        c.insert(ip, resolved);
+                    }
+                }
+            })
+            .ok();
+
+        Self {
+            static_hosts,
+            cache,
+            req_tx,
+        }
+    }
+
+    /// Queries the DNS cache for an IP hostname, scheduling async lookup if absent.
+    pub fn get_or_resolve(&self, ip: IpAddr) -> Option<String> {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return Some("localhost".to_string());
+        }
+        if let Some(host) = self.static_hosts.get(&ip) {
+            return Some(host.clone());
+        }
+        if let Ok(c) = self.cache.lock()
+            && let Some(cached) = c.get(&ip)
+        {
+            return cached.clone();
+        }
+        let _ = self.req_tx.send(ip);
+        None
+    }
+}
+
+/// Loads static IP-to-hostname mappings from `/etc/hostname`, `/etc/hosts`, and `/proc/net/fib_trie`.
+fn get_local_hosts_map() -> HashMap<IpAddr, String> {
+    let mut map = HashMap::new();
+
+    map.insert(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        "localhost".to_string(),
+    );
+    map.insert(IpAddr::V6(Ipv6Addr::LOCALHOST), "localhost".to_string());
+
+    let hostname = fs::read_to_string("/etc/hostname")
+        .or_else(|_| fs::read_to_string("/proc/sys/kernel/hostname"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| {
+            rustix::system::uname()
+                .nodename()
+                .to_string_lossy()
+                .to_string()
+        });
+
+    if !hostname.is_empty() {
+        map.insert(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), hostname.clone());
+
+        // Parse local IPv4 addresses from /proc/net/fib_trie
+        if let Ok(fib) = fs::read_to_string("/proc/net/fib_trie") {
+            let mut prev_ip: Option<IpAddr> = None;
+            for line in fib.lines() {
+                if line.contains("|--") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    prev_ip = parts.last().and_then(|s| s.parse::<IpAddr>().ok());
+                } else if line.contains("/32 host LOCAL")
+                    && let Some(ip) = prev_ip
+                {
+                    map.insert(ip, hostname.clone());
+                }
+            }
+        }
+
+        // Parse local IPv6 addresses from /proc/net/if_inet6
+        if let Ok(inet6) = fs::read_to_string("/proc/net/if_inet6") {
+            for line in inet6.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(hex_ip) = parts.first()
+                    && let Some(v6) = parse_ipv6_hex(hex_ip)
+                {
+                    map.insert(IpAddr::V6(v6), hostname.clone());
+                }
+            }
+        }
+    }
+
+    if let Ok(hosts_content) = fs::read_to_string("/etc/hosts") {
+        for line in hosts_content.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            if let Some(ip_str) = parts.next()
+                && let Some(host_str) = parts.next()
+                && let Ok(ip) = ip_str.parse::<IpAddr>()
+            {
+                map.entry(ip).or_insert_with(|| host_str.to_string());
+            }
+        }
+    }
+
+    map
+}
+
+/// Performs safe reverse DNS lookup via system name service switch.
+fn reverse_dns_lookup(ip: IpAddr) -> Option<String> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Some("localhost".to_string());
+    }
+
+    let ip_str = ip.to_string();
+    if let Ok(output) = std::process::Command::new("getent")
+        .args(["hosts", &ip_str])
+        .output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parts: Vec<&str> = stdout.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let host = parts[1];
+            if !host.is_empty() && host != ip_str {
+                return Some(host.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Builds a mapping of socket inode numbers to `(PID, process_comm)` by scanning `/proc/*/fd/`.
+pub fn build_socket_inode_map() -> HashMap<u64, (u32, String)> {
+    let mut map = HashMap::new();
+    let Ok(proc_dir) = fs::read_dir("/proc") else {
+        return map;
+    };
+    for entry in proc_dir.flatten() {
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        let Ok(fd_dir) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            continue;
+        };
+        for fd_entry in fd_dir.flatten() {
+            if let Ok(link) = fs::read_link(fd_entry.path()) {
+                let link_str = link.to_string_lossy();
+                if let Some(rest) = link_str.strip_prefix("socket:[")
+                    && let Some(inode_str) = rest.strip_suffix(']')
+                    && let Ok(inode) = inode_str.parse::<u64>()
+                {
+                    map.insert(inode, (pid, comm.clone()));
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Parses a 32-bit IPv4 hex string in little-endian order into an `Ipv4Addr`.
+fn parse_ipv4_hex(hex: &str) -> Option<Ipv4Addr> {
+    let val = u32::from_str_radix(hex, 16).ok()?;
+    Some(Ipv4Addr::from(val.to_le_bytes()))
+}
+
+/// Parses a 128-bit IPv6 hex string in 4 little-endian 32-bit words into an `Ipv6Addr`.
+fn parse_ipv6_hex(hex: &str) -> Option<Ipv6Addr> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..4 {
+        let word = u32::from_str_radix(&hex[i * 8..(i + 1) * 8], 16).ok()?;
+        bytes[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
+    }
+    Some(Ipv6Addr::from(bytes))
+}
+
+/// Parses a 16-bit port hex string into a numeric port value.
+fn parse_port_hex(hex: &str) -> Option<u16> {
+    u16::from_str_radix(hex, 16).ok()
+}
+
+/// Translates Linux `/proc/net/tcp` hex connection state string to human-readable label.
+fn parse_tcp_state(st_hex: &str) -> &'static str {
+    match st_hex {
+        "01" => "ESTABLISHED",
+        "02" => "SYN_SENT",
+        "03" => "SYN_RECV",
+        "04" => "FIN_WAIT1",
+        "05" => "FIN_WAIT2",
+        "06" => "TIME_WAIT",
+        "07" => "CLOSE",
+        "08" => "CLOSE_WAIT",
+        "09" => "LAST_ACK",
+        "0A" => "LISTEN",
+        "0B" => "CLOSING",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Reads active network connections from `/proc/net/tcp*` and `/proc/net/udp*`.
+///
+/// # Returns
+/// `Ok(Vec<NetConnectionInfo>)` or `Err("Root permissions required.")` if restricted.
+pub fn read_network_connections(
+    dns: &DnsResolver,
+) -> Result<Vec<NetConnectionInfo>, &'static str> {
+    let mut conns = Vec::new();
+    let socket_map = build_socket_inode_map();
+
+    let files = [
+        ("/proc/net/tcp", "TCP", false),
+        ("/proc/net/tcp6", "TCP6", true),
+        ("/proc/net/udp", "UDP", false),
+        ("/proc/net/udp6", "UDP6", true),
+    ];
+
+    let mut had_perm_error = false;
+    let mut successfully_read = 0;
+
+    for (path, proto, is_v6) in files {
+        let content = match fs::read_to_string(path) {
+            Ok(c) => {
+                successfully_read += 1;
+                c
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                had_perm_error = true;
+                continue;
+            }
+            Err(_) => continue,
+        };
+
+        for line in content.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 10 {
+                continue;
+            }
+
+            let local_parts: Vec<&str> = parts[1].split(':').collect();
+            if local_parts.len() != 2 {
+                continue;
+            }
+            let local_ip = if is_v6 {
+                parse_ipv6_hex(local_parts[0])
+                    .map(IpAddr::V6)
+                    .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+            } else {
+                parse_ipv4_hex(local_parts[0])
+                    .map(IpAddr::V4)
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            };
+            let local_port = parse_port_hex(local_parts[1]).unwrap_or(0);
+
+            let rem_parts: Vec<&str> = parts[2].split(':').collect();
+            if rem_parts.len() != 2 {
+                continue;
+            }
+            let remote_ip = if is_v6 {
+                parse_ipv6_hex(rem_parts[0])
+                    .map(IpAddr::V6)
+                    .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+            } else {
+                parse_ipv4_hex(rem_parts[0])
+                    .map(IpAddr::V4)
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            };
+            let remote_port = parse_port_hex(rem_parts[1]).unwrap_or(0);
+
+            let state = if proto.starts_with("UDP") {
+                "UNCONN"
+            } else {
+                parse_tcp_state(parts[3])
+            };
+            let inode = parts[9].parse::<u64>().unwrap_or(0);
+
+            let (pid, process_name) = if let Some((p, comm)) = socket_map.get(&inode) {
+                (Some(*p), Some(comm.clone()))
+            } else {
+                (None, None)
+            };
+
+            let local_host = if !local_ip.is_unspecified() {
+                dns.get_or_resolve(local_ip)
+            } else {
+                None
+            };
+
+            let remote_host = if !remote_ip.is_unspecified() {
+                dns.get_or_resolve(remote_ip)
+            } else {
+                None
+            };
+
+            conns.push(NetConnectionInfo {
+                proto,
+                local_ip,
+                local_port,
+                local_host,
+                remote_ip,
+                remote_port,
+                state,
+                pid,
+                process_name,
+                remote_host,
+                inode,
+            });
+        }
+    }
+
+    if successfully_read == 0 && had_perm_error {
+        return Err("Root permissions required.");
+    }
+
+    // Sort: established connections first, then listening sockets
+    conns.sort_by(|a, b| {
+        let a_prio = match a.state {
+            "ESTABLISHED" => 0,
+            "SYN_SENT" | "SYN_RECV" => 1,
+            "CLOSE_WAIT" | "TIME_WAIT" | "FIN_WAIT1" | "FIN_WAIT2" => 2,
+            "LISTEN" => 3,
+            _ => 4,
+        };
+        let b_prio = match b.state {
+            "ESTABLISHED" => 0,
+            "SYN_SENT" | "SYN_RECV" => 1,
+            "CLOSE_WAIT" | "TIME_WAIT" | "FIN_WAIT1" | "FIN_WAIT2" => 2,
+            "LISTEN" => 3,
+            _ => 4,
+        };
+        a_prio.cmp(&b_prio).then_with(|| a.proto.cmp(b.proto))
+    });
+
+    Ok(conns)
 }

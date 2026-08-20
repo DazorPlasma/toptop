@@ -4,22 +4,27 @@
 //! 2x4 sub-pixel Unicode Braille gradient historical graphs, tables, gauges,
 //! and dashboard cards for all 6 monitor tabs.
 
+use std::collections::{HashMap, HashSet};
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
-    text::Line,
-    widgets::{Block, BorderType, Borders, Cell, Row, Table, TableState},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Cell, Row, Table, TableState, Tabs},
 };
 
 use crate::{
-    process::{ProcessInfo, ProcessSortColumn},
+    process::{
+        group_processes_for_simple_view, matches_process_search, ProcessInfo,
+        ProcessKillConfirmation, ProcessSortColumn,
+    },
     system::{
-        BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetInterfaceInfo,
-        PackageStorageCategory, SystemGeneralInfo,
+        BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo,
+        NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo,
     },
     theme::{darken_color, gradient_color, io_gradient_pct, process_cpu_color},
-    utils::{format_bytes_dyn, format_freq, format_percent, format_uptime, fuzzy_match},
+    utils::{format_bytes_dyn, format_freq, format_percent, format_uptime},
 };
 
 /// Computes the 8-bit Unicode Braille dot bitmask for a given sub-pixel cell coordinate.
@@ -249,14 +254,75 @@ pub fn render_gradient_chart(
     }
 }
 
-/// Renders the Process Manager (Tab 2) interactive table view with sorting, filtering, and detailed columns.
+/// Formats a process command string into styled Ratatui Spans, highlighting the binary/app
+/// and dimming command line option flags and arguments (`-f`, `--option`, `value`).
+///
+/// # Arguments
+/// * `cmd` - Process name or command line invocation.
+/// * `is_selected` - Whether the current table row is cursor selected.
+///
+/// # Returns
+/// A Ratatui `Line` containing styled text spans.
+pub fn format_command_spans<'a>(cmd: &'a str, is_selected: bool) -> Line<'a> {
+    let mut spans = Vec::new();
+    let tokens: Vec<&'a str> = cmd.split_whitespace().collect();
+    let mut in_args = false;
+
+    for (i, &tok) in tokens.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+
+        if tok == "▶" || tok == "▼" {
+            let style = if is_selected {
+                Style::default().fg(Color::Rgb(255, 255, 255)).bold()
+            } else {
+                Style::default().fg(Color::Rgb(240, 240, 240)).bold()
+            };
+            spans.push(Span::styled(tok, style));
+            continue;
+        }
+
+        if tok == "├─" || tok == "└─" {
+            let style = if is_selected {
+                Style::default().fg(Color::Rgb(180, 180, 180))
+            } else {
+                Style::default().fg(Color::Rgb(120, 120, 120))
+            };
+            spans.push(Span::styled(tok, style));
+            continue;
+        }
+
+        if tok.starts_with('-') {
+            in_args = true;
+        }
+
+        let style = if in_args {
+            if is_selected {
+                Style::default().fg(Color::Rgb(160, 160, 160))
+            } else {
+                Style::default().fg(Color::Rgb(110, 110, 110))
+            }
+        } else if is_selected {
+            Style::default().fg(Color::Rgb(255, 255, 255)).bold()
+        } else {
+            Style::default().fg(Color::Rgb(240, 240, 240)).bold()
+        };
+        spans.push(Span::styled(tok, style));
+    }
+
+    Line::from(spans)
+}
+
+/// Renders the Process Manager (Tab 2) interactive sorting table.
 ///
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
-/// * `area` - Target bounding box for the table widget.
-/// * `processes` - List of active processes to display.
-/// * `advanced_view` - Whether advanced column mode (with UID, State, Threads, etc.) is enabled.
-/// * `search_query` - Current fuzzy filter search text.
+/// * `area` - Target bounding box for the table.
+/// * `processes` - Current snapshot of system processes.
+/// * `advanced_view` - Whether advanced view (all columns, kernel threads, raw paths) is enabled.
+/// * `expanded_groups` - Set of group names currently expanded in tree view.
+/// * `search_query` - Current user search filter text.
 /// * `is_searching` - Whether the search query input box is active.
 /// * `current_sort_col` - Currently selected sort column.
 /// * `sort_ascending` - Sort order direction.
@@ -269,6 +335,7 @@ pub fn render_process_tab(
     area: Rect,
     processes: &[ProcessInfo],
     advanced_view: bool,
+    expanded_groups: &HashSet<String>,
     search_query: &str,
     is_searching: bool,
     current_sort_col: ProcessSortColumn,
@@ -277,77 +344,92 @@ pub fn render_process_tab(
     num_cores: usize,
     table_state: &mut TableState,
 ) {
-    let displayed_processes: Vec<&ProcessInfo> = processes
+    let grouped_storage;
+    let base_processes: &[ProcessInfo] = if advanced_view {
+        processes
+    } else {
+        grouped_storage = group_processes_for_simple_view(
+            processes,
+            expanded_groups,
+            current_sort_col,
+            sort_ascending,
+            search_query,
+        );
+        &grouped_storage
+    };
+
+    let proc_map: HashMap<u32, &ProcessInfo> = processes.iter().map(|p| (p.pid, p)).collect();
+
+    let displayed_processes: Vec<&ProcessInfo> = base_processes
         .iter()
         .filter(|p| advanced_view || p.rss_kb > 0)
-        .filter(|p| {
-            search_query.is_empty()
-                || fuzzy_match(search_query, &p.name)
-                || fuzzy_match(search_query, &p.pid.to_string())
-                || fuzzy_match(search_query, &p.user)
-        })
+        .filter(|p| matches_process_search(p, search_query, Some(&proc_map)))
         .collect();
+
+    let show_pid = area.width >= 150;
 
     let (header_titles, constraints): (Vec<(&str, ProcessSortColumn)>, Vec<Constraint>) =
         if advanced_view {
-            (
-                vec![
-                    ("PID", ProcessSortColumn::Pid),
-                    ("User", ProcessSortColumn::User),
-                    ("Name", ProcessSortColumn::Name),
-                    ("State", ProcessSortColumn::State),
-                    ("Threads", ProcessSortColumn::Threads),
-                    ("CPU", ProcessSortColumn::Cpu),
-                    ("RAM", ProcessSortColumn::Mem),
-                    ("GPU", ProcessSortColumn::Gpu),
-                    ("VRAM", ProcessSortColumn::GpuMem),
-                    ("IO", ProcessSortColumn::Io),
-                    ("Net", ProcessSortColumn::Net),
-                ],
-                vec![
-                    Constraint::Length(8),  // PID
-                    Constraint::Length(10), // User
-                    Constraint::Fill(1),    // Name
-                    Constraint::Length(7),  // State
-                    Constraint::Length(8),  // Threads
-                    Constraint::Length(8),  // CPU
-                    Constraint::Length(10), // RAM
-                    Constraint::Length(8),  // GPU
-                    Constraint::Length(10), // VRAM
-                    Constraint::Length(23), // IO (read / write)
-                    Constraint::Length(23), // Net (down / up)
-                ],
-            )
+            let mut titles = Vec::with_capacity(11);
+            let mut cons = Vec::with_capacity(11);
+            if show_pid {
+                titles.push(("PID", ProcessSortColumn::Pid));
+                cons.push(Constraint::Length(8));
+            }
+            titles.push(("User", ProcessSortColumn::User));
+            cons.push(Constraint::Length(10));
+            titles.push(("Name", ProcessSortColumn::Name));
+            cons.push(Constraint::Fill(1));
+            titles.push(("State", ProcessSortColumn::State));
+            cons.push(Constraint::Length(7));
+            titles.push(("Threads", ProcessSortColumn::Threads));
+            cons.push(Constraint::Length(8));
+            titles.push(("CPU", ProcessSortColumn::Cpu));
+            cons.push(Constraint::Length(8));
+            titles.push(("RAM", ProcessSortColumn::Mem));
+            cons.push(Constraint::Length(10));
+            titles.push(("GPU", ProcessSortColumn::Gpu));
+            cons.push(Constraint::Length(8));
+            titles.push(("VRAM", ProcessSortColumn::GpuMem));
+            cons.push(Constraint::Length(10));
+            titles.push(("IO", ProcessSortColumn::Io));
+            cons.push(Constraint::Length(22));
+            titles.push(("Net", ProcessSortColumn::Net));
+            cons.push(Constraint::Length(22));
+            (titles, cons)
         } else {
-            (
-                vec![
-                    ("PID", ProcessSortColumn::Pid),
-                    ("Name", ProcessSortColumn::Name),
-                    ("CPU", ProcessSortColumn::Cpu),
-                    ("RAM", ProcessSortColumn::Mem),
-                    ("GPU", ProcessSortColumn::Gpu),
-                    ("VRAM", ProcessSortColumn::GpuMem),
-                    ("IO", ProcessSortColumn::Io),
-                    ("Net", ProcessSortColumn::Net),
-                ],
-                vec![
-                    Constraint::Length(8),  // PID
-                    Constraint::Fill(1),    // Name
-                    Constraint::Length(8),  // CPU
-                    Constraint::Length(10), // RAM
-                    Constraint::Length(8),  // GPU
-                    Constraint::Length(10), // VRAM
-                    Constraint::Length(23), // IO (read / write)
-                    Constraint::Length(23), // Net (down / up)
-                ],
-            )
+            let mut titles = Vec::with_capacity(8);
+            let mut cons = Vec::with_capacity(8);
+            if show_pid {
+                titles.push(("PID", ProcessSortColumn::Pid));
+                cons.push(Constraint::Length(8));
+            }
+            titles.push(("Name", ProcessSortColumn::Name));
+            cons.push(Constraint::Fill(1));
+            titles.push(("CPU", ProcessSortColumn::Cpu));
+            cons.push(Constraint::Length(8));
+            titles.push(("RAM", ProcessSortColumn::Mem));
+            cons.push(Constraint::Length(10));
+            titles.push(("GPU", ProcessSortColumn::Gpu));
+            cons.push(Constraint::Length(8));
+            titles.push(("VRAM", ProcessSortColumn::GpuMem));
+            cons.push(Constraint::Length(10));
+            titles.push(("IO", ProcessSortColumn::Io));
+            cons.push(Constraint::Length(22));
+            titles.push(("Net", ProcessSortColumn::Net));
+            cons.push(Constraint::Length(22));
+            (titles, cons)
         };
 
     let header_cells = header_titles.iter().map(|&(title, col)| {
         if col == current_sort_col {
-            let arrow = if sort_ascending { "▲" } else { "▼" };
+            let (arrow, color) = if sort_ascending {
+                ("▲", Color::Rgb(0, 255, 255))
+            } else {
+                ("▼", Color::Rgb(255, 255, 0))
+            };
             Cell::from(format!("{} {}", title, arrow))
-                .style(Style::default().fg(Color::Rgb(255, 255, 0)).bold())
+                .style(Style::default().fg(color).bold())
         } else {
             Cell::from(title).style(Style::default().fg(Color::Rgb(255, 255, 255)))
         }
@@ -428,36 +510,30 @@ pub fn render_process_tab(
             format_bytes_dyn(p.net_tx_speed)
         );
 
-        let cells = if advanced_view {
-            vec![
-                Cell::from(p.pid.to_string()).style(Style::default().fg(text_color)),
-                Cell::from(p.user.clone()).style(Style::default().fg(text_color)),
-                Cell::from(p.name.clone()).style(Style::default().fg(text_color)),
-                Cell::from(p.state.clone()).style(Style::default().fg(text_color)),
-                Cell::from(p.threads.to_string()).style(Style::default().fg(text_color)),
-                Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)),
-                Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64))
-                    .style(Style::default().fg(mem_color)),
-                Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)),
-                Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64))
-                    .style(Style::default().fg(gpu_mem_color)),
-                Cell::from(io_text).style(Style::default().fg(io_color)),
-                Cell::from(net_text).style(Style::default().fg(net_color)),
-            ]
+        let mut cells = Vec::with_capacity(11);
+        if show_pid {
+            cells.push(Cell::from(p.pid.to_string()).style(Style::default().fg(text_color)));
+        }
+        if advanced_view {
+            cells.push(Cell::from(p.user.clone()).style(Style::default().fg(text_color)));
+            cells.push(Cell::from(p.name.clone()).style(Style::default().fg(text_color)));
+            cells.push(Cell::from(p.state.clone()).style(Style::default().fg(text_color)));
+            cells.push(Cell::from(p.threads.to_string()).style(Style::default().fg(text_color)));
+            cells.push(Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)));
+            cells.push(Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64)).style(Style::default().fg(mem_color)));
+            cells.push(Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)));
+            cells.push(Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64)).style(Style::default().fg(gpu_mem_color)));
+            cells.push(Cell::from(io_text).style(Style::default().fg(io_color)));
+            cells.push(Cell::from(net_text).style(Style::default().fg(net_color)));
         } else {
-            vec![
-                Cell::from(p.pid.to_string()).style(Style::default().fg(text_color)),
-                Cell::from(p.name.clone()).style(Style::default().fg(text_color)),
-                Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)),
-                Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64))
-                    .style(Style::default().fg(mem_color)),
-                Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)),
-                Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64))
-                    .style(Style::default().fg(gpu_mem_color)),
-                Cell::from(io_text).style(Style::default().fg(io_color)),
-                Cell::from(net_text).style(Style::default().fg(net_color)),
-            ]
-        };
+            cells.push(Cell::from(format_command_spans(&p.name, is_selected)));
+            cells.push(Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)));
+            cells.push(Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64)).style(Style::default().fg(mem_color)));
+            cells.push(Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)));
+            cells.push(Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64)).style(Style::default().fg(gpu_mem_color)));
+            cells.push(Cell::from(io_text).style(Style::default().fg(io_color)));
+            cells.push(Cell::from(net_text).style(Style::default().fg(net_color)));
+        }
         Row::new(cells).height(1)
     });
 
@@ -478,9 +554,9 @@ pub fn render_process_tab(
         " Processes [Advanced] ('/' Search, ←/→ Sort, 'r' Order, 'c' Term, 'k' Kill, ↑/↓/g/G Select, 'a' Normal View) "
             .to_string()
     } else {
-        " Processes ('/' Search, ←/→ Sort, 'r' Order, 'c' Term, 'k' Kill, ↑/↓/g/G Select, 'a' Advanced View) "
+        " Processes ('/' Search, Enter Expand/Collapse, ←/→ Sort, 'r' Order, 'c' Term, 'k' Kill, ↑/↓/g/G Select, 'a' Advanced View) "
             .to_string()
-    };
+    }.fg(Color::Rgb(170, 170, 170));
 
     let table = Table::new(rows, constraints)
         .header(header)
@@ -510,6 +586,7 @@ pub fn render_process_tab(
 /// * `cpu_model` - Marketing CPU model identifier string.
 /// * `mem` - Memory utilization metrics (RAM and swap).
 /// * `mem_history` - Historical RAM usage samples for Braille graphing.
+/// * `swap_history` - Historical Swap usage samples for Braille graphing.
 /// * `ram_info` - DMI memory capacity, speed, and DDR generation string.
 #[allow(clippy::too_many_arguments)]
 pub fn render_cpu_ram_tab(
@@ -524,6 +601,7 @@ pub fn render_cpu_ram_tab(
     cpu_model: &str,
     mem: &MemoryMetrics,
     mem_history: &[Option<f64>],
+    swap_history: &[Option<f64>],
     ram_info: &str,
 ) {
     let body_chunks = Layout::default()
@@ -531,11 +609,21 @@ pub fn render_cpu_ram_tab(
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
+    let num_cores = core_usages.len();
+    let available_rows = body_chunks[0].height.saturating_sub(2) as usize;
+    let needs_two_cols = available_rows > 0 && num_cores > available_rows;
+
+    let cores_constraint = if needs_two_cols {
+        Constraint::Percentage(36)
+    } else {
+        Constraint::Percentage(20)
+    };
+
     let cpu_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(0),
-            Constraint::Percentage(20),
+            cores_constraint,
             Constraint::Length(9),
         ])
         .split(body_chunks[0]);
@@ -552,68 +640,67 @@ pub fn render_cpu_ram_tab(
         frame,
         cpu_chunks[0],
         "CPU History",
-        Some((&cpu_freq_label, cpu_freq_color)),
+        None,
         Some(cpu_model),
         Color::Rgb(60, 60, 60),
         cpu_history,
     );
 
     let cores_block = Block::default()
-        .title("Cores".fg(Color::Rgb(170, 170, 170)))
+        .title(" Cores ".fg(Color::Rgb(170, 170, 170)))
+        .title(
+            Line::from(format!(" {} ", cpu_freq_label).fg(cpu_freq_color))
+                .alignment(ratatui::layout::Alignment::Right),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
     let cores_inner = cores_block.inner(cpu_chunks[1]);
     frame.render_widget(cores_block, cpu_chunks[1]);
 
-    let cores_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![
-            Constraint::Ratio(1, core_usages.len().max(1) as u32);
-            core_usages.len().max(1)
-        ])
-        .split(cores_inner);
+    if cores_inner.width > 0 && cores_inner.height > 0 {
+        let is_two_col = needs_two_cols && cores_inner.width >= 32;
+        let col_w = if is_two_col {
+            (cores_inner.width.saturating_sub(1)) / 2
+        } else {
+            cores_inner.width
+        };
 
-    for (i, &usage) in core_usages.iter().enumerate() {
-        if i >= cores_layout.len() {
-            break;
-        }
-        let c_area = cores_layout[i];
-        if c_area.height == 0 || c_area.width == 0 {
-            continue;
-        }
-        let label = format!("C{:<2} {:>3.0}% ", i, usage);
-        let label_len = label.chars().count() as u16;
-        for (idx, ch) in label.chars().enumerate() {
-            let col = c_area.x + idx as u16;
-            if col < c_area.right() {
-                frame.buffer_mut()[(col, c_area.y)]
-                    .set_char(ch)
-                    .set_style(Style::default().fg(Color::Rgb(170, 170, 170)));
-            }
-        }
+        for (i, &usage) in core_usages.iter().enumerate() {
+            let (col_idx, row_idx) = if is_two_col {
+                (i % 2, i / 2)
+            } else {
+                (0, i)
+            };
 
-        let bar_start = c_area.x + label_len;
-        let total_bar = c_area.right().saturating_sub(bar_start);
-        let usage_clamped = usage.clamp(0.0, 100.0);
-        let filled_len = ((total_bar as f64) * (usage_clamped / 100.0)).round() as u16;
-
-        for c in 0..total_bar {
-            let col = bar_start + c;
-            if col >= c_area.right() {
+            let row_y = cores_inner.y + row_idx as u16;
+            if row_y >= cores_inner.bottom() {
                 break;
             }
-            let pct = (c as f64 + 0.5) / (total_bar as f64) * 100.0;
-            if c < filled_len {
-                let color = gradient_color(pct);
-                frame.buffer_mut()[(col, c_area.y)]
-                    .set_char('━')
-                    .set_style(Style::default().fg(color));
+
+            let start_x = if col_idx == 0 {
+                cores_inner.x
             } else {
-                frame.buffer_mut()[(col, c_area.y)]
-                    .set_char('─')
-                    .set_style(Style::default().fg(Color::Rgb(50, 50, 50)));
-            }
+                cores_inner.x + col_w + 1
+            };
+            let max_x = if col_idx == 0 && is_two_col {
+                cores_inner.x + col_w
+            } else {
+                cores_inner.right()
+            };
+
+            draw_labeled_bar(
+                frame.buffer_mut(),
+                Rect {
+                    x: start_x,
+                    y: row_y,
+                    width: max_x.saturating_sub(start_x),
+                    height: 1,
+                },
+                &format!("C{:<2}:", i),
+                &format!("{:.0}%", usage),
+                usage,
+            );
         }
     }
 
@@ -673,14 +760,20 @@ pub fn render_cpu_ram_tab(
         }
     }
 
-    let mem_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(3),
-            Constraint::Length(3),
-        ])
+    let ram_swap_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(body_chunks[1]);
+
+    let ram_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(ram_swap_cols[0]);
+
+    let swap_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(ram_swap_cols[1]);
 
     let mem_percent_f64 = if mem.total_mem_mb > 0 {
         (mem.used_mem_mb as f64 / mem.total_mem_mb as f64) * 100.0
@@ -688,9 +781,21 @@ pub fn render_cpu_ram_tab(
         0.0
     };
 
+    let swap_pct = if mem.total_swap_mb > 0 {
+        (mem.used_swap_mb as f64 / mem.total_swap_mb as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let swap_label = if mem.total_swap_mb > 0 {
+        format!("{:.0}%", swap_pct)
+    } else {
+        "None".to_string()
+    };
+
     render_gradient_chart(
         frame,
-        mem_layout[0],
+        ram_layout[0],
         "Memory History",
         None,
         Some(ram_info),
@@ -698,13 +803,23 @@ pub fn render_cpu_ram_tab(
         mem_history,
     );
 
+    render_gradient_chart(
+        frame,
+        swap_layout[0],
+        "Swap History",
+        None,
+        Some(&swap_label),
+        Color::Rgb(60, 60, 60),
+        swap_history,
+    );
+
     let mem_block = Block::default()
-        .title("Memory Usage".fg(Color::Rgb(170, 170, 170)))
+        .title(" Memory Usage ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let mem_inner = mem_block.inner(mem_layout[1]);
-    frame.render_widget(mem_block, mem_layout[1]);
+    let mem_inner = mem_block.inner(ram_layout[1]);
+    frame.render_widget(mem_block, ram_layout[1]);
 
     if mem_inner.height > 0 && mem_inner.width > 0 {
         let total_bar = mem_inner.width;
@@ -750,19 +865,14 @@ pub fn render_cpu_ram_tab(
     }
 
     let swap_block = Block::default()
-        .title("Swap Usage".fg(Color::Rgb(170, 170, 170)))
+        .title(" Swap Usage ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let swap_inner = swap_block.inner(mem_layout[2]);
-    frame.render_widget(swap_block, mem_layout[2]);
+    let swap_inner = swap_block.inner(swap_layout[1]);
+    frame.render_widget(swap_block, swap_layout[1]);
 
     if swap_inner.height > 0 && swap_inner.width > 0 {
-        let swap_pct = if mem.total_swap_mb > 0 {
-            (mem.used_swap_mb as f64 / mem.total_swap_mb as f64) * 100.0
-        } else {
-            0.0
-        };
         let total_bar = swap_inner.width;
         let filled_len = ((total_bar as f64) * (swap_pct.clamp(0.0, 100.0) / 100.0)).round() as u16;
         let label = if mem.total_swap_mb > 0 {
@@ -995,7 +1105,7 @@ pub fn render_gpu_tab(
     }
 }
 
-/// Renders the Network (Tab 5) download/upload graphs, primary interface card, and interfaces list.
+/// Renders the Network (Tab 5) download/upload graphs, primary interface card, and active IP connections table.
 ///
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
@@ -1003,27 +1113,32 @@ pub fn render_gpu_tab(
 /// * `net_ifaces` - List of detected network interfaces and throughput rates.
 /// * `net_rx_history` - Historical download (RX) speed samples for Braille graphing.
 /// * `net_tx_history` - Historical upload (TX) speed samples for Braille graphing.
+/// * `connections_res` - Active network connections or permission error message.
+/// * `conn_scroll_offset` - Vertical scroll offset for connections list.
 pub fn render_network_tab(
     frame: &mut Frame,
     area: Rect,
     net_ifaces: &[NetInterfaceInfo],
     net_rx_history: &[Option<f64>],
     net_tx_history: &[Option<f64>],
+    connections_res: &Result<Vec<NetConnectionInfo>, &'static str>,
+    conn_scroll_offset: usize,
 ) {
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
     let top_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(body_chunks[0]);
 
-    let bottom_chunks = Layout::default()
+    // Top-Left: shared by the two graphs (horizontal split)
+    let graph_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
-        .split(body_chunks[1]);
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(top_chunks[0]);
 
     let primary_iface = net_ifaces
         .iter()
@@ -1037,7 +1152,7 @@ pub fn render_network_tab(
 
     render_gradient_chart(
         frame,
-        top_chunks[0],
+        graph_chunks[0],
         "Download (RX) History",
         None,
         Some(&rx_label),
@@ -1045,35 +1160,60 @@ pub fn render_network_tab(
         net_rx_history,
     );
 
+    render_gradient_chart(
+        frame,
+        graph_chunks[1],
+        "Upload (TX) History",
+        None,
+        Some(&tx_label),
+        Color::Rgb(60, 60, 60),
+        net_tx_history,
+    );
+
+    // Top-Right: Interfaces details
     let iface_block = Block::default()
-        .title(" Primary Interface ".fg(Color::Rgb(170, 170, 170)))
+        .title(" Interfaces ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
     let iface_inner = iface_block.inner(top_chunks[1]);
     frame.render_widget(iface_block, top_chunks[1]);
 
-    if iface_inner.height > 0
-        && iface_inner.width > 0
-        && let Some(iface) = primary_iface
-    {
-        let lines = [
-            format!("Interface: {}", iface.name),
-            format!("Status:    {}", iface.operstate),
-            format!("Speed:     {} Mbps", iface.speed_mbps),
-            format!("Duplex:    {}", iface.duplex),
-            format!("MAC:       {}", iface.mac),
-            format!("Total RX:  {}", format_bytes_dyn(iface.rx_bytes as f64)),
-            format!("Total TX:  {}", format_bytes_dyn(iface.tx_bytes as f64)),
-        ];
+    if iface_inner.height > 0 && iface_inner.width > 0 {
+        let mut lines = Vec::new();
+        if let Some(iface) = primary_iface {
+            lines.push(format!("Primary:  {}", iface.name));
+            lines.push(format!("Status:   {}", iface.operstate));
+            lines.push(format!("Speed:    {} Mbps", iface.speed_mbps));
+            lines.push(format!("Duplex:   {}", iface.duplex));
+            lines.push(format!("MAC:      {}", iface.mac));
+            lines.push(format!("Total RX: {}", format_bytes_dyn(iface.rx_bytes as f64)));
+            lines.push(format!("Total TX: {}", format_bytes_dyn(iface.tx_bytes as f64)));
+        }
+        if net_ifaces.len() > 1 {
+            lines.push("".to_string());
+            lines.push("Other:".to_string());
+            for other in net_ifaces
+                .iter()
+                .filter(|i| primary_iface.map(|p| p.name.as_str()) != Some(i.name.as_str()))
+            {
+                lines.push(format!(
+                    "• {}: {} (↓ {} / ↑ {})",
+                    other.name,
+                    other.operstate,
+                    format_bytes_dyn(other.rx_speed),
+                    format_bytes_dyn(other.tx_speed)
+                ));
+            }
+        }
         for (idx, line_str) in lines.iter().enumerate() {
             let row = iface_inner.y + idx as u16;
             if row < iface_inner.bottom() {
                 for (c_idx, ch) in line_str.chars().enumerate() {
                     let col = iface_inner.x + c_idx as u16;
                     if col < iface_inner.right() {
-                        let color = if idx == 1 && iface.operstate == "up" {
-                            Color::Rgb(0, 255, 0)
+                        let color = if idx == 1 && primary_iface.map(|i| i.operstate.as_str()) == Some("up") {
+                            Color::Rgb(0, 255, 128)
                         } else {
                             Color::Rgb(170, 170, 170)
                         };
@@ -1086,46 +1226,207 @@ pub fn render_network_tab(
         }
     }
 
-    render_gradient_chart(
-        frame,
-        bottom_chunks[0],
-        "Upload (TX) History",
-        None,
-        Some(&tx_label),
-        Color::Rgb(60, 60, 60),
-        net_tx_history,
-    );
-
-    let list_block = Block::default()
-        .title(" All Interfaces ".fg(Color::Rgb(170, 170, 170)))
+    // Bottom: Active Connections Card
+    let conn_block = Block::default()
+        .title(" Active Connections ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let list_inner = list_block.inner(bottom_chunks[1]);
-    frame.render_widget(list_block, bottom_chunks[1]);
+    let conn_inner = conn_block.inner(body_chunks[1]);
+    frame.render_widget(conn_block, body_chunks[1]);
 
-    if list_inner.height > 0 && list_inner.width > 0 {
-        let mut row_offset = 0;
-        for iface in net_ifaces {
-            let line1 = format!("{}: {}", iface.name, iface.operstate);
-            let line2 = format!(
-                " {} ↓ / {} ↑",
-                format_bytes_dyn(iface.rx_speed),
-                format_bytes_dyn(iface.tx_speed)
-            );
-            for line_str in &[line1, line2] {
-                let row = list_inner.y + row_offset;
-                if row < list_inner.bottom() {
-                    for (c_idx, ch) in line_str.chars().enumerate() {
-                        let col = list_inner.x + c_idx as u16;
-                        if col < list_inner.right() {
-                            frame.buffer_mut()[(col, row)]
+    if conn_inner.height > 0 && conn_inner.width > 0 {
+        match connections_res {
+            Err(msg) => {
+                let msg_len = msg.chars().count() as u16;
+                let msg_x = conn_inner.x + (conn_inner.width.saturating_sub(msg_len)) / 2;
+                let msg_y = conn_inner.y + conn_inner.height / 2;
+                if msg_y < conn_inner.bottom() {
+                    for (c_idx, ch) in msg.chars().enumerate() {
+                        let col = msg_x + c_idx as u16;
+                        if col < conn_inner.right() {
+                            frame.buffer_mut()[(col, msg_y)]
                                 .set_char(ch)
-                                .set_style(Style::default().fg(Color::Rgb(170, 170, 170)));
+                                .set_style(Style::default().fg(Color::Rgb(255, 80, 80)));
                         }
                     }
                 }
-                row_offset += 1;
+            }
+            Ok(conns) => {
+                if conns.is_empty() {
+                    let msg = "No active network connections.";
+                    let msg_len = msg.chars().count() as u16;
+                    let msg_x = conn_inner.x + (conn_inner.width.saturating_sub(msg_len)) / 2;
+                    let msg_y = conn_inner.y + conn_inner.height / 2;
+                    if msg_y < conn_inner.bottom() {
+                        for (c_idx, ch) in msg.chars().enumerate() {
+                            let col = msg_x + c_idx as u16;
+                            if col < conn_inner.right() {
+                                frame.buffer_mut()[(col, msg_y)]
+                                    .set_char(ch)
+                                    .set_style(Style::default().fg(Color::Rgb(120, 120, 120)));
+                            }
+                        }
+                    }
+                } else {
+                    let proto_w = 6usize;
+                    let pid_w = 8usize;
+                    let prog_w = 16usize;
+                    let state_w = 14usize;
+                    let rem_cols_w = conn_inner.width as usize;
+                    let fixed_w = proto_w + pid_w + prog_w + state_w + 5;
+                    let local_w = 26.min(rem_cols_w.saturating_sub(fixed_w) / 2);
+                    let remote_w = rem_cols_w.saturating_sub(fixed_w + local_w);
+
+                    let header_str = format!(
+                        "{:<proto_w$} {:<pid_w$} {:<prog_w$} {:<local_w$} {:<remote_w$} {:<state_w$}",
+                        "Proto",
+                        "PID",
+                        "Program",
+                        "Local Address",
+                        "Remote Address / Host",
+                        "State",
+                        proto_w = proto_w,
+                        pid_w = pid_w,
+                        prog_w = prog_w,
+                        local_w = local_w,
+                        remote_w = remote_w,
+                        state_w = state_w,
+                    );
+                    for (c_idx, ch) in header_str.chars().enumerate() {
+                        let col = conn_inner.x + c_idx as u16;
+                        if col < conn_inner.right() {
+                            frame.buffer_mut()[(col, conn_inner.y)]
+                                .set_char(ch)
+                                .set_style(Style::default().fg(Color::Rgb(200, 200, 200)));
+                        }
+                    }
+
+                    let visible_rows = conn_inner.height.saturating_sub(1) as usize;
+                    let max_scroll = conns.len().saturating_sub(visible_rows);
+                    let start_idx = conn_scroll_offset.min(max_scroll);
+                    for (row_offset, conn) in (1..).zip(conns.iter().skip(start_idx)) {
+                        if row_offset >= conn_inner.height {
+                            break;
+                        }
+                        let row_y = conn_inner.y + row_offset;
+
+                        let proto_str = conn.proto;
+                        let pid_str = conn
+                            .pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        let prog_str = conn.process_name.as_deref().unwrap_or("-");
+                        let local_str = if conn.local_ip.is_unspecified() {
+                            format!("*:{}", conn.local_port)
+                        } else if let Some(ref host) = conn.local_host {
+                            format!("{}:{}", host, conn.local_port)
+                        } else {
+                            format!("{}:{}", conn.local_ip, conn.local_port)
+                        };
+                        let remote_str = if conn.remote_ip.is_unspecified() && conn.remote_port == 0 {
+                            "*.*".to_string()
+                        } else if let Some(ref host) = conn.remote_host {
+                            format!("{}:{}", host, conn.remote_port)
+                        } else {
+                            format!("{}:{}", conn.remote_ip, conn.remote_port)
+                        };
+                        let state_str = conn.state;
+
+                        let state_color = match state_str {
+                            "ESTABLISHED" => Color::Rgb(0, 255, 128),
+                            "LISTEN" => Color::Rgb(100, 180, 255),
+                            "TIME_WAIT" | "CLOSE_WAIT" | "FIN_WAIT1" | "FIN_WAIT2" => Color::Rgb(150, 150, 150),
+                            "SYN_SENT" | "SYN_RECV" => Color::Rgb(255, 200, 50),
+                            _ => Color::Rgb(170, 170, 170),
+                        };
+
+                        let mut cur_col = conn_inner.x;
+                        // Proto
+                        for ch in format!("{:<proto_w$}", proto_str, proto_w = proto_w).chars() {
+                            if cur_col < conn_inner.right() {
+                                frame.buffer_mut()[(cur_col, row_y)]
+                                    .set_char(ch)
+                                    .set_style(Style::default().fg(Color::Rgb(140, 140, 140)));
+                                cur_col += 1;
+                            }
+                        }
+                        cur_col += 1;
+                        // PID
+                        for ch in format!("{:<pid_w$}", pid_str, pid_w = pid_w).chars() {
+                            if cur_col < conn_inner.right() {
+                                frame.buffer_mut()[(cur_col, row_y)]
+                                    .set_char(ch)
+                                    .set_style(Style::default().fg(Color::Rgb(160, 160, 160)));
+                                cur_col += 1;
+                            }
+                        }
+                        cur_col += 1;
+                        // Program
+                        let truncated_prog = if prog_str.chars().count() > prog_w {
+                            format!(
+                                "{}…",
+                                prog_str.chars().take(prog_w.saturating_sub(1)).collect::<String>()
+                            )
+                        } else {
+                            format!("{:<prog_w$}", prog_str, prog_w = prog_w)
+                        };
+                        for ch in truncated_prog.chars() {
+                            if cur_col < conn_inner.right() {
+                                frame.buffer_mut()[(cur_col, row_y)]
+                                    .set_char(ch)
+                                    .set_style(Style::default().fg(Color::Rgb(240, 240, 240)));
+                                cur_col += 1;
+                            }
+                        }
+                        cur_col += 1;
+                        // Local
+                        let truncated_local = if local_str.chars().count() > local_w {
+                            format!(
+                                "{}…",
+                                local_str.chars().take(local_w.saturating_sub(1)).collect::<String>()
+                            )
+                        } else {
+                            format!("{:<local_w$}", local_str, local_w = local_w)
+                        };
+                        for ch in truncated_local.chars() {
+                            if cur_col < conn_inner.right() {
+                                frame.buffer_mut()[(cur_col, row_y)]
+                                    .set_char(ch)
+                                    .set_style(Style::default().fg(Color::Rgb(180, 180, 180)));
+                                cur_col += 1;
+                            }
+                        }
+                        cur_col += 1;
+                        // Remote
+                        let truncated_remote = if remote_str.chars().count() > remote_w {
+                            format!(
+                                "{}…",
+                                remote_str.chars().take(remote_w.saturating_sub(1)).collect::<String>()
+                            )
+                        } else {
+                            format!("{:<remote_w$}", remote_str, remote_w = remote_w)
+                        };
+                        for ch in truncated_remote.chars() {
+                            if cur_col < conn_inner.right() {
+                                frame.buffer_mut()[(cur_col, row_y)]
+                                    .set_char(ch)
+                                    .set_style(Style::default().fg(Color::Rgb(220, 220, 220)));
+                                cur_col += 1;
+                            }
+                        }
+                        cur_col += 1;
+                        // State
+                        for ch in format!("{:<state_w$}", state_str, state_w = state_w).chars() {
+                            if cur_col < conn_inner.right() {
+                                frame.buffer_mut()[(cur_col, row_y)]
+                                    .set_char(ch)
+                                    .set_style(Style::default().fg(state_color));
+                                cur_col += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1167,7 +1468,7 @@ pub fn render_disks_tab(
 
     // Fit both graphs in the space of the top-left area
     let graph_chunks = Layout::default()
-        .direction(Direction::Vertical)
+        .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(top_chunks[0]);
 
@@ -1236,12 +1537,34 @@ pub fn render_disks_tab(
                 for (c_idx, ch) in line_str.chars().enumerate() {
                     let col = disks_inner.x + c_idx as u16;
                     if col < disks_inner.right() {
-                        let color = if idx == 0 && disk_io.read_speed > 0.0 {
-                            gradient_color(io_gradient_pct(disk_io.read_speed))
-                        } else if idx == 1 && disk_io.write_speed > 0.0 {
-                            gradient_color(io_gradient_pct(disk_io.write_speed))
+                        let color = if idx == 0 {
+                            if disk_io.read_speed > 0.0 {
+                                gradient_color(io_gradient_pct(disk_io.read_speed))
+                            } else {
+                                Color::Rgb(0, 85, 0)
+                            }
+                        } else if idx == 1 {
+                            if disk_io.write_speed > 0.0 {
+                                gradient_color(io_gradient_pct(disk_io.write_speed))
+                            } else {
+                                Color::Rgb(0, 85, 0)
+                            }
                         } else if idx == 5 {
                             Color::Rgb(255, 255, 255)
+                        } else if idx >= 7 && (idx - 7) % 2 == 0 {
+                            let drive_idx = (idx - 7) / 2;
+                            if let Some(d) = disk_io.disks.get(drive_idx) {
+                                let max_speed = d.read_speed.max(d.write_speed);
+                                if max_speed > 0.0 {
+                                    gradient_color(io_gradient_pct(max_speed))
+                                } else {
+                                    Color::Rgb(0, 85, 0)
+                                }
+                            } else {
+                                Color::Rgb(170, 170, 170)
+                            }
+                        } else if idx >= 6 && (idx - 6) % 2 == 0 {
+                            Color::Rgb(220, 220, 220)
                         } else {
                             Color::Rgb(170, 170, 170)
                         };
@@ -1326,70 +1649,56 @@ pub fn render_disks_tab(
                 }
             }
 
-            // 2. Items list with scroll offset
-            let max_item_bytes = active_cat
-                .items
-                .iter()
-                .map(|it| it.size_bytes)
-                .max()
-                .unwrap_or(1)
-                .max(1);
-
-            let mut row_offset = 2;
-            for item in active_cat.items.iter().skip(start_idx) {
-                if row_offset + 2 > pkg_inner.height {
+            // 2. Items list with scroll offset (clean 1-line text with size)
+            for (row_offset, item) in (2..).zip(active_cat.items.iter().skip(start_idx)) {
+                if row_offset >= pkg_inner.height {
                     break;
                 }
-                let display_name = if item.name.len() > 42 {
-                    format!("{}…", &item.name[..41])
-                } else {
-                    item.name.clone()
-                };
-                let header = if item.detail.is_empty() {
-                    format!("• {}", display_name)
-                } else {
-                    format!("• {} [{}]", display_name, item.detail)
-                };
-                let row_h = pkg_inner.y + row_offset;
-                let row_b = row_h + 1;
+                let row_y = pkg_inner.y + row_offset;
+                let right_label = &item.size_str;
+                let right_len = right_label.chars().count() as u16;
 
-                for (c_idx, ch) in header.chars().enumerate() {
-                    let col = pkg_inner.x + c_idx as u16;
+                // Right aligned size text
+                let r_col = pkg_inner.right().saturating_sub(right_len + 1);
+                for (c_idx, ch) in right_label.chars().enumerate() {
+                    let col = r_col + c_idx as u16;
                     if col < pkg_inner.right() {
-                        frame.buffer_mut()[(col, row_h)]
+                        frame.buffer_mut()[(col, row_y)]
                             .set_char(ch)
-                            .set_style(Style::default().fg(Color::Rgb(240, 240, 240)).bold());
+                            .set_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold());
                     }
                 }
 
-                if item.size_bytes > 0 {
-                    let item_pct = (item.size_bytes as f64 / max_item_bytes as f64) * 100.0;
-                    let right_label = item.size_str.clone();
-                    let bar_area =
-                        Rect::new(pkg_inner.x + 2, row_b, pkg_inner.width.saturating_sub(2), 1);
-                    draw_labeled_bar(
-                        frame.buffer_mut(),
-                        bar_area,
-                        "Size: ",
-                        &right_label,
-                        item_pct,
-                    );
-                    row_offset += 3;
+                // Left aligned name and detail
+                let max_left_w = (r_col.saturating_sub(pkg_inner.x + 2)) as usize;
+                let full_left = if item.detail.is_empty() {
+                    format!("• {}", item.name)
                 } else {
-                    let right_label = item.size_str.clone();
-                    let row_sub = row_h;
-                    let r_col = pkg_inner
-                        .right()
-                        .saturating_sub(right_label.len() as u16 + 1);
-                    for (c_idx, ch) in right_label.chars().enumerate() {
-                        let col = r_col + c_idx as u16;
-                        if col < pkg_inner.right() {
-                            frame.buffer_mut()[(col, row_sub)]
-                                .set_char(ch)
-                                .set_style(Style::default().fg(Color::Rgb(140, 140, 140)));
-                        }
+                    format!("• {} [{}]", item.name, item.detail)
+                };
+
+                let truncated_left: String = if full_left.chars().count() > max_left_w {
+                    let take_len = max_left_w.saturating_sub(1);
+                    let mut s: String = full_left.chars().take(take_len).collect();
+                    s.push('…');
+                    s
+                } else {
+                    full_left
+                };
+
+                for (c_idx, ch) in truncated_left.chars().enumerate() {
+                    let col = pkg_inner.x + c_idx as u16;
+                    if col < r_col {
+                        let is_detail = ch == '[' || ch == ']' || (c_idx > item.name.len() + 2);
+                        let color = if is_detail {
+                            Color::Rgb(140, 140, 140)
+                        } else {
+                            Color::Rgb(230, 230, 230)
+                        };
+                        frame.buffer_mut()[(col, row_y)]
+                            .set_char(ch)
+                            .set_style(Style::default().fg(color));
                     }
-                    row_offset += 2;
                 }
             }
         }
@@ -1555,7 +1864,7 @@ fn draw_labeled_bar(
         area,
         label_left,
         pct,
-        &[(label_right, Color::Rgb(220, 220, 220), true)],
+        &[(label_right, Color::Rgb(220, 220, 220), false)],
     );
 }
 
@@ -1666,77 +1975,35 @@ pub fn format_system_overview_copy_text(
         }
     }
 
-    lines.push(format!(
-        "Load:     {:.2}, {:.2}, {:.2} (1m, 5m, 15m)",
-        sys_info.load_1, sys_info.load_5, sys_info.load_15
-    ));
-
     lines.join("\n")
 }
 
-/// Renders the General Dashboard (Tab 1) featuring the full System Overview card,
-/// battery drainage/charging metrics, unmerged network/disk cards, and high-resource processes list.
+/// Renders the System Overview telemetry metadata card.
 ///
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
-/// * `area` - Target bounding box for the dashboard.
+/// * `area` - Target bounding box for the overview card.
 /// * `sys_info` - Host system overview metadata.
-/// * `battery` - Optional laptop battery metrics.
-/// * `global_cpu_usage` - Total CPU utilization percentage.
-/// * `core_usages` - Per-core CPU load percentages.
-/// * `cpu_cur_mhz` - Current CPU clock frequency in MHz.
-/// * `cpu_min_mhz` - Minimum CPU clock frequency in MHz.
-/// * `cpu_max_mhz` - Maximum CPU clock frequency in MHz.
-/// * `cpu_temp` - CPU temperature in degrees Celsius.
 /// * `cpu_model` - Marketing CPU model identifier string.
-/// * `mem` - Memory metrics.
 /// * `ram_info` - DMI memory capacity, speed, and DDR generation string.
 /// * `gpu` - GPU metrics.
-/// * `net_ifaces` - List of active network interfaces.
-/// * `disk_io` - Disk I/O metrics.
-/// * `disk_mounts` - Mounted partition list.
-/// * `processes` - List of active processes to scan for >30% resource usage.
 /// * `copied` - Whether the overview copy button feedback is currently active.
-#[allow(clippy::too_many_arguments)]
-pub fn render_general_tab(
+fn render_general_overview_card(
     frame: &mut Frame,
     area: Rect,
     sys_info: &SystemGeneralInfo,
-    battery: Option<&BatteryInfo>,
-    global_cpu_usage: f64,
-    core_usages: &[f64],
-    cpu_cur_mhz: f64,
-    cpu_min_mhz: f64,
-    cpu_max_mhz: f64,
-    cpu_temp: u32,
     cpu_model: &str,
-    mem: &MemoryMetrics,
     ram_info: &str,
     gpu: &GpuMetrics,
-    net_ifaces: &[NetInterfaceInfo],
-    disk_io: &DiskIoInfo,
-    disk_mounts: &[MountInfo],
-    processes: &[ProcessInfo],
     copied: bool,
 ) {
-    let main_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(15), Constraint::Min(0)])
-        .split(area);
-
-    // 1. Top Section: System Info & Battery Cards
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_chunks[0]);
-
     let sys_block = Block::default()
         .title(" System Overview ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let sys_inner = sys_block.inner(top_chunks[0]);
-    frame.render_widget(sys_block, top_chunks[0]);
+    let sys_inner = sys_block.inner(area);
+    frame.render_widget(sys_block, area);
 
     if sys_inner.height > 0 && sys_inner.width > 0 {
         let vram_gb = ((gpu.vram_total_mb as f64) / 1024.0).round() as u64;
@@ -1830,11 +2097,6 @@ pub fn render_general_tab(
             }
         }
 
-        lines.push(format!(
-            "Load:     {:.2}, {:.2}, {:.2} (1m, 5m, 15m)",
-            sys_info.load_1, sys_info.load_5, sys_info.load_15
-        ));
-
         for (idx, line) in lines.iter().enumerate() {
             let row = sys_inner.y + idx as u16;
             if row < sys_inner.bottom() {
@@ -1867,9 +2129,9 @@ pub fn render_general_tab(
 
         if btn_x < sys_inner.right() && btn_y < sys_inner.bottom() {
             let style = if copied {
-                Style::default().fg(Color::Rgb(0, 255, 128)).bold()
+                Style::default().fg(Color::Rgb(0, 255, 128))
             } else {
-                Style::default().fg(Color::Rgb(100, 200, 255)).bold()
+                Style::default().fg(Color::Rgb(100, 200, 255))
             };
             for (idx, ch) in btn_text.chars().enumerate() {
                 let col = btn_x + idx as u16;
@@ -1881,14 +2143,21 @@ pub fn render_general_tab(
             }
         }
     }
+}
 
+/// Renders the Battery & Power telemetry metadata card.
+fn render_general_battery_card(
+    frame: &mut Frame,
+    area: Rect,
+    battery: Option<&BatteryInfo>,
+) {
     let pwr_block = Block::default()
         .title(" Battery & Power ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let pwr_inner = pwr_block.inner(top_chunks[1]);
-    frame.render_widget(pwr_block, top_chunks[1]);
+    let pwr_inner = pwr_block.inner(area);
+    frame.render_widget(pwr_block, area);
 
     if pwr_inner.height > 0 && pwr_inner.width > 0 {
         if let Some(bat) = battery {
@@ -1951,19 +2220,16 @@ pub fn render_general_tab(
                 }
             }
         } else {
-            let pwr_line = "Power Source: AC Connected (Desktop System / No Battery)";
+            let pwr_line = "Power Source: AC Connected ";
             for (c_idx, ch) in pwr_line.chars().enumerate() {
                 let col = pwr_inner.x + c_idx as u16;
                 if col < pwr_inner.right() {
                     frame.buffer_mut()[(col, pwr_inner.y)]
                         .set_char(ch)
-                        .set_style(Style::default().fg(Color::Rgb(0, 255, 128)).bold());
+                        .set_style(Style::default().fg(Color::Rgb(0, 255, 128)));
                 }
             }
-            let pwr_sub_lines = [
-                "Hardware sensors indicate direct wall power.",
-                "Power State: Active & Stable",
-            ];
+            let pwr_sub_lines = ["Hardware sensors indicate direct wall power."];
             for (idx, line) in pwr_sub_lines.iter().enumerate() {
                 let row = pwr_inner.y + 2 + idx as u16;
                 if row < pwr_inner.bottom() {
@@ -1979,31 +2245,34 @@ pub fn render_general_tab(
             }
         }
     }
+}
 
-    // 2. Middle & Lower Section: Full Bar Charts from Everywhere
-    let body_columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(main_chunks[1]);
-
-    // Left Column: CPU, Memory, Heavy Processes
-    let left_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(25),
-            Constraint::Percentage(35),
-        ])
-        .split(body_columns[0]);
-
-    // CPU Card
-    let cpu_block = Block::default()
-        .title(" CPU Performance ".fg(Color::Rgb(170, 170, 170)))
+/// Renders the CPU performance card with total bar and per-core grid.
+#[allow(clippy::too_many_arguments)]
+fn render_general_cpu_card(
+    frame: &mut Frame,
+    area: Rect,
+    global_cpu_usage: f64,
+    core_usages: &[f64],
+    cpu_cur_mhz: f64,
+    cpu_min_mhz: f64,
+    cpu_max_mhz: f64,
+    cpu_temp: u32,
+    cpu_model: &str,
+) {
+    let mut cpu_block = Block::default()
+        .title(" CPU ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let cpu_inner = cpu_block.inner(left_chunks[0]);
-    frame.render_widget(cpu_block, left_chunks[0]);
+    if !cpu_model.is_empty() {
+        cpu_block = cpu_block.title(
+            Line::from(format!(" {} ", cpu_model).fg(Color::Rgb(170, 170, 170)))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    }
+    let cpu_inner = cpu_block.inner(area);
+    frame.render_widget(cpu_block, area);
 
     if cpu_inner.height > 0 && cpu_inner.width > 0 {
         let cpu_freq_pct = if cpu_max_mhz > cpu_min_mhz {
@@ -2019,7 +2288,7 @@ pub fn render_general_tab(
         let cpu_temp_str = format!("{}°C", cpu_temp);
 
         let cpu_pct_str = format!("{:.0}% [", global_cpu_usage);
-        let cpu_model_str = format!(", {}]", cpu_model);
+        let cpu_end_str = "]".to_string();
 
         draw_styled_bar(
             frame.buffer_mut(),
@@ -2032,68 +2301,109 @@ pub fn render_general_tab(
             "CPU Total:",
             global_cpu_usage,
             &[
-                (&cpu_pct_str, Color::Rgb(220, 220, 220), true),
-                (&cpu_freq_str, cpu_freq_color, true),
+                (&cpu_pct_str, Color::Rgb(220, 220, 220), false),
+                (&cpu_freq_str, cpu_freq_color, false),
                 (", ", Color::Rgb(170, 170, 170), false),
-                (&cpu_temp_str, cpu_temp_color, true),
-                (&cpu_model_str, Color::Rgb(170, 170, 170), false),
+                (&cpu_temp_str, cpu_temp_color, false),
+                (&cpu_end_str, Color::Rgb(220, 220, 220), false),
             ],
         );
 
+        let start_row = 1u16;
+        let avail_rows = (cpu_inner.bottom().saturating_sub(cpu_inner.y + start_row)) as usize;
         let num_cores = core_usages.len();
-        let half = num_cores.div_ceil(2);
+        let (cols, show_bar) = if num_cores.div_ceil(2) <= avail_rows || cpu_inner.width < 30 {
+            (2, true)
+        } else if num_cores.div_ceil(3) <= avail_rows || cpu_inner.width < 45 {
+            (3, true)
+        } else {
+            (4, false)
+        };
+        let rows_per_col = num_cores.div_ceil(cols);
+        let spacing = 2u16;
+        let total_gap = spacing * (cols as u16 - 1);
+        let col_w = cpu_inner.width.saturating_sub(total_gap) / cols as u16;
 
-        for (row_idx, i) in (2u16..).zip(0..half) {
-            let row_y = cpu_inner.y + row_idx;
-            if row_y >= cpu_inner.bottom() {
-                break;
-            }
+        if col_w > 0 {
+            for r in 0..rows_per_col {
+                let row_y = cpu_inner.y + start_row + r as u16;
+                if row_y >= cpu_inner.bottom() {
+                    break;
+                }
 
-            // Left core
-            let c1 = i;
-            let u1 = core_usages.get(c1).copied().unwrap_or(0.0);
-            let w_half = (cpu_inner.width.saturating_sub(2)) / 2;
+                for c in 0..cols {
+                    let core_idx = c * rows_per_col + r;
+                    if let Some(&usage) = core_usages.get(core_idx) {
+                        let col_x = cpu_inner.x + (c as u16) * (col_w + spacing);
+                        let w = if c == cols - 1 {
+                            cpu_inner.right().saturating_sub(col_x)
+                        } else {
+                            col_w
+                        };
 
-            draw_labeled_bar(
-                frame.buffer_mut(),
-                Rect {
-                    x: cpu_inner.x,
-                    y: row_y,
-                    width: w_half,
-                    height: 1,
-                },
-                &format!("C{:<2}:", c1),
-                &format!("{:.0}%", u1),
-                u1,
-            );
+                        if show_bar {
+                            draw_labeled_bar(
+                                frame.buffer_mut(),
+                                Rect {
+                                    x: col_x,
+                                    y: row_y,
+                                    width: w,
+                                    height: 1,
+                                },
+                                &format!("C{:<2}:", core_idx),
+                                &format!("{:.0}%", usage),
+                                usage,
+                            );
+                        } else {
+                            let label = format!("C{:<2}: ", core_idx);
+                            let val_str = format!("{:>3.0}%", usage);
+                            let color = gradient_color(usage.clamp(0.0, 100.0));
 
-            // Right core
-            let c2 = i + half;
-            if let Some(&u2) = core_usages.get(c2) {
-                draw_labeled_bar(
-                    frame.buffer_mut(),
-                    Rect {
-                        x: cpu_inner.x + w_half + 2,
-                        y: row_y,
-                        width: w_half,
-                        height: 1,
-                    },
-                    &format!("C{:<2}:", c2),
-                    &format!("{:.0}%", u2),
-                    u2,
-                );
+                            let mut cx = col_x;
+                            for ch in label.chars() {
+                                if cx < col_x + w && cx < cpu_inner.right() {
+                                    frame.buffer_mut()[(cx, row_y)]
+                                        .set_char(ch)
+                                        .set_style(Style::default().fg(Color::Rgb(170, 170, 170)));
+                                    cx += 1;
+                                }
+                            }
+                            for ch in val_str.chars() {
+                                if cx < col_x + w && cx < cpu_inner.right() {
+                                    frame.buffer_mut()[(cx, row_y)]
+                                        .set_char(ch)
+                                        .set_style(Style::default().fg(color));
+                                    cx += 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+}
 
-    // Memory Card
-    let mem_block = Block::default()
-        .title(" Memory & Swap ".fg(Color::Rgb(170, 170, 170)))
+/// Renders the Memory and Swap utilization card.
+fn render_general_memory_card(
+    frame: &mut Frame,
+    area: Rect,
+    mem: &MemoryMetrics,
+    ram_info: &str,
+) {
+    let mut mem_block = Block::default()
+        .title(" Memory ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let mem_inner = mem_block.inner(left_chunks[1]);
-    frame.render_widget(mem_block, left_chunks[1]);
+    if !ram_info.is_empty() {
+        mem_block = mem_block.title(
+            Line::from(format!(" {} ", ram_info).fg(Color::Rgb(170, 170, 170)))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    }
+    let mem_inner = mem_block.inner(area);
+    frame.render_widget(mem_block, area);
 
     if mem_inner.height > 0 && mem_inner.width > 0 {
         let ram_pct = if mem.total_mem_mb > 0 {
@@ -2114,13 +2424,13 @@ pub fn render_general_tab(
             },
             "RAM:",
             &format!(
-                "{:.1}% ({:.1}/{:.1} GB) [{}]",
-                ram_pct, ram_used_gb, ram_total_gb, ram_info
+                "{:.1}% ({:.1}/{:.1} GB)",
+                ram_pct, ram_used_gb, ram_total_gb
             ),
             ram_pct,
         );
 
-        if mem_inner.height > 2 {
+        if mem_inner.height > 1 {
             let swap_pct = if mem.total_swap_mb > 0 {
                 (mem.used_swap_mb as f64 / mem.total_swap_mb as f64) * 100.0
             } else {
@@ -2129,11 +2439,17 @@ pub fn render_general_tab(
             let swap_used_gb = mem.used_swap_mb as f64 / 1024.0;
             let swap_total_gb = mem.total_swap_mb as f64 / 1024.0;
 
+            let row_y = if mem_inner.height > 2 {
+                mem_inner.y + 2
+            } else {
+                mem_inner.y + 1
+            };
+
             draw_labeled_bar(
                 frame.buffer_mut(),
                 Rect {
                     x: mem_inner.x,
-                    y: mem_inner.y + 2,
+                    y: row_y,
                     width: mem_inner.width,
                     height: 1,
                 },
@@ -2146,20 +2462,42 @@ pub fn render_general_tab(
             );
         }
     }
+}
 
-    // Heavy Processes (>30%) Card
+/// Renders the high-resource-consuming processes card.
+fn render_general_processes_card(
+    frame: &mut Frame,
+    area: Rect,
+    processes: &[ProcessInfo],
+    mem: &MemoryMetrics,
+    gpu: &GpuMetrics,
+    num_cores: usize,
+) {
     let heavy_block = Block::default()
-        .title(" High Resource Processes (>30%) ".fg(Color::Rgb(170, 170, 170)))
+        .title(" High Resource Processes ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let heavy_inner = heavy_block.inner(left_chunks[2]);
-    frame.render_widget(heavy_block, left_chunks[2]);
+    let heavy_inner = heavy_block.inner(area);
+    frame.render_widget(heavy_block, area);
 
     if heavy_inner.height > 0 && heavy_inner.width > 0 {
-        let mut heavy_procs: Vec<(&ProcessInfo, f64, f64, f64)> = processes
+        let empty_set = HashSet::new();
+        let grouped_procs = group_processes_for_simple_view(
+            processes,
+            &empty_set,
+            ProcessSortColumn::Cpu,
+            false,
+            "",
+        );
+        let mut heavy_procs: Vec<(&ProcessInfo, f64, f64, f64)> = grouped_procs
             .iter()
             .filter_map(|p| {
+                let all_core_cpu_pct = if num_cores > 0 {
+                    p.cpu_percent / (num_cores as f64)
+                } else {
+                    p.cpu_percent
+                };
                 let mem_pct = if mem.total_mem_mb > 0 {
                     (p.rss_kb as f64 / (mem.total_mem_mb as f64 * 1024.0)) * 100.0
                 } else {
@@ -2170,12 +2508,17 @@ pub fn render_general_tab(
                 } else {
                     0.0
                 };
-                let max_pct = p
-                    .cpu_percent
-                    .max(mem_pct)
-                    .max(p.gpu_percent)
-                    .max(gpu_vram_pct);
-                if max_pct >= 30.0 {
+
+                let is_heavy_cpu = all_core_cpu_pct >= 50.0;
+                let is_heavy_mem = mem_pct >= 30.0;
+                let is_heavy_gpu = p.gpu_percent >= 30.0;
+                let is_heavy_vram = gpu_vram_pct >= 30.0;
+
+                if is_heavy_cpu || is_heavy_mem || is_heavy_gpu || is_heavy_vram {
+                    let max_pct = all_core_cpu_pct
+                        .max(mem_pct)
+                        .max(p.gpu_percent)
+                        .max(gpu_vram_pct);
                     Some((p, mem_pct, gpu_vram_pct, max_pct))
                 } else {
                     None
@@ -2186,7 +2529,7 @@ pub fn render_general_tab(
         heavy_procs.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
 
         if heavy_procs.is_empty() {
-            let msg = "No processes exceeding 30% resource threshold";
+            let msg = "No heavy processes found.";
             let msg_len = msg.chars().count() as u16;
             let msg_x = heavy_inner.x + (heavy_inner.width.saturating_sub(msg_len)) / 2;
             let msg_y = heavy_inner.y + heavy_inner.height / 2;
@@ -2207,19 +2550,17 @@ pub fn render_general_tab(
             let hdr_mem = "MEM%";
             let hdr_gpu = "GPU%";
             let hdr_vram = "VRAM%";
-            let hdr_user = "USER";
 
             let name_w =
-                (heavy_inner.width.saturating_sub(7 + 8 + 8 + 8 + 8 + 10 + 2) as usize).max(8);
+                (heavy_inner.width.saturating_sub(7 + 8 + 8 + 8 + 8 + 2) as usize).max(8);
             let header_str = format!(
-                "{:<7}{:<name_w$} {:>7} {:>7} {:>7} {:>7}  {:<8}",
+                "{:<7}{:<name_w$} {:>7} {:>7} {:>7} {:>7}",
                 hdr_pid,
                 hdr_name,
                 hdr_cpu,
                 hdr_mem,
                 hdr_gpu,
                 hdr_vram,
-                hdr_user,
                 name_w = name_w
             );
 
@@ -2228,7 +2569,7 @@ pub fn render_general_tab(
                 if col < heavy_inner.right() {
                     frame.buffer_mut()[(col, heavy_inner.y)]
                         .set_char(ch)
-                        .set_style(Style::default().fg(Color::Rgb(200, 200, 200)).bold());
+                        .set_style(Style::default().fg(Color::Rgb(200, 200, 200)));
                 }
             }
 
@@ -2250,12 +2591,10 @@ pub fn render_general_tab(
                 }
 
                 let pid_str = format!("{:<7}", p.pid);
-                let name_col_str = format!("{:<name_w$} ", name_display, name_w = name_w);
                 let cpu_val_str = format!("{:>6.1}% ", p.cpu_percent);
                 let mem_val_str = format!("{:>6.1}% ", mem_pct);
                 let gpu_val_str = format!("{:>6.1}% ", p.gpu_percent);
-                let vram_val_str = format!("{:>6.1}% ", gpu_vram_pct);
-                let user_val_str = format!("{:<8}", p.user);
+                let vram_val_str = format!("{:>6.1}%", gpu_vram_pct);
 
                 let mut col = heavy_inner.x;
                 // PID
@@ -2268,17 +2607,40 @@ pub fn render_general_tab(
                     }
                 }
                 // NAME
-                for ch in name_col_str.chars() {
-                    if col < heavy_inner.right() {
-                        frame.buffer_mut()[(col, row_y)]
-                            .set_char(ch)
-                            .set_style(Style::default().fg(Color::Rgb(220, 220, 220)));
-                        col += 1;
+                let name_tokens: Vec<&str> = name_display.split_whitespace().collect();
+                let mut name_cur_x = col;
+                let mut in_args = false;
+                for (t_idx, &tok) in name_tokens.iter().enumerate() {
+                    if t_idx > 0 && name_cur_x < heavy_inner.right() {
+                        frame.buffer_mut()[(name_cur_x, row_y)].set_char(' ');
+                        name_cur_x += 1;
+                    }
+                    if tok.starts_with('-') {
+                        in_args = true;
+                    }
+                    let tok_style = if in_args {
+                        Style::default().fg(Color::Rgb(110, 110, 110))
+                    } else {
+                        Style::default().fg(Color::Rgb(240, 240, 240))
+                    };
+                    for ch in tok.chars() {
+                        if name_cur_x < heavy_inner.right() && name_cur_x < col + name_w as u16 {
+                            frame.buffer_mut()[(name_cur_x, row_y)]
+                                .set_char(ch)
+                                .set_style(tok_style);
+                            name_cur_x += 1;
+                        }
                     }
                 }
+                col += name_w as u16 + 1;
                 // CPU%
-                let cpu_color = if p.cpu_percent >= 30.0 {
-                    gradient_color(p.cpu_percent.min(100.0))
+                let all_core_cpu_pct = if num_cores > 0 {
+                    p.cpu_percent / (num_cores as f64)
+                } else {
+                    p.cpu_percent
+                };
+                let cpu_color = if all_core_cpu_pct >= 50.0 {
+                    gradient_color(all_core_cpu_pct.min(100.0))
                 } else {
                     Color::Rgb(140, 140, 140)
                 };
@@ -2286,7 +2648,7 @@ pub fn render_general_tab(
                     if col < heavy_inner.right() {
                         frame.buffer_mut()[(col, row_y)]
                             .set_char(ch)
-                            .set_style(Style::default().fg(cpu_color).bold());
+                            .set_style(Style::default().fg(cpu_color));
                         col += 1;
                     }
                 }
@@ -2300,7 +2662,7 @@ pub fn render_general_tab(
                     if col < heavy_inner.right() {
                         frame.buffer_mut()[(col, row_y)]
                             .set_char(ch)
-                            .set_style(Style::default().fg(mem_color).bold());
+                            .set_style(Style::default().fg(mem_color));
                         col += 1;
                     }
                 }
@@ -2314,7 +2676,7 @@ pub fn render_general_tab(
                     if col < heavy_inner.right() {
                         frame.buffer_mut()[(col, row_y)]
                             .set_char(ch)
-                            .set_style(Style::default().fg(gpu_color).bold());
+                            .set_style(Style::default().fg(gpu_color));
                         col += 1;
                     }
                 }
@@ -2328,42 +2690,34 @@ pub fn render_general_tab(
                     if col < heavy_inner.right() {
                         frame.buffer_mut()[(col, row_y)]
                             .set_char(ch)
-                            .set_style(Style::default().fg(vram_color).bold());
-                        col += 1;
-                    }
-                }
-                // USER
-                for ch in user_val_str.chars() {
-                    if col < heavy_inner.right() {
-                        frame.buffer_mut()[(col, row_y)]
-                            .set_char(ch)
-                            .set_style(Style::default().fg(Color::Rgb(150, 150, 150)));
+                            .set_style(Style::default().fg(vram_color));
                         col += 1;
                     }
                 }
             }
         }
     }
+}
 
-    // Right Column: GPU, Network, Disks, Storage
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-            Constraint::Ratio(1, 4),
-        ])
-        .split(body_columns[1]);
-
-    // GPU Card
-    let gpu_block = Block::default()
-        .title(" GPU & VRAM ".fg(Color::Rgb(170, 170, 170)))
+/// Renders the GPU utilization and VRAM allocation card.
+fn render_general_gpu_card(
+    frame: &mut Frame,
+    area: Rect,
+    gpu: &GpuMetrics,
+) {
+    let mut gpu_block = Block::default()
+        .title(" GPU ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let gpu_inner = gpu_block.inner(right_chunks[0]);
-    frame.render_widget(gpu_block, right_chunks[0]);
+    if !gpu.name.is_empty() && gpu.name != "None" {
+        gpu_block = gpu_block.title(
+            Line::from(format!(" {} ", gpu.name).fg(Color::Rgb(170, 170, 170)))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    }
+    let gpu_inner = gpu_block.inner(area);
+    frame.render_widget(gpu_block, area);
 
     if gpu_inner.height > 0 && gpu_inner.width > 0 {
         let gpu_freq_pct = if gpu.max_mhz > gpu.min_mhz {
@@ -2378,8 +2732,8 @@ pub fn render_general_tab(
         let gpu_temp_color = gradient_color(gpu_temp_pct);
         let gpu_temp_str = format!("{}°C", gpu.temp_c);
 
-        let gpu_pct_str = format!("{:.1}% (", gpu.utilization_pct);
-        let gpu_name_str = format!(", {})", gpu.name);
+        let gpu_pct_str = format!("{:.1}% [", gpu.utilization_pct);
+        let gpu_end_str = "]".to_string();
 
         draw_styled_bar(
             frame.buffer_mut(),
@@ -2392,11 +2746,11 @@ pub fn render_general_tab(
             "GPU Core:",
             gpu.utilization_pct,
             &[
-                (&gpu_pct_str, Color::Rgb(220, 220, 220), true),
-                (&gpu_freq_str, gpu_freq_color, true),
+                (&gpu_pct_str, Color::Rgb(220, 220, 220), false),
+                (&gpu_freq_str, gpu_freq_color, false),
                 (", ", Color::Rgb(170, 170, 170), false),
-                (&gpu_temp_str, gpu_temp_color, true),
-                (&gpu_name_str, Color::Rgb(170, 170, 170), false),
+                (&gpu_temp_str, gpu_temp_color, false),
+                (&gpu_end_str, Color::Rgb(220, 220, 220), false),
             ],
         );
 
@@ -2428,15 +2782,21 @@ pub fn render_general_tab(
             );
         }
     }
+}
 
-    // Network Throughput Card
+/// Renders the Network throughput card with RX and TX bandwidth.
+fn render_general_net_card(
+    frame: &mut Frame,
+    area: Rect,
+    net_ifaces: &[NetInterfaceInfo],
+) {
     let net_block = Block::default()
-        .title(" Network Throughput ".fg(Color::Rgb(170, 170, 170)))
+        .title(" Network ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let net_inner = net_block.inner(right_chunks[1]);
-    frame.render_widget(net_block, right_chunks[1]);
+    let net_inner = net_block.inner(area);
+    frame.render_widget(net_block, area);
 
     if net_inner.height > 0 && net_inner.width > 0 {
         let primary_iface = net_ifaces
@@ -2479,15 +2839,21 @@ pub fn render_general_tab(
             );
         }
     }
+}
 
-    // Disk Throughput Card
+/// Renders the Disk IO throughput card with read and write rates.
+fn render_general_disk_card(
+    frame: &mut Frame,
+    area: Rect,
+    disk_io: &DiskIoInfo,
+) {
     let disk_block = Block::default()
-        .title(" Disk Throughput ".fg(Color::Rgb(170, 170, 170)))
+        .title(" IO ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let disk_inner = disk_block.inner(right_chunks[2]);
-    frame.render_widget(disk_block, right_chunks[2]);
+    let disk_inner = disk_block.inner(area);
+    frame.render_widget(disk_block, area);
 
     if disk_inner.height > 0 && disk_inner.width > 0 {
         draw_labeled_bar(
@@ -2523,15 +2889,21 @@ pub fn render_general_tab(
             );
         }
     }
+}
 
-    // Mounted Filesystems Card
+/// Renders the mounted filesystem storage partitions card.
+fn render_general_storage_card(
+    frame: &mut Frame,
+    area: Rect,
+    disk_mounts: &[MountInfo],
+) {
     let storage_block = Block::default()
-        .title(" Storage & Partitions ".fg(Color::Rgb(170, 170, 170)))
+        .title(" Partitions ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let storage_inner = storage_block.inner(right_chunks[3]);
-    frame.render_widget(storage_block, right_chunks[3]);
+    let storage_inner = storage_block.inner(area);
+    frame.render_widget(storage_block, area);
 
     if storage_inner.height > 0 && storage_inner.width > 0 {
         for (idx, m) in disk_mounts.iter().enumerate() {
@@ -2560,4 +2932,320 @@ pub fn render_general_tab(
             );
         }
     }
+}
+
+/// Renders the General Dashboard (Tab 1).
+/// In standard view (when height >= 28 and width >= 70), displays all cards in a grid.
+/// In compact / overflow view, provides a tabbed card-by-card browser navigable with arrow keys.
+///
+/// # Arguments
+/// * `frame` - Terminal rendering frame buffer.
+/// * `area` - Target bounding box for the dashboard.
+/// * `sys_info` - Host system overview metadata.
+/// * `battery` - Optional laptop battery metrics.
+/// * `global_cpu_usage` - Total CPU utilization percentage.
+/// * `core_usages` - Per-core CPU load percentages.
+/// * `cpu_cur_mhz` - Current CPU clock frequency in MHz.
+/// * `cpu_min_mhz` - Minimum CPU clock frequency in MHz.
+/// * `cpu_max_mhz` - Maximum CPU clock frequency in MHz.
+/// * `cpu_temp` - CPU temperature in degrees Celsius.
+/// * `cpu_model` - Marketing CPU model identifier string.
+/// * `mem` - Memory metrics.
+/// * `ram_info` - DMI memory capacity, speed, and DDR generation string.
+/// * `gpu` - GPU metrics.
+/// * `net_ifaces` - List of active network interfaces.
+/// * `disk_io` - Disk I/O metrics.
+/// * `disk_mounts` - Mounted partition list.
+/// * `processes` - List of active processes to scan for >30% resource usage.
+/// * `copied` - Whether the overview copy button feedback is currently active.
+/// * `sub_tab` - Active sub-card index when rendered in compact/overflow mode.
+#[allow(clippy::too_many_arguments)]
+pub fn render_general_tab(
+    frame: &mut Frame,
+    area: Rect,
+    sys_info: &SystemGeneralInfo,
+    battery: Option<&BatteryInfo>,
+    global_cpu_usage: f64,
+    core_usages: &[f64],
+    cpu_cur_mhz: f64,
+    cpu_min_mhz: f64,
+    cpu_max_mhz: f64,
+    cpu_temp: u32,
+    cpu_model: &str,
+    mem: &MemoryMetrics,
+    ram_info: &str,
+    gpu: &GpuMetrics,
+    net_ifaces: &[NetInterfaceInfo],
+    disk_io: &DiskIoInfo,
+    disk_mounts: &[MountInfo],
+    processes: &[ProcessInfo],
+    copied: bool,
+    sub_tab: usize,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let num_cores = core_usages.len();
+    let cpu_min_rows = 1 + num_cores.div_ceil(4) as u16 + 2;
+    let min_height_needed = (14 + (area.height * 30 / 100).max(6) + cpu_min_rows).max(29);
+    let is_compact = area.height < min_height_needed || area.width < 80;
+
+    if is_compact {
+        let sub_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
+
+        let titles = vec!["Overview", "Hardware", "High", "Partitions"];
+        let tabs = Tabs::new(titles)
+            .style(Style::default().fg(Color::Rgb(170, 170, 170)))
+            .select(sub_tab % 4)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Plain)
+                    .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                    .title(" General View (←/→ switch box) ".fg(Color::Rgb(170, 170, 170))),
+            )
+            .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)))
+            .divider("|");
+
+        frame.render_widget(tabs, sub_chunks[0]);
+
+        let body = sub_chunks[1];
+        match sub_tab % 4 {
+            0 => {
+                if body.width >= 70 {
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(body);
+                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, ram_info, gpu, copied);
+                    render_general_battery_card(frame, chunks[1], battery);
+                } else {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(0), Constraint::Length(6)])
+                        .split(body);
+                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, ram_info, gpu, copied);
+                    render_general_battery_card(frame, chunks[1], battery);
+                }
+            }
+            1 => {
+                if body.width >= 70 {
+                    let cols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(body);
+
+                    // Left: CPU taking full height
+                    render_general_cpu_card(
+                        frame,
+                        cols[0],
+                        global_cpu_usage,
+                        core_usages,
+                        cpu_cur_mhz,
+                        cpu_min_mhz,
+                        cpu_max_mhz,
+                        cpu_temp,
+                        cpu_model,
+                    );
+
+                    // Right: Memory, GPU, Network, IO
+                    let right = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(4),
+                            Constraint::Length(4),
+                            Constraint::Length(4),
+                            Constraint::Length(4),
+                        ])
+                        .split(cols[1]);
+                    render_general_memory_card(frame, right[0], mem, ram_info);
+                    render_general_gpu_card(frame, right[1], gpu);
+                    render_general_net_card(frame, right[2], net_ifaces);
+                    render_general_disk_card(frame, right[3], disk_io);
+                } else {
+                    let rows = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Min(0),
+                            Constraint::Length(4),
+                            Constraint::Length(4),
+                            Constraint::Length(4),
+                            Constraint::Length(4),
+                        ])
+                        .split(body);
+                    render_general_cpu_card(
+                        frame,
+                        rows[0],
+                        global_cpu_usage,
+                        core_usages,
+                        cpu_cur_mhz,
+                        cpu_min_mhz,
+                        cpu_max_mhz,
+                        cpu_temp,
+                        cpu_model,
+                    );
+                    render_general_memory_card(frame, rows[1], mem, ram_info);
+                    render_general_gpu_card(frame, rows[2], gpu);
+                    render_general_net_card(frame, rows[3], net_ifaces);
+                    render_general_disk_card(frame, rows[4], disk_io);
+                }
+            }
+            2 => {
+                render_general_processes_card(frame, body, processes, mem, gpu, num_cores);
+            }
+            _ => {
+                render_general_storage_card(frame, body, disk_mounts);
+            }
+        }
+    } else {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(14),
+                Constraint::Min(0),
+                Constraint::Percentage(30),
+            ])
+            .split(columns[0]);
+
+        render_general_overview_card(frame, left_chunks[0], sys_info, cpu_model, ram_info, gpu, copied);
+        render_general_cpu_card(
+            frame,
+            left_chunks[1],
+            global_cpu_usage,
+            core_usages,
+            cpu_cur_mhz,
+            cpu_min_mhz,
+            cpu_max_mhz,
+            cpu_temp,
+            cpu_model,
+        );
+        render_general_processes_card(frame, left_chunks[2], processes, mem, gpu, num_cores);
+
+        let battery_height = if battery.is_some() { 7 } else { 5 };
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(battery_height),
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Length(4),
+                Constraint::Min(0),
+            ])
+            .split(columns[1]);
+
+        render_general_battery_card(frame, right_chunks[0], battery);
+        render_general_memory_card(frame, right_chunks[1], mem, ram_info);
+        render_general_gpu_card(frame, right_chunks[2], gpu);
+        render_general_net_card(frame, right_chunks[3], net_ifaces);
+        render_general_disk_card(frame, right_chunks[4], disk_io);
+        render_general_storage_card(frame, right_chunks[5], disk_mounts);
+    }
+}
+
+/// Renders a modal confirmation dialog when terminating (SIGTERM) or force-killing (SIGKILL) a process.
+///
+/// # Arguments
+/// * `frame` - Terminal rendering frame buffer.
+/// * `area` - Full terminal frame bounding box.
+/// * `confirm` - Pending process kill confirmation details.
+///
+/// # Returns
+/// A tuple of `(Rect, Rect)` containing the bounding rectangles for the `[ Yes (y) ]` and `[ No (n) ]` clickable buttons.
+pub fn render_kill_confirmation_modal(
+    frame: &mut Frame,
+    area: Rect,
+    confirm: &ProcessKillConfirmation,
+) -> (Rect, Rect) {
+    let popup_width = 58.min(area.width.saturating_sub(4));
+    let popup_height = 8.min(area.height.saturating_sub(2));
+    let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    frame.render_widget(ratatui::widgets::Clear, popup_rect);
+
+    let (title, border_color, sig_text) = if confirm.is_kill {
+        (" Force Kill (SIGKILL) ", Color::Rgb(255, 60, 60), "force kill")
+    } else {
+        (" Terminate (SIGTERM) ", Color::Rgb(255, 190, 0), "terminate")
+    };
+
+    let block = Block::default()
+        .title(title.fg(border_color).bold())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(popup_rect);
+    frame.render_widget(block, popup_rect);
+
+    let target_desc = if confirm.pids.len() > 1 {
+        format!("{} ({} processes)", confirm.process_name, confirm.pids.len())
+    } else if let Some(&pid) = confirm.pids.first() {
+        format!("{} [PID: {}]", confirm.process_name, pid)
+    } else {
+        confirm.process_name.clone()
+    };
+
+    let question = Line::from(vec![
+        Span::raw(" Are you sure you want to "),
+        Span::styled(sig_text, Style::default().fg(border_color).bold()),
+        Span::raw(" this process?"),
+    ]);
+
+    let target_line = Line::from(vec![
+        Span::raw("   "),
+        Span::styled(target_desc, Style::default().fg(Color::Rgb(255, 255, 255)).bold()),
+    ]);
+
+    let btn_y = inner.y + inner.height.saturating_sub(2);
+    let yes_w = 14;
+    let no_w = 14;
+    let total_btn_w = yes_w + no_w + 4;
+    let btn_start_x = inner.x + inner.width.saturating_sub(total_btn_w) / 2;
+
+    let yes_rect = Rect::new(btn_start_x, btn_y, yes_w, 1);
+    let no_rect = Rect::new(btn_start_x + yes_w + 4, btn_y, no_w, 1);
+
+    let lines = vec![
+        question,
+        target_line,
+    ];
+
+    let paragraph = ratatui::widgets::Paragraph::new(lines);
+    frame.render_widget(paragraph, Rect::new(inner.x, inner.y + 1, inner.width, 2));
+
+    // Render Yes Button
+    let yes_style = if confirm.is_kill {
+        Style::default().bg(Color::Rgb(200, 30, 30)).fg(Color::Rgb(255, 255, 255)).bold()
+    } else {
+        Style::default().bg(Color::Rgb(200, 140, 0)).fg(Color::Rgb(0, 0, 0)).bold()
+    };
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(" [ Yes (y) ] ")
+            .style(yes_style)
+            .alignment(ratatui::layout::Alignment::Center),
+        yes_rect,
+    );
+
+    // Render No Button
+    let no_style = Style::default().bg(Color::Rgb(70, 70, 70)).fg(Color::Rgb(255, 255, 255)).bold();
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(" [ No (n) ] ")
+            .style(no_style)
+            .alignment(ratatui::layout::Alignment::Center),
+        no_rect,
+    );
+
+    (yes_rect, no_rect)
 }

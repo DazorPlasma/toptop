@@ -257,3 +257,56 @@ fn base64_encode(input: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use ratatui::prelude::*;
+    use ratatui::widgets::{Block, Borders, Tabs};
+
+    #[test]
+    fn test_tabs_coords() {
+        let area = Rect::new(0, 0, 100, 3);
+        let mut buf = Buffer::empty(area);
+        let titles = vec![
+            Line::from("General (1)"),
+            Line::from("Processes (2)"),
+            Line::from("CPU & RAM (3)"),
+            Line::from("GPU (4)"),
+            Line::from("Network (5)"),
+            Line::from("Disk (6)"),
+        ];
+        let tabs = Tabs::new(titles)
+            .select(0)
+            .block(Block::default().borders(Borders::ALL))
+            .divider("|")
+            .padding(" ", " ");
+        tabs.render(area, &mut buf);
+        let row: String = (0..area.width).map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' ')).collect();
+        println!("ROW: '{}'", row);
+
+        let row_chars: Vec<char> = (0..area.width)
+            .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        let titles_raw = [
+            "General (1)",
+            "Processes (2)",
+            "CPU & RAM (3)",
+            "GPU (4)",
+            "Network (5)",
+            "Disk (6)",
+        ];
+        let mut tab_x = area.x + 1;
+        for (idx, title) in titles_raw.iter().enumerate() {
+            let tab_w = 1 + title.chars().count() as u16 + 1;
+            let slice: String = row_chars[tab_x as usize..(tab_x + tab_w) as usize].iter().collect();
+            println!("Tab {}: idx={} range=[{}, {}) text='{}'", idx, title, tab_x, tab_x + tab_w, slice);
+            assert_eq!(slice, format!(" {} ", title));
+            if idx < titles_raw.len() - 1 {
+                let div: String = row_chars[(tab_x + tab_w) as usize..(tab_x + tab_w + 1) as usize].iter().collect();
+                assert_eq!(div, "|");
+            }
+            tab_x += tab_w + 1;
+        }
+    }
+}
