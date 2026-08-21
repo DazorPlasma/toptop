@@ -3100,8 +3100,23 @@ fn render_general_overview_card(
     gpu: &GpuMetrics,
     copied: bool,
 ) {
+    let btn_text = if copied {
+        "[ ✓ Copied! ]"
+    } else {
+        "[ 'c' Copy ]"
+    };
+    let btn_style = if copied {
+        Style::default().fg(Color::Rgb(0, 255, 128))
+    } else {
+        Style::default().fg(Color::Rgb(100, 200, 255))
+    };
     let sys_block = Block::default()
         .title(" System Overview ".fg(Color::Rgb(170, 170, 170)))
+        .title(
+            Line::from(format!(" {} ", btn_text))
+                .style(btn_style)
+                .alignment(ratatui::layout::Alignment::Right),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
@@ -3228,32 +3243,6 @@ fn render_general_overview_card(
                             .set_char(ch)
                             .set_style(Style::default().fg(color));
                     }
-                }
-            }
-        }
-
-        // Bottom right Copy button
-        let btn_text = if copied {
-            "[ ✓ Copied! ]"
-        } else {
-            "[ 'c' Copy ]"
-        };
-        let btn_len = btn_text.chars().count() as u16;
-        let btn_x = sys_inner.right().saturating_sub(btn_len);
-        let btn_y = sys_inner.bottom().saturating_sub(1);
-
-        if btn_x < sys_inner.right() && btn_y < sys_inner.bottom() {
-            let style = if copied {
-                Style::default().fg(Color::Rgb(0, 255, 128))
-            } else {
-                Style::default().fg(Color::Rgb(100, 200, 255))
-            };
-            for (idx, ch) in btn_text.chars().enumerate() {
-                let col = btn_x + idx as u16;
-                if col < sys_inner.right() {
-                    frame.buffer_mut()[(col, btn_y)]
-                        .set_char(ch)
-                        .set_style(style);
                 }
             }
         }

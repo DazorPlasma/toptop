@@ -2104,21 +2104,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             tab_x += w + 1;
                                         }
                                     } else {
-                                        let top_box_w = if is_compact {
+                                        let top_box_w = if is_compact && table_area.width < 70 {
                                             table_area.width
                                         } else {
                                             table_area.width / 2
                                         };
                                         let top_box_right = table_area.x + top_box_w;
-                                        let top_box_bottom = if is_compact {
-                                            table_area.y + 3 + 14
+                                        let top_box_top = if is_compact {
+                                            table_area.y + 3
                                         } else {
-                                            table_area.y + 14
+                                            table_area.y
                                         };
                                         if mx >= top_box_right.saturating_sub(18)
                                             && mx <= top_box_right
-                                            && my >= top_box_bottom.saturating_sub(3)
-                                            && my <= top_box_bottom
+                                            && my >= top_box_top
+                                            && my <= top_box_top + 1
                                         {
                                             let cur_snap = snapshots.get(snapshot_idx);
                                             let text = format_system_overview_copy_text(
