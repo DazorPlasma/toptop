@@ -59,7 +59,7 @@ use crate::{
         calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery, read_cpu_freq_info,
         read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts, read_gpu_metrics,
         read_memory, read_network_connections, read_network_interfaces,
-        read_package_storage_categories, read_system_general_info,
+        read_package_storage_categories, read_dust_storage, read_system_general_info,
     },
     theme::io_gradient_pct,
     ui::{
@@ -274,6 +274,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         Receiver<Vec<PackageStorageCategory>>,
     ) = channel();
 
+    let (dust_tx, dust_rx): (
+        Sender<Option<PackageStorageCategory>>,
+        Receiver<Option<PackageStorageCategory>>,
+    ) = channel();
+    let mut is_dust_scanning = false;
+
     // Spawn background worker for async 20-second package storage scans
     std::thread::Builder::new()
         .name("storage-scanner".to_string())
@@ -288,7 +294,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         })
         .expect("failed to spawn storage scanner thread");
 
-    let mut storage_categories = Vec::new();
+    let mut storage_categories = vec![PackageStorageCategory {
+        name: "All".to_string(),
+        total_str: String::new(),
+        items: Vec::new(),
+    }];
     let mut general_sub_tab = 0;
     let mut gpu_sub_tab = 0;
     let mut disks_sub_tab = 0;
@@ -392,9 +402,32 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
     'main_loop: loop {
         while let Ok(new_cats) = storage_rx.try_recv() {
-            storage_categories = new_cats;
+            let all_entry = storage_categories
+                .iter()
+                .find(|c| c.name == "All")
+                .cloned()
+                .unwrap_or_else(|| PackageStorageCategory {
+                    name: "All".to_string(),
+                    total_str: String::new(),
+                    items: Vec::new(),
+                });
+            let mut combined = vec![all_entry];
+            combined.extend(new_cats);
+            storage_categories = combined;
             if !storage_categories.is_empty() && disks_sub_tab >= storage_categories.len() {
                 disks_sub_tab = storage_categories.len() - 1;
+            }
+            needs_redraw = true;
+        }
+
+        while let Ok(dust_res) = dust_rx.try_recv() {
+            is_dust_scanning = false;
+            if let Some(cat) = dust_res {
+                if let Some(all_pos) = storage_categories.iter().position(|c| c.name == "All") {
+                    storage_categories[all_pos] = cat;
+                } else {
+                    storage_categories.insert(0, cat);
+                }
             }
             needs_redraw = true;
         }
@@ -670,6 +703,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             disks_scroll_offset,
                             disks_box_tab,
                             is_snapshot,
+                            is_dust_scanning,
                         );
                     }
                     _ => {}
@@ -1671,6 +1705,27 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     disks_scroll_offset = max_scroll;
                                     needs_redraw = true;
                                 }
+                                KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    if !is_tabbed || disks_box_tab == 2 {
+                                        let cat_idx = disks_sub_tab
+                                            .min(storage_categories.len().saturating_sub(1));
+                                        if let Some(cat) = storage_categories.get(cat_idx)
+                                            && cat.name == "All"
+                                            && !is_dust_scanning
+                                        {
+                                            is_dust_scanning = true;
+                                            let tx = dust_tx.clone();
+                                            std::thread::Builder::new()
+                                                .name("dust-scanner".to_string())
+                                                .spawn(move || {
+                                                    let res = read_dust_storage();
+                                                    let _ = tx.send(res);
+                                                })
+                                                .ok();
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                }
                                 KeyCode::Char(' ') => {
                                     is_paused = !is_paused;
                                     if !is_paused {
@@ -2079,11 +2134,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     let mut cur_row: u16 = 0;
                                     let mut cur_col: u16 = 0;
                                     for (i, cat) in storage_categories.iter().enumerate() {
-                                        let tab_len =
+                                        let tab_len = if cat.total_str.is_empty() {
+                                            format!("[ ▶ {} ] ", cat.name).chars().count() as u16
+                                        } else {
                                             format!("[ ▶ {} ({}) ] ", cat.name, cat.total_str)
                                                 .chars()
                                                 .count()
-                                                as u16;
+                                                as u16
+                                        };
                                         if cur_row == 0
                                             && cur_col > 0
                                             && (cur_col + tab_len) > inner_w

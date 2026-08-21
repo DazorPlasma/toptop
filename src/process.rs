@@ -734,6 +734,61 @@ pub fn identify_process_group(name: &str) -> Option<&'static str> {
     if lower.contains("syncthing") || bin.contains("syncthing") {
         return Some("Syncthing");
     }
+    if lower.contains("dbus") || bin.contains("dbus") {
+        return Some("Dbus");
+    }
+    if bin == "wl-paste"
+        || bin == "wl-copy"
+        || bin == "wl-clip-persist"
+        || bin == "wl-clipboard"
+        || bin == "cliphist"
+        || bin == "copyq"
+        || bin == "clipman"
+        || bin == "clipse"
+        || bin == "xclip"
+        || bin == "xsel"
+        || bin == "xclipboard"
+        || bin == "gpaste-daemon"
+        || bin == "gpaste"
+        || bin == "greenclip"
+        || bin == "clipcatd"
+        || bin == "clipcatctl"
+        || bin == "parcellite"
+        || bin == "clipit"
+        || bin == "diodon"
+        || bin == "klipper"
+        || bin == "autocutsel"
+        || bin == "clipboard-sync"
+        || lower.contains("wl-paste")
+        || lower.contains("wl-copy")
+        || lower.contains("wl-clip-persist")
+        || lower.contains("cliphist")
+        || lower.contains("copyq")
+        || lower.contains("clipman")
+        || lower.contains("gpaste")
+        || lower.contains("greenclip")
+        || lower.contains("clipcatd")
+        || lower.contains("clipboard-sync")
+    {
+        return Some("Clipboard");
+    }
+    if lower.contains("pipewire")
+        || lower.contains("wireplumber")
+        || lower.contains("pulseaudio")
+        || bin == "pipewire"
+        || bin == "pipewire-pulse"
+        || bin == "wireplumber"
+        || bin == "pipewire-media-session"
+        || bin == "pulseaudio"
+        || bin == "jackd"
+        || bin == "jackdbus"
+        || bin == "sndiod"
+        || bin == "alsactl"
+        || lower.contains("jackdbus")
+        || (bin.starts_with("jackd") && !bin.contains("jackdock"))
+    {
+        return Some("Audio Server");
+    }
     None
 }
 
@@ -1389,6 +1444,23 @@ mod tests {
         assert_eq!(identify_process_group("/usr/bin/syncthing --no-browser"), Some("Syncthing"));
         assert_eq!(identify_process_group("/nix/store/abc-syncthing-1.27.0/bin/syncthing"), Some("Syncthing"));
         assert_eq!(identify_process_group("syncthing-inotify"), Some("Syncthing"));
+        assert_eq!(identify_process_group("dbus-daemon --system"), Some("Dbus"));
+        assert_eq!(identify_process_group("dbus-broker-launch --scope user"), Some("Dbus"));
+        assert_eq!(identify_process_group("/nix/store/123-dbus-broker/bin/dbus-broker"), Some("Dbus"));
+        assert_eq!(identify_process_group("xdg-dbus-proxy --args"), Some("Dbus"));
+        assert_eq!(identify_process_group("wl-paste --type text --watch cliphist store"), Some("Clipboard"));
+        assert_eq!(identify_process_group("wl-copy"), Some("Clipboard"));
+        assert_eq!(identify_process_group("/usr/bin/copyq --start-server"), Some("Clipboard"));
+        assert_eq!(identify_process_group("xclip -selection clipboard"), Some("Clipboard"));
+        assert_eq!(identify_process_group("gpaste-daemon"), Some("Clipboard"));
+        assert_eq!(identify_process_group("clipman"), Some("Clipboard"));
+        assert_eq!(identify_process_group("greenclip daemon"), Some("Clipboard"));
+        assert_eq!(identify_process_group("/nix/store/123-pipewire/bin/pipewire"), Some("Audio Server"));
+        assert_eq!(identify_process_group("pipewire-pulse"), Some("Audio Server"));
+        assert_eq!(identify_process_group("wireplumber"), Some("Audio Server"));
+        assert_eq!(identify_process_group("/usr/bin/pulseaudio --daemonize=no"), Some("Audio Server"));
+        assert_eq!(identify_process_group("jackd -d alsa"), Some("Audio Server"));
+        assert_eq!(identify_process_group("sndiod"), Some("Audio Server"));
     }
 
     #[test]

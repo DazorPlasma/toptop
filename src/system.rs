@@ -1567,6 +1567,143 @@ pub struct PackageStorageCategory {
 
 /// Queries all 9 supported storage systems (Docker, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm)
 /// and returns only those categories that are detected on the host system.
+/// Parses the stdout from `dust` into a `PackageStorageCategory`.
+///
+/// # Arguments
+/// * `stdout` - Raw output from `dust -d 1 -c /`.
+///
+/// # Returns
+/// An optional `PackageStorageCategory` representing the `"All"` disk breakdown.
+pub fn parse_dust_output(stdout: &str) -> Option<PackageStorageCategory> {
+    let mut items = Vec::new();
+    let mut total_bytes = 0;
+    let mut total_str = "0 B".to_string();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let size_tok = parts.next().unwrap_or("");
+        let size_bytes = parse_size_to_bytes(size_tok);
+
+        let rest = if let Some(idx) = trimmed.find(char::is_whitespace) {
+            trimmed[idx..].trim_start()
+        } else {
+            ""
+        };
+
+        let without_tree = rest
+            .trim_start_matches(|c| {
+                c == '┌'
+                    || c == '├'
+                    || c == '└'
+                    || c == '─'
+                    || c == '┴'
+                    || c == '│'
+                    || c == ' '
+            })
+            .trim();
+
+        let dir_name = if let Some(pipe_idx) = without_tree.find('│') {
+            without_tree[..pipe_idx].trim()
+        } else if let Some(bar_idx) = without_tree.find('|') {
+            without_tree[..bar_idx].trim()
+        } else {
+            without_tree.split_whitespace().next().unwrap_or("")
+        };
+
+        if dir_name.is_empty() {
+            continue;
+        }
+
+        let pct_str = if let Some(last_pipe) = trimmed.rfind('│') {
+            trimmed[last_pipe + '│'.len_utf8()..].trim().to_string()
+        } else if let Some(last_bar) = trimmed.rfind('|') {
+            trimmed[last_bar + 1..].trim().to_string()
+        } else {
+            String::new()
+        };
+
+        let full_path = if dir_name == "/" {
+            "/".to_string()
+        } else {
+            format!("/{}", dir_name)
+        };
+
+        if dir_name == "/" {
+            total_bytes = size_bytes;
+            total_str = format_bytes_dyn(size_bytes as f64);
+        } else {
+            let detail = if !pct_str.is_empty() {
+                format!("{} of root filesystem ({})", pct_str, full_path)
+            } else {
+                full_path.clone()
+            };
+
+            items.push(PackageStorageItem {
+                name: full_path,
+                detail,
+                size_bytes,
+                size_str: format_bytes_dyn(size_bytes as f64),
+            });
+        }
+    }
+
+    if !items.is_empty() || total_bytes > 0 {
+        items.sort_by(|a, b| {
+            b.size_bytes
+                .cmp(&a.size_bytes)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Some(PackageStorageCategory {
+            name: "All".to_string(),
+            total_str: if total_bytes > 0 {
+                total_str
+            } else {
+                format_bytes_dyn(items.iter().map(|i| i.size_bytes).sum::<u64>() as f64)
+            },
+            items,
+        })
+    } else {
+        None
+    }
+}
+
+/// Scans the entire filesystem root breakdown using the `dust` CLI.
+///
+/// # Returns
+/// An optional `PackageStorageCategory` representing the `"All"` disk breakdown.
+pub fn read_dust_storage() -> Option<PackageStorageCategory> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let dust_bins = [
+        "dust",
+        "/run/current-system/sw/bin/dust",
+        "/usr/bin/dust",
+        &format!("{}/.nix-profile/bin/dust", home),
+        &format!("{}/.cargo/bin/dust", home),
+    ];
+
+    for bin in dust_bins {
+        if let Ok(output) = std::process::Command::new(bin)
+            .args(["-d", "1", "-c", "/"])
+            .output()
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(cat) = parse_dust_output(&stdout) {
+                return Some(cat);
+            }
+        }
+    }
+
+    None
+}
+
+/// Scans, parses, and aggregates storage space metrics across all detected system package managers,
+/// container storage directories, and developer caches.
 ///
 /// # Returns
 /// A vector of `PackageStorageCategory` for all detected systems.
@@ -2927,6 +3064,39 @@ mod tests {
             assert!(!cat.name.is_empty());
             for item in &cat.items {
                 assert!(!item.name.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_dust_output() {
+        let sample = "  0B   ┌── proc      │█                                                   │   0%\n\
+  0B   ├── sys       │█                                                   │   0%\n\
+4.0K   ├── boot      │█                                                   │   0%\n\
+ 23G   ├── var       │████                                                │   7%\n\
+120G   ├── nix       │████████████████████                                │  38%\n\
+169G   ├── home      │████████████████████████████                        │  54%\n\
+313G ┌─┴ /           │███████████████████████████████████████████████████ │ 100%\n";
+
+        let cat = parse_dust_output(sample).expect("should parse dust output");
+        assert_eq!(cat.name, "All");
+        assert_eq!(cat.total_str, "313.0 GB");
+        assert_eq!(cat.items.len(), 6);
+        assert_eq!(cat.items[0].name, "/home");
+        assert_eq!(cat.items[0].size_str, "169.0 GB");
+        assert_eq!(cat.items[1].name, "/nix");
+        assert_eq!(cat.items[1].size_str, "120.0 GB");
+        assert_eq!(cat.items[2].name, "/var");
+        assert_eq!(cat.items[2].size_str, "23.0 GB");
+    }
+
+    #[test]
+    fn test_read_dust_storage() {
+        if let Some(dust_cat) = read_dust_storage() {
+            assert_eq!(dust_cat.name, "All");
+            assert!(!dust_cat.total_str.is_empty());
+            for item in &dust_cat.items {
+                assert!(item.name.starts_with('/'));
             }
         }
     }

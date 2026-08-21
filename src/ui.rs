@@ -2026,6 +2026,7 @@ pub fn is_disks_overflow(area: Rect, disk_io: &DiskIoInfo, disk_mounts: &[MountI
 /// * `scroll_offset` - Vertical scroll offset within the active category's item list.
 /// * `box_tab` - Selected box index when in tabbed view (0: Graphs, 1: Physical Disks, 2: Storage, 3: Mounted Filesystems).
 /// * `is_snapshot` - Whether historical snapshot telemetry is currently being inspected.
+/// * `is_dust_scanning` - Whether a background dust whole-disk scan is currently in progress.
 #[allow(clippy::too_many_arguments)]
 pub fn render_disks_tab(
     frame: &mut Frame,
@@ -2039,6 +2040,7 @@ pub fn render_disks_tab(
     scroll_offset: usize,
     box_tab: usize,
     is_snapshot: bool,
+    is_dust_scanning: bool,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -2137,6 +2139,7 @@ pub fn render_disks_tab(
                     active_cat_idx,
                     scroll_offset,
                     is_snapshot,
+                    is_dust_scanning,
                 );
             }
             _ => {
@@ -2195,6 +2198,7 @@ pub fn render_disks_tab(
             active_cat_idx,
             scroll_offset,
             is_snapshot,
+            is_dust_scanning,
         );
         render_mounted_filesystems_card(frame, bottom_chunks[1], disk_mounts);
     }
@@ -2263,12 +2267,10 @@ fn render_physical_disks_card(frame: &mut Frame, area: Rect, disk_io: &DiskIoInf
                                     Color::Rgb(0, 85, 0)
                                 }
                             } else {
-                                Color::Rgb(170, 170, 170)
+                                Color::Rgb(140, 140, 140)
                             }
-                        } else if idx >= 6 && (idx - 6) % 2 == 0 {
-                            Color::Rgb(220, 220, 220)
                         } else {
-                            Color::Rgb(170, 170, 170)
+                            Color::Rgb(140, 140, 140)
                         };
                         frame.buffer_mut()[(col, row)]
                             .set_char(ch)
@@ -2288,6 +2290,7 @@ fn render_package_storage_card(
     active_cat_idx: usize,
     scroll_offset: usize,
     is_snapshot: bool,
+    is_dust_scanning: bool,
 ) {
     let card_title = if is_snapshot || storage_categories.is_empty() {
         " Store ".to_string()
@@ -2319,7 +2322,7 @@ fn render_package_storage_card(
             }
         } else if storage_categories.is_empty() {
             let msg = "Scanning package and runtime storage in background...";
-            let sub = "(Supported: Docker, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm • 20s refresh)";
+            let sub = "(Supported: All (dust), Docker, Podman, Cargo, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm • 20s refresh)";
             let row = pkg_inner.y + 1;
             for (c_idx, ch) in msg.chars().enumerate() {
                 let col = pkg_inner.x + 2 + c_idx as u16;
@@ -2349,7 +2352,13 @@ fn render_package_storage_card(
             let mut cur_col = pkg_inner.x;
             for (i, cat) in storage_categories.iter().enumerate() {
                 let is_active = i == cat_idx;
-                let tab_label = if is_active {
+                let tab_label = if cat.total_str.is_empty() {
+                    if is_active {
+                        format!("[ ▶ {} ] ", cat.name)
+                    } else {
+                        format!("[ {} ] ", cat.name)
+                    }
+                } else if is_active {
                     format!("[ ▶ {} ({}) ] ", cat.name, cat.total_str)
                 } else {
                     format!("[ {} ({}) ] ", cat.name, cat.total_str)
@@ -2386,63 +2395,87 @@ fn render_package_storage_card(
                 }
             }
 
-            // 2. Items list with scroll offset (clean 1-line text with size)
-            let start_row_offset = subtab_rows + 1;
-            let visible_rows =
-                (pkg_inner.height as usize).saturating_sub(start_row_offset as usize);
-            let max_scroll = total_items.saturating_sub(visible_rows);
-            let start_idx = scroll_offset.min(max_scroll);
-
-            for (row_offset, item) in
-                (start_row_offset..).zip(active_cat.items.iter().skip(start_idx))
-            {
-                if row_offset >= pkg_inner.height {
-                    break;
-                }
-                let row_y = pkg_inner.y + row_offset;
-                let right_label = &item.size_str;
-                let right_len = right_label.chars().count() as u16;
-
-                // Right aligned size text
-                let r_col = pkg_inner.right().saturating_sub(right_len + 1);
-                for (c_idx, ch) in right_label.chars().enumerate() {
-                    let col = r_col + c_idx as u16;
-                    if col < pkg_inner.right() {
-                        frame.buffer_mut()[(col, row_y)]
-                            .set_char(ch)
-                            .set_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold());
-                    }
-                }
-
-                // Left aligned name and detail
-                let max_left_w = (r_col.saturating_sub(pkg_inner.x + 2)) as usize;
-                let full_left = if item.detail.is_empty() {
-                    format!("• {}", item.name)
+            if active_cat.items.is_empty() {
+                let msg = if is_dust_scanning && active_cat.name == "All" {
+                    "Scanning disk with dust in background..."
+                } else if active_cat.name == "All" {
+                    "Press Enter to scan disk scan."
                 } else {
-                    format!("• {} [{}]", item.name, item.detail)
+                    "No items detected in category."
                 };
-
-                let truncated_left: String = if full_left.chars().count() > max_left_w {
-                    let take_len = max_left_w.saturating_sub(1);
-                    let mut s: String = full_left.chars().take(take_len).collect();
-                    s.push('…');
-                    s
-                } else {
-                    full_left
-                };
-
-                for (c_idx, ch) in truncated_left.chars().enumerate() {
-                    let col = pkg_inner.x + c_idx as u16;
-                    if col < r_col {
-                        let is_detail = ch == '[' || ch == ']' || (c_idx > item.name.len() + 2);
-                        let color = if is_detail {
-                            Color::Rgb(140, 140, 140)
+                let row = pkg_inner.y + subtab_rows + 1;
+                for (c_idx, ch) in msg.chars().enumerate() {
+                    let col = pkg_inner.x + 2 + c_idx as u16;
+                    if col < pkg_inner.right() && row < pkg_inner.bottom() {
+                        let color = if is_dust_scanning && active_cat.name == "All" {
+                            Color::Rgb(255, 204, 0)
                         } else {
-                            Color::Rgb(230, 230, 230)
+                            Color::Rgb(140, 140, 140)
                         };
-                        frame.buffer_mut()[(col, row_y)]
+                        frame.buffer_mut()[(col, row)]
                             .set_char(ch)
                             .set_style(Style::default().fg(color));
+                    }
+                }
+            } else {
+                // 2. Items list with scroll offset (clean 1-line text with size)
+                let start_row_offset = subtab_rows + 1;
+                let visible_rows =
+                    (pkg_inner.height as usize).saturating_sub(start_row_offset as usize);
+                let max_scroll = total_items.saturating_sub(visible_rows);
+                let start_idx = scroll_offset.min(max_scroll);
+
+                for (row_offset, item) in
+                    (start_row_offset..).zip(active_cat.items.iter().skip(start_idx))
+                {
+                    if row_offset >= pkg_inner.height {
+                        break;
+                    }
+                    let row_y = pkg_inner.y + row_offset;
+                    let right_label = &item.size_str;
+                    let right_len = right_label.chars().count() as u16;
+
+                    // Right aligned size text
+                    let r_col = pkg_inner.right().saturating_sub(right_len + 1);
+                    for (c_idx, ch) in right_label.chars().enumerate() {
+                        let col = r_col + c_idx as u16;
+                        if col < pkg_inner.right() {
+                            frame.buffer_mut()[(col, row_y)]
+                                .set_char(ch)
+                                .set_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold());
+                        }
+                    }
+
+                    // Left aligned name and detail
+                    let max_left_w = (r_col.saturating_sub(pkg_inner.x + 2)) as usize;
+                    let full_left = if item.detail.is_empty() {
+                        format!("• {}", item.name)
+                    } else {
+                        format!("• {} [{}]", item.name, item.detail)
+                    };
+
+                    let truncated_left: String = if full_left.chars().count() > max_left_w {
+                        let take_len = max_left_w.saturating_sub(1);
+                        let mut s: String = full_left.chars().take(take_len).collect();
+                        s.push('…');
+                        s
+                    } else {
+                        full_left
+                    };
+
+                    for (c_idx, ch) in truncated_left.chars().enumerate() {
+                        let col = pkg_inner.x + c_idx as u16;
+                        if col < r_col {
+                            let is_detail = ch == '[' || ch == ']' || (c_idx > item.name.len() + 2);
+                            let color = if is_detail {
+                                Color::Rgb(140, 140, 140)
+                            } else {
+                                Color::Rgb(230, 230, 230)
+                            };
+                            frame.buffer_mut()[(col, row_y)]
+                                .set_char(ch)
+                                .set_style(Style::default().fg(color));
+                        }
                     }
                 }
             }
