@@ -16,8 +16,8 @@ use ratatui::{
 
 use crate::{
     process::{
-        ProcessInfo, ProcessKillConfirmation, ProcessSortColumn, group_processes_for_simple_view,
-        matches_process_search,
+        ProcessErrorPopup, ProcessInfo, ProcessKillConfirmation, ProcessSortColumn,
+        group_processes_for_simple_view, matches_process_search,
     },
     system::{
         BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo,
@@ -3720,6 +3720,69 @@ pub fn render_kill_confirmation_modal(
     );
 
     (yes_rect, no_rect)
+}
+
+/// Renders a modal error popup dialog when process validation fails before or during kill/terminate.
+///
+/// # Arguments
+/// * `frame` - Terminal rendering frame buffer.
+/// * `area` - Full terminal frame bounding box.
+/// * `popup` - Pending process error popup details.
+///
+/// # Returns
+/// The bounding rectangle for the `[ OK (Enter) ]` clickable button.
+pub fn render_process_error_popup(
+    frame: &mut Frame,
+    area: Rect,
+    popup: &ProcessErrorPopup,
+) -> Rect {
+    let popup_width = 62.min(area.width.saturating_sub(4));
+    let content_lines = popup.message_lines.len() as u16;
+    let popup_height = (5 + content_lines).min(area.height.saturating_sub(2)).max(6);
+    let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
+    let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
+
+    frame.render_widget(ratatui::widgets::Clear, popup_rect);
+
+    let border_color = Color::Rgb(255, 70, 70);
+    let block = Block::default()
+        .title(format!(" {} ", popup.title).fg(border_color).bold())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(popup_rect);
+    frame.render_widget(block, popup_rect);
+
+    let mut lines = Vec::with_capacity(popup.message_lines.len());
+    for msg in &popup.message_lines {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(msg.clone(), Style::default().fg(Color::Rgb(255, 230, 230)).bold()),
+        ]));
+    }
+
+    let text_area = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1));
+    frame.render_widget(ratatui::widgets::Paragraph::new(lines), text_area);
+
+    let btn_w = 18;
+    let btn_x = inner.x + (inner.width.saturating_sub(btn_w)) / 2;
+    let btn_y = inner.y + inner.height.saturating_sub(1);
+    let ok_rect = Rect::new(btn_x, btn_y, btn_w, 1);
+
+    let ok_style = Style::default()
+        .bg(Color::Rgb(200, 40, 40))
+        .fg(Color::Rgb(255, 255, 255))
+        .bold();
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(" [ OK (Enter) ] ")
+            .style(ok_style)
+            .alignment(ratatui::layout::Alignment::Center),
+        ok_rect,
+    );
+
+    ok_rect
 }
 
 #[cfg(test)]

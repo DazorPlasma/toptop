@@ -48,23 +48,24 @@ use ratatui::{
 
 use crate::{
     process::{
-        ADVANCED_SORT_COLUMNS, NORMAL_SORT_COLUMNS, ProcessInfo, ProcessKillConfirmation,
-        ProcessSortColumn, directly_matches_search, group_processes_for_simple_view,
-        matches_process_search, process_search_score, read_processes, sort_processes,
+        ADVANCED_SORT_COLUMNS, NORMAL_SORT_COLUMNS, ProcessErrorPopup, ProcessInfo,
+        ProcessKillConfirmation, ProcessSortColumn, ProcessTarget, directly_matches_search,
+        group_processes_for_simple_view, matches_process_search, process_search_score,
+        read_processes, sort_processes, validate_process_target,
     },
     system::{
-        calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery,
-        read_cpu_freq_info, read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts,
-        read_gpu_metrics, read_memory, read_network_connections, read_network_interfaces,
-        read_package_storage_categories, read_system_general_info, BatteryInfo, DiskIoInfo,
-        DnsResolver, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo, NetInterfaceInfo,
-        PackageStorageCategory, SystemGeneralInfo,
+        BatteryInfo, DiskIoInfo, DnsResolver, GpuMetrics, MemoryMetrics, MountInfo,
+        NetConnectionInfo, NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo,
+        calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery, read_cpu_freq_info,
+        read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts, read_gpu_metrics,
+        read_memory, read_network_connections, read_network_interfaces,
+        read_package_storage_categories, read_system_general_info,
     },
     theme::io_gradient_pct,
     ui::{
         format_system_overview_copy_text, is_disks_overflow, is_gpu_overflow, render_cpu_ram_tab,
         render_disks_tab, render_general_tab, render_gpu_tab, render_kill_confirmation_modal,
-        render_network_tab, render_process_tab,
+        render_network_tab, render_process_error_popup, render_process_tab,
     },
     utils::copy_to_clipboard,
 };
@@ -353,7 +354,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut net_scroll_offset: usize = 0;
     let mut expanded_groups: HashSet<String> = HashSet::new();
     let mut kill_confirmation: Option<ProcessKillConfirmation> = None;
+    let mut process_error_popup: Option<ProcessErrorPopup> = None;
     let mut modal_btn_rects: Option<(Rect, Rect)> = None;
+    let mut error_btn_rect: Option<Rect> = None;
     let mut needs_redraw = true;
 
     let mut snapshots = Vec::with_capacity(MAX_SNAPSHOTS);
@@ -451,13 +454,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
                 let time_badge = if is_paused && steps_back > 0 {
                     format!(
-                        " [PAUSED -{}s ({}/{}) | [/] time travel, Space to resume] ",
+                        " [PAUSED -{}s ({}/{}) | '[' / ']' time travel] ",
                         secs_back, cur_snap, total_snaps
                     )
                 } else if is_paused {
-                    " [PAUSED (LIVE) | [/] time travel, Space to resume] ".to_string()
+                    " [PAUSED (LIVE) | '[' / ']' time travel] ".to_string()
                 } else {
-                    " - Space to pause | [/] time travel ".to_string()
+                    " - Space to pause ".to_string()
                 };
 
                 let tabs_title = format!(" System Monitor{} ", time_badge);
@@ -622,37 +625,53 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     _ => {}
                 }
 
-                if let Some(ref confirm) = kill_confirmation {
+                if let Some(ref err_popup) = process_error_popup {
+                    error_btn_rect = Some(render_process_error_popup(frame, area, err_popup));
+                    modal_btn_rects = None;
+                } else if let Some(ref confirm) = kill_confirmation {
                     modal_btn_rects = Some(render_kill_confirmation_modal(frame, area, confirm));
+                    error_btn_rect = None;
                 } else {
                     modal_btn_rects = None;
+                    error_btn_rect = None;
                 }
             })?;
             needs_redraw = false;
         }
 
-        let timeout = if is_paused {
-            if let Some(until) = copy_feedback_until {
-                until
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO)
-                    .min(Duration::from_millis(250))
-            } else {
-                Duration::from_millis(250)
-            }
-        } else {
-            let base_timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
+        let base_timeout = tick_rate
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or(Duration::ZERO);
+        let timeout = if let Some(until) = copy_feedback_until {
+            let copy_timeout = until
+                .checked_duration_since(Instant::now())
                 .unwrap_or(Duration::ZERO);
-            if let Some(until) = copy_feedback_until {
-                let copy_timeout = until
-                    .checked_duration_since(Instant::now())
-                    .unwrap_or(Duration::ZERO);
-                base_timeout.min(copy_timeout)
-            } else {
-                base_timeout
-            }
+            base_timeout.min(copy_timeout)
+        } else {
+            base_timeout
         };
+
+        if let Some(_err_popup) = process_error_popup.as_ref() {
+            if event::poll(timeout)? {
+                match event::read()? {
+                    Event::Key(_) => {
+                        process_error_popup = None;
+                        needs_redraw = true;
+                    }
+                    Event::Mouse(mouse_event) => {
+                        if let MouseEventKind::Down(MouseButton::Left) = mouse_event.kind {
+                            process_error_popup = None;
+                            needs_redraw = true;
+                        }
+                    }
+                    Event::Resize(_, _) => {
+                        needs_redraw = true;
+                    }
+                    _ => {}
+                }
+            }
+            continue 'main_loop;
+        }
 
         if let Some(confirm) = kill_confirmation.as_ref() {
             if event::poll(timeout)? {
@@ -662,21 +681,42 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             key.code,
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
                         ) {
-                            for &p_id in &confirm.pids {
-                                if let Some(pid) = rustix::process::Pid::from_raw(p_id as i32) {
-                                    let _ = rustix::process::kill_process(pid, confirm.signal);
+                            let mut validation_err = None;
+                            for t in &confirm.targets {
+                                if let Err(e) = validate_process_target(t) {
+                                    validation_err = Some(e);
+                                    break;
                                 }
                             }
-                            std::thread::sleep(Duration::from_millis(40));
-                            let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
-                            processes = read_processes(&mut prev_procs, &users, cur_dt);
-                            sort_processes(&mut processes, current_sort_col, sort_ascending);
-                            mem = read_memory(&mut io_buf);
-                            if !is_paused {
-                                last_tick = Instant::now();
+
+                            if let Some(err_msg) = validation_err {
+                                kill_confirmation = None;
+                                process_error_popup = Some(ProcessErrorPopup {
+                                    title: "Process Validation Error".to_string(),
+                                    message_lines: vec![
+                                        err_msg,
+                                        "Action cancelled to protect unintended processes."
+                                            .to_string(),
+                                    ],
+                                });
+                                needs_redraw = true;
+                            } else {
+                                for &p_id in &confirm.pids {
+                                    if let Some(pid) = rustix::process::Pid::from_raw(p_id as i32) {
+                                        let _ = rustix::process::kill_process(pid, confirm.signal);
+                                    }
+                                }
+                                std::thread::sleep(Duration::from_millis(40));
+                                let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
+                                processes = read_processes(&mut prev_procs, &users, cur_dt);
+                                sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                mem = read_memory(&mut io_buf);
+                                if !is_paused {
+                                    last_tick = Instant::now();
+                                }
+                                kill_confirmation = None;
+                                needs_redraw = true;
                             }
-                            kill_confirmation = None;
-                            needs_redraw = true;
                         } else if matches!(
                             key.code,
                             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc
@@ -696,21 +736,49 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 && my >= yes_rect.y
                                 && my < yes_rect.bottom()
                             {
-                                for &p_id in &confirm.pids {
-                                    if let Some(pid) = rustix::process::Pid::from_raw(p_id as i32) {
-                                        let _ = rustix::process::kill_process(pid, confirm.signal);
+                                let mut validation_err = None;
+                                for t in &confirm.targets {
+                                    if let Err(e) = validate_process_target(t) {
+                                        validation_err = Some(e);
+                                        break;
                                     }
                                 }
-                                std::thread::sleep(Duration::from_millis(40));
-                                let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
-                                processes = read_processes(&mut prev_procs, &users, cur_dt);
-                                sort_processes(&mut processes, current_sort_col, sort_ascending);
-                                mem = read_memory(&mut io_buf);
-                                if !is_paused {
-                                    last_tick = Instant::now();
+
+                                if let Some(err_msg) = validation_err {
+                                    kill_confirmation = None;
+                                    process_error_popup = Some(ProcessErrorPopup {
+                                        title: "Process Validation Error".to_string(),
+                                        message_lines: vec![
+                                            err_msg,
+                                            "Action cancelled to protect unintended processes."
+                                                .to_string(),
+                                        ],
+                                    });
+                                    needs_redraw = true;
+                                } else {
+                                    for &p_id in &confirm.pids {
+                                        if let Some(pid) =
+                                            rustix::process::Pid::from_raw(p_id as i32)
+                                        {
+                                            let _ =
+                                                rustix::process::kill_process(pid, confirm.signal);
+                                        }
+                                    }
+                                    std::thread::sleep(Duration::from_millis(40));
+                                    let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
+                                    processes = read_processes(&mut prev_procs, &users, cur_dt);
+                                    sort_processes(
+                                        &mut processes,
+                                        current_sort_col,
+                                        sort_ascending,
+                                    );
+                                    mem = read_memory(&mut io_buf);
+                                    if !is_paused {
+                                        last_tick = Instant::now();
+                                    }
+                                    kill_confirmation = None;
+                                    needs_redraw = true;
                                 }
-                                kill_confirmation = None;
-                                needs_redraw = true;
                             } else if mx >= no_rect.x
                                 && mx < no_rect.right()
                                 && my >= no_rect.y
@@ -1112,25 +1180,64 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             })
                                             .collect();
                                         if let Some(target) = displayed.get(sel) {
-                                            let pids = if !target.grouped_pids.is_empty() {
-                                                target.grouped_pids.clone()
+                                            let mut targets = Vec::new();
+                                            if !target.grouped_pids.is_empty() {
+                                                for &p_id in &target.grouped_pids {
+                                                    let (comm, name) = if let Some(p) =
+                                                        proc_map.get(&p_id)
+                                                    {
+                                                        (p.comm.clone(), p.name.clone())
+                                                    } else {
+                                                        (target.comm.clone(), target.name.clone())
+                                                    };
+                                                    targets.push(ProcessTarget {
+                                                        pid: p_id,
+                                                        comm,
+                                                        name,
+                                                    });
+                                                }
                                             } else {
-                                                vec![target.pid]
-                                            };
-                                            let clean_name = target
-                                                .name
-                                                .trim_start_matches("▼ ")
-                                                .trim_start_matches("▶ ")
-                                                .trim_start_matches("├─ ")
-                                                .trim_start_matches("└─ ")
-                                                .trim()
-                                                .to_string();
-                                            kill_confirmation = Some(ProcessKillConfirmation {
-                                                pids,
-                                                process_name: clean_name,
-                                                signal: rustix::process::Signal::Term,
-                                                is_kill: false,
-                                            });
+                                                targets.push(ProcessTarget {
+                                                    pid: target.pid,
+                                                    comm: target.comm.clone(),
+                                                    name: target.name.clone(),
+                                                });
+                                            }
+
+                                            let mut validation_err = None;
+                                            for t in &targets {
+                                                if let Err(e) = validate_process_target(t) {
+                                                    validation_err = Some(e);
+                                                    break;
+                                                }
+                                            }
+
+                                            if let Some(err_msg) = validation_err {
+                                                process_error_popup = Some(ProcessErrorPopup {
+                                                    title: "Process Validation Error".to_string(),
+                                                    message_lines: vec![
+                                                        err_msg,
+                                                        "Action cancelled to protect unintended processes.".to_string(),
+                                                    ],
+                                                });
+                                            } else {
+                                                let pids = targets.iter().map(|t| t.pid).collect();
+                                                let clean_name = target
+                                                    .name
+                                                    .trim_start_matches("▼ ")
+                                                    .trim_start_matches("▶ ")
+                                                    .trim_start_matches("├─ ")
+                                                    .trim_start_matches("└─ ")
+                                                    .trim()
+                                                    .to_string();
+                                                kill_confirmation = Some(ProcessKillConfirmation {
+                                                    targets,
+                                                    pids,
+                                                    process_name: clean_name,
+                                                    signal: rustix::process::Signal::Term,
+                                                    is_kill: false,
+                                                });
+                                            }
                                             needs_redraw = true;
                                         }
                                     }
@@ -1149,25 +1256,64 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             })
                                             .collect();
                                         if let Some(target) = displayed.get(sel) {
-                                            let pids = if !target.grouped_pids.is_empty() {
-                                                target.grouped_pids.clone()
+                                            let mut targets = Vec::new();
+                                            if !target.grouped_pids.is_empty() {
+                                                for &p_id in &target.grouped_pids {
+                                                    let (comm, name) = if let Some(p) =
+                                                        proc_map.get(&p_id)
+                                                    {
+                                                        (p.comm.clone(), p.name.clone())
+                                                    } else {
+                                                        (target.comm.clone(), target.name.clone())
+                                                    };
+                                                    targets.push(ProcessTarget {
+                                                        pid: p_id,
+                                                        comm,
+                                                        name,
+                                                    });
+                                                }
                                             } else {
-                                                vec![target.pid]
-                                            };
-                                            let clean_name = target
-                                                .name
-                                                .trim_start_matches("▼ ")
-                                                .trim_start_matches("▶ ")
-                                                .trim_start_matches("├─ ")
-                                                .trim_start_matches("└─ ")
-                                                .trim()
-                                                .to_string();
-                                            kill_confirmation = Some(ProcessKillConfirmation {
-                                                pids,
-                                                process_name: clean_name,
-                                                signal: rustix::process::Signal::Kill,
-                                                is_kill: true,
-                                            });
+                                                targets.push(ProcessTarget {
+                                                    pid: target.pid,
+                                                    comm: target.comm.clone(),
+                                                    name: target.name.clone(),
+                                                });
+                                            }
+
+                                            let mut validation_err = None;
+                                            for t in &targets {
+                                                if let Err(e) = validate_process_target(t) {
+                                                    validation_err = Some(e);
+                                                    break;
+                                                }
+                                            }
+
+                                            if let Some(err_msg) = validation_err {
+                                                process_error_popup = Some(ProcessErrorPopup {
+                                                    title: "Process Validation Error".to_string(),
+                                                    message_lines: vec![
+                                                        err_msg,
+                                                        "Action cancelled to protect unintended processes.".to_string(),
+                                                    ],
+                                                });
+                                            } else {
+                                                let pids = targets.iter().map(|t| t.pid).collect();
+                                                let clean_name = target
+                                                    .name
+                                                    .trim_start_matches("▼ ")
+                                                    .trim_start_matches("▶ ")
+                                                    .trim_start_matches("├─ ")
+                                                    .trim_start_matches("└─ ")
+                                                    .trim()
+                                                    .to_string();
+                                                kill_confirmation = Some(ProcessKillConfirmation {
+                                                    targets,
+                                                    pids,
+                                                    process_name: clean_name,
+                                                    signal: rustix::process::Signal::Kill,
+                                                    is_kill: true,
+                                                });
+                                            }
                                             needs_redraw = true;
                                         }
                                     }
@@ -1851,7 +1997,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             }
         }
 
-        if !is_paused && last_tick.elapsed() >= tick_rate {
+        if last_tick.elapsed() >= tick_rate {
             let dt = last_tick.elapsed().as_secs_f64();
             sys_info = read_system_general_info();
             battery = read_battery();
@@ -1961,8 +2107,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             ));
             if snapshots.len() > MAX_SNAPSHOTS {
                 snapshots.remove(0);
+                if is_paused {
+                    snapshot_idx = snapshot_idx.saturating_sub(1);
+                }
             }
-            snapshot_idx = snapshots.len().saturating_sub(1);
+            if !is_paused {
+                snapshot_idx = snapshots.len().saturating_sub(1);
+            }
 
             last_tick = Instant::now();
             needs_redraw = true;
@@ -2041,5 +2192,83 @@ mod tests {
             snapshot_idx += 1;
         }
         assert_eq!(snapshot_idx, 4);
+    }
+
+    #[test]
+    fn test_snapshot_growth_while_paused() {
+        let mut snapshots = Vec::new();
+        let sys_info = SystemGeneralInfo::default();
+        let gpu = GpuMetrics::default();
+        let mem = MemoryMetrics::default();
+        let disk = DiskIoInfo::default();
+        let dummy_net_conns: Result<Vec<NetConnectionInfo>, &'static str> = Ok(Vec::new());
+
+        let create_dummy = |val: f64| {
+            create_snapshot(
+                &sys_info,
+                None,
+                val,
+                &[val],
+                2000.0,
+                1000.0,
+                3000.0,
+                45,
+                &mem,
+                "16 GB",
+                &gpu,
+                &[],
+                &dummy_net_conns,
+                &disk,
+                &[],
+                &[],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+            )
+        };
+
+        // Start with 3 snapshots
+        snapshots.push(create_dummy(1.0));
+        snapshots.push(create_dummy(2.0));
+        snapshots.push(create_dummy(3.0));
+        assert_eq!(snapshots.len(), 3);
+
+        // User pauses at 2nd snapshot (index 1, display 2/3)
+        let is_paused = true;
+        let mut snapshot_idx = 1;
+        assert_eq!(snapshot_idx + 1, 2);
+        assert_eq!(snapshots.len(), 3);
+
+        // New tick captures snapshot 4 while paused
+        snapshots.push(create_dummy(4.0));
+        if !is_paused {
+            snapshot_idx = snapshots.len().saturating_sub(1);
+        }
+        // Now at 2/4 (snapshot_idx = 1, len = 4)
+        assert_eq!(snapshot_idx + 1, 2);
+        assert_eq!(snapshots.len(), 4);
+
+        // New tick captures snapshot 5 while paused
+        snapshots.push(create_dummy(5.0));
+        if !is_paused {
+            snapshot_idx = snapshots.len().saturating_sub(1);
+        }
+        // Now at 2/5 (snapshot_idx = 1, len = 5)
+        assert_eq!(snapshot_idx + 1, 2);
+        assert_eq!(snapshots.len(), 5);
+
+        // Unpausing jumps to latest (5/5)
+        let is_paused = false;
+        if !is_paused {
+            snapshot_idx = snapshots.len().saturating_sub(1);
+        }
+        assert_eq!(snapshot_idx + 1, 5);
+        assert_eq!(snapshots.len(), 5);
     }
 }

@@ -65,9 +65,22 @@ pub struct ProcessInfo {
     pub group_name: Option<String>,
 }
 
+/// Target process details for termination/kill validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessTarget {
+    /// Process Identifier (PID).
+    pub pid: u32,
+    /// Expected command name.
+    pub comm: String,
+    /// Expected process name.
+    pub name: String,
+}
+
 /// Stores pending process termination confirmation modal state.
 #[derive(Clone, Debug)]
 pub struct ProcessKillConfirmation {
+    /// List of target processes to validate and terminate upon confirmation.
+    pub targets: Vec<ProcessTarget>,
     /// List of PIDs to send signal to upon confirmation.
     pub pids: Vec<u32>,
     /// Name or summary of the target process/group.
@@ -76,6 +89,15 @@ pub struct ProcessKillConfirmation {
     pub signal: rustix::process::Signal,
     /// Indicates whether this is a forceful SIGKILL (`true`) or graceful SIGTERM (`false`).
     pub is_kill: bool,
+}
+
+/// Stores process validation error popup state.
+#[derive(Clone, Debug)]
+pub struct ProcessErrorPopup {
+    /// Title of the error popup.
+    pub title: String,
+    /// Message lines explaining the validation error.
+    pub message_lines: Vec<String>,
 }
 
 /// Identifies the column currently selected for process sorting.
@@ -973,9 +995,117 @@ pub fn group_processes_for_simple_view(
     result
 }
 
+/// Validates if a target process still exists at `target.pid` and has not been replaced by an unrelated process.
+///
+/// # Arguments
+/// * `target` - Target process details including expected PID, comm, and name.
+///
+/// # Returns
+/// `Ok(())` if the process exists and matches the expected executable, or an `Err(String)` describing the mismatch.
+pub fn validate_process_target(target: &ProcessTarget) -> Result<(), String> {
+    let comm_path = format!("/proc/{}/comm", target.pid);
+    let Ok(current_comm_raw) = fs::read_to_string(&comm_path) else {
+        let display_name = if !target.comm.is_empty() {
+            &target.comm
+        } else {
+            &target.name
+        };
+        return Err(format!(
+            "Process '{}' (PID: {}) no longer exists.",
+            display_name, target.pid
+        ));
+    };
+
+    let current_comm = current_comm_raw.trim();
+    if current_comm.is_empty() {
+        let display_name = if !target.comm.is_empty() {
+            &target.comm
+        } else {
+            &target.name
+        };
+        return Err(format!(
+            "Process '{}' (PID: {}) no longer exists.",
+            display_name, target.pid
+        ));
+    }
+
+    let clean_exp_comm = target
+        .comm
+        .trim_start_matches("▼ ")
+        .trim_start_matches("▶ ")
+        .trim_start_matches("├─ ")
+        .trim_start_matches("└─ ")
+        .trim();
+
+    let clean_exp_name = target
+        .name
+        .trim_start_matches("▼ ")
+        .trim_start_matches("▶ ")
+        .trim_start_matches("├─ ")
+        .trim_start_matches("└─ ")
+        .trim();
+
+    let exp_comm_short: String = clean_exp_comm.chars().take(15).collect();
+    let cur_comm_short: String = current_comm.chars().take(15).collect();
+
+    if current_comm == clean_exp_comm
+        || cur_comm_short == exp_comm_short
+        || clean_exp_name.starts_with(current_comm)
+        || clean_exp_comm.starts_with(current_comm)
+        || current_comm.starts_with(clean_exp_comm)
+    {
+        return Ok(());
+    }
+
+    if let Ok(cmdline_bytes) = fs::read(format!("/proc/{}/cmdline", target.pid))
+        && !cmdline_bytes.is_empty()
+    {
+        let cmd = String::from_utf8_lossy(&cmdline_bytes)
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+        if cmd == clean_exp_name
+            || cmd.starts_with(clean_exp_comm)
+            || clean_exp_name.starts_with(&cmd)
+            || cmd.contains(clean_exp_comm)
+        {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "Process at PID {} has changed! Expected '{}', but found '{}'.",
+        target.pid, clean_exp_comm, current_comm
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_process_target() {
+        // Validation on self PID should succeed
+        let my_pid = std::process::id();
+        let target = ProcessTarget {
+            pid: my_pid,
+            comm: "toptop".to_string(),
+            name: "toptop".to_string(),
+        };
+        // Even if cargo test runner has a slightly different binary name (e.g. toptop-xxx),
+        // it starts with toptop
+        assert!(validate_process_target(&target).is_ok());
+
+        // Validation on non-existent PID should fail with NotFound error
+        let fake_target = ProcessTarget {
+            pid: 4_194_300,
+            comm: "nonexistent_proc".to_string(),
+            name: "nonexistent_proc".to_string(),
+        };
+        let res = validate_process_target(&fake_target);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("no longer exists"));
+    }
 
     #[test]
     fn test_strip_binary_path() {
