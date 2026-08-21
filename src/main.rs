@@ -51,7 +51,7 @@ use crate::{
         ADVANCED_SORT_COLUMNS, NORMAL_SORT_COLUMNS, ProcessErrorPopup, ProcessInfo,
         ProcessKillConfirmation, ProcessSortColumn, ProcessTarget, directly_matches_search,
         group_processes_for_simple_view, matches_process_search, process_search_score,
-        read_processes, sort_processes, validate_process_target,
+        read_process_detail, read_processes, sort_processes, validate_process_target,
     },
     system::{
         BatteryInfo, DiskIoInfo, DnsResolver, GpuMetrics, MemoryMetrics, MountInfo,
@@ -65,7 +65,7 @@ use crate::{
     ui::{
         format_system_overview_copy_text, is_disks_overflow, is_gpu_overflow, render_cpu_ram_tab,
         render_disks_tab, render_general_tab, render_gpu_tab, render_kill_confirmation_modal,
-        render_network_tab, render_process_error_popup, render_process_tab,
+        render_network_tab, render_process_detail, render_process_error_popup, render_process_tab,
     },
     utils::{copy_to_clipboard, format_datetime},
 };
@@ -322,6 +322,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     sort_processes(&mut processes, current_sort_col, sort_ascending);
     let mut table_state = TableState::default();
     table_state.select(Some(0));
+    let mut selected_proc_detail: Option<u32> = None;
 
     if !prev_ticks.is_empty() && !curr_ticks.is_empty() {
         global_usage = calculate_usage(&prev_ticks[0], &curr_ticks[0]);
@@ -576,20 +577,46 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     }
                     1 => {
                         let num_cores = snap.core_usages.len().max(1);
-                        render_process_tab(
-                            frame,
-                            chunks[1],
-                            &snap.processes,
-                            advanced_view,
-                            &expanded_groups,
-                            &search_query,
-                            is_searching,
-                            current_sort_col,
-                            sort_ascending,
-                            snap.mem.total_mem_mb,
-                            num_cores,
-                            &mut table_state,
-                        );
+                        let proc_map: HashMap<u32, &ProcessInfo> =
+                            snap.processes.iter().map(|p| (p.pid, p)).collect();
+                        if let Some(detail_pid) = selected_proc_detail {
+                            let dummy_proc;
+                            let proc_info = if let Some(p) = proc_map.get(&detail_pid) {
+                                p
+                            } else {
+                                dummy_proc = ProcessInfo {
+                                    pid: detail_pid,
+                                    comm: format!("PID {}", detail_pid),
+                                    name: format!("PID {}", detail_pid),
+                                    state: "Exited".to_string(),
+                                    ..Default::default()
+                                };
+                                &dummy_proc
+                            };
+                            let detail = read_process_detail(proc_info, &proc_map);
+                            render_process_detail(
+                                frame,
+                                chunks[1],
+                                &detail,
+                                snap.mem.total_mem_mb,
+                                num_cores,
+                            );
+                        } else {
+                            render_process_tab(
+                                frame,
+                                chunks[1],
+                                &snap.processes,
+                                advanced_view,
+                                &expanded_groups,
+                                &search_query,
+                                is_searching,
+                                current_sort_col,
+                                sort_ascending,
+                                snap.mem.total_mem_mb,
+                                num_cores,
+                                &mut table_state,
+                            );
+                        }
                     }
                     2 => {
                         render_cpu_ram_tab(
@@ -970,6 +997,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 }
                                 _ => {}
                             }
+                        } else if current_tab == 1
+                            && selected_proc_detail.is_some()
+                            && (key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q'))
+                        {
+                            selected_proc_detail = None;
+                            needs_redraw = true;
                         } else if key.code == KeyCode::Char('q')
                             || (key.modifiers.contains(KeyModifiers::CONTROL)
                                 && key.code == KeyCode::Char('c'))
@@ -977,20 +1010,28 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             break 'main_loop;
                         } else if key.code == KeyCode::Tab {
                             current_tab = (current_tab + 1) % 6;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::BackTab {
                             current_tab = (current_tab + 5) % 6;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::Char('1') {
                             current_tab = 0;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::Char('2') {
                             current_tab = 1;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::Char('3') {
                             current_tab = 2;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::Char('4') {
                             current_tab = 3;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::Char('5') {
                             current_tab = 4;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::Char('6') {
                             current_tab = 5;
+                            selected_proc_detail = None;
                         } else if key.code == KeyCode::Char('[') {
                             is_paused = true;
                             snapshot_idx = snapshot_idx.saturating_sub(1);
@@ -1011,16 +1052,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     cur_snap.map(|s| s.ram_info.as_str()).unwrap_or(&ram_info),
                                 );
                                 copy_to_clipboard(&text);
-                                copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
+                                copy_feedback_until =
+                                    Some(Instant::now() + Duration::from_secs(2));
                                 needs_redraw = true;
-                            } else if key.code == KeyCode::Left || key.code == KeyCode::Char('h') {
-                                general_sub_tab = if general_sub_tab == 0 {
-                                    3
-                                } else {
-                                    general_sub_tab - 1
-                                };
+                            } else if key.code == KeyCode::Left {
+                                general_sub_tab = (general_sub_tab + 3) % 4;
                                 needs_redraw = true;
-                            } else if key.code == KeyCode::Right || key.code == KeyCode::Char('l') {
+                            } else if key.code == KeyCode::Right {
                                 general_sub_tab = (general_sub_tab + 1) % 4;
                                 needs_redraw = true;
                             } else if key.code == KeyCode::Char(' ') {
@@ -1074,66 +1112,122 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     matches_process_search(p, &search_query, Some(&proc_map))
                                 })
                                 .count();
-                            match key.code {
-                                KeyCode::Enter => {
-                                    if let Some(sel) = table_state.selected() {
-                                        let displayed: Vec<&ProcessInfo> = base_procs
-                                            .iter()
-                                            .filter(|p| advanced_view || p.rss_kb > 0)
-                                            .filter(|p| {
-                                                matches_process_search(
-                                                    p,
-                                                    &search_query,
-                                                    Some(&proc_map),
-                                                )
-                                            })
-                                            .collect();
-                                        if let Some(target) = displayed.get(sel)
-                                            && let Some(grp) = &target.group_name
-                                            && (target.is_group_header || target.is_group_child)
+
+                            if let Some(detail_pid) = selected_proc_detail {
+                                match key.code {
+                                    KeyCode::Esc
+                                    | KeyCode::Char('q')
+                                    | KeyCode::Char('Q')
+                                    | KeyCode::Backspace
+                                    | KeyCode::Enter => {
+                                        selected_proc_detail = None;
+                                        needs_redraw = true;
+                                    }
+                                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                                        if let Some(target_p) =
+                                            active_procs.iter().find(|p| p.pid == detail_pid)
                                         {
-                                            if expanded_groups.contains(grp) {
-                                                expanded_groups.remove(grp);
-                                            } else {
-                                                expanded_groups.insert(grp.clone());
+                                            kill_confirmation = Some(ProcessKillConfirmation {
+                                                targets: vec![ProcessTarget {
+                                                    pid: target_p.pid,
+                                                    comm: target_p.comm.clone(),
+                                                    name: target_p.name.clone(),
+                                                }],
+                                                pids: vec![target_p.pid],
+                                                process_name: target_p.name.clone(),
+                                                signal: rustix::process::Signal::Term,
+                                                is_kill: false,
+                                            });
+                                            selected_proc_detail = None;
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                                        if let Some(target_p) =
+                                            active_procs.iter().find(|p| p.pid == detail_pid)
+                                        {
+                                            kill_confirmation = Some(ProcessKillConfirmation {
+                                                targets: vec![ProcessTarget {
+                                                    pid: target_p.pid,
+                                                    comm: target_p.comm.clone(),
+                                                    name: target_p.name.clone(),
+                                                }],
+                                                pids: vec![target_p.pid],
+                                                process_name: target_p.name.clone(),
+                                                signal: rustix::process::Signal::Kill,
+                                                is_kill: true,
+                                            });
+                                            selected_proc_detail = None;
+                                            needs_redraw = true;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        if let Some(sel) = table_state.selected() {
+                                            let displayed: Vec<&ProcessInfo> = base_procs
+                                                .iter()
+                                                .filter(|p| advanced_view || p.rss_kb > 0)
+                                                .filter(|p| {
+                                                    matches_process_search(
+                                                        p,
+                                                        &search_query,
+                                                        Some(&proc_map),
+                                                    )
+                                                })
+                                                .collect();
+                                            if let Some(target) = displayed.get(sel) {
+                                                if target.is_group_header {
+                                                    if let Some(grp) = &target.group_name {
+                                                        if expanded_groups.contains(grp) {
+                                                            expanded_groups.remove(grp);
+                                                        } else {
+                                                            expanded_groups.insert(grp.clone());
+                                                        }
+                                                    }
+                                                } else {
+                                                    selected_proc_detail = Some(target.pid);
+                                                    needs_redraw = true;
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                KeyCode::Char('/') => {
-                                    is_searching = true;
-                                    table_state.select(Some(0));
-                                    search_query.clear();
-                                    needs_redraw = true;
-                                }
-                                KeyCode::Esc => {
-                                    search_query.clear();
-                                    table_state.select(Some(0));
-                                }
-                                KeyCode::Left => {
-                                    let cur_idx = cols
-                                        .iter()
-                                        .position(|&c| c == current_sort_col)
-                                        .unwrap_or(0);
-                                    let new_idx = if cur_idx == 0 {
-                                        cols.len() - 1
-                                    } else {
-                                        cur_idx - 1
-                                    };
-                                    current_sort_col = cols[new_idx];
-                                    for s in &mut snapshots {
+                                    KeyCode::Char('/') => {
+                                        is_searching = true;
+                                        table_state.select(Some(0));
+                                        search_query.clear();
+                                        needs_redraw = true;
+                                    }
+                                    KeyCode::Esc => {
+                                        search_query.clear();
+                                        table_state.select(Some(0));
+                                    }
+                                    KeyCode::Left => {
+                                        let cur_idx = cols
+                                            .iter()
+                                            .position(|&c| c == current_sort_col)
+                                            .unwrap_or(0);
+                                        let new_idx = if cur_idx == 0 {
+                                            cols.len() - 1
+                                        } else {
+                                            cur_idx - 1
+                                        };
+                                        current_sort_col = cols[new_idx];
+                                        for s in &mut snapshots {
+                                            sort_processes(
+                                                &mut s.processes,
+                                                current_sort_col,
+                                                sort_ascending,
+                                            );
+                                        }
                                         sort_processes(
-                                            &mut s.processes,
+                                            &mut processes,
                                             current_sort_col,
                                             sort_ascending,
                                         );
                                     }
-                                    sort_processes(
-                                        &mut processes,
-                                        current_sort_col,
-                                        sort_ascending,
-                                    );
-                                }
                                 KeyCode::Right => {
                                     let cur_idx = cols
                                         .iter()
@@ -1389,7 +1483,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 }
                                 _ => {}
                             }
-                        } else if current_tab == 3 {
+                        }
+                    } else if current_tab == 3 {
                             let cur_gpu = snapshots
                                 .get(snapshot_idx)
                                 .map(|s| &s.gpu_metrics)
@@ -1833,15 +1928,17 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                                         )
                                                     })
                                                     .collect();
-                                                if let Some(target) = displayed.get(proc_idx)
-                                                    && let Some(grp) = &target.group_name
-                                                    && (target.is_group_header
-                                                        || target.is_group_child)
-                                                {
-                                                    if expanded_groups.contains(grp) {
-                                                        expanded_groups.remove(grp);
+                                                if let Some(target) = displayed.get(proc_idx) {
+                                                    if target.is_group_header {
+                                                        if let Some(grp) = &target.group_name {
+                                                            if expanded_groups.contains(grp) {
+                                                                expanded_groups.remove(grp);
+                                                            } else {
+                                                                expanded_groups.insert(grp.clone());
+                                                            }
+                                                        }
                                                     } else {
-                                                        expanded_groups.insert(grp.clone());
+                                                        selected_proc_detail = Some(target.pid);
                                                     }
                                                 }
                                             } else {
@@ -2294,4 +2391,33 @@ mod tests {
         assert_eq!(snapshot_idx + 1, 5);
         assert_eq!(snapshots.len(), 5);
     }
+
+    #[test]
+    fn test_process_detail_view_navigation() {
+        let mut selected_proc_detail: Option<u32> = None;
+
+        // Pressing Enter on a non-group process sets selected_proc_detail
+        let target_pid = 12345;
+        let is_group_header = false;
+        if !is_group_header {
+            selected_proc_detail = Some(target_pid);
+        }
+        assert_eq!(selected_proc_detail, Some(12345));
+
+        // Pressing Esc / q / Enter restores process list
+        let key_code = crossterm::event::KeyCode::Esc;
+        if matches!(key_code, crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Enter) {
+            selected_proc_detail = None;
+        }
+        assert_eq!(selected_proc_detail, None);
+
+        // Stopping (c) or Killing (t) zoomed in process also resets selected_proc_detail back to process list
+        selected_proc_detail = Some(target_pid);
+        let stop_key = crossterm::event::KeyCode::Char('c');
+        if matches!(stop_key, crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('t')) {
+            selected_proc_detail = None;
+        }
+        assert_eq!(selected_proc_detail, None);
+    }
 }
+

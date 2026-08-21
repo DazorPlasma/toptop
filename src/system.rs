@@ -2055,7 +2055,188 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
         }
     }
 
-    // 9. npm
+    // 9. Podman Container Storage
+    let mut podman_items = Vec::new();
+    let mut podman_total = 0;
+    let podman_rootless = format!("{}/.local/share/containers/storage", home);
+    for (root, kind) in &[
+        (podman_rootless.as_str(), "User (~/.local/share/containers)"),
+        ("/var/lib/containers/storage", "System (/var/lib/containers)"),
+    ] {
+        if std::path::Path::new(root).exists() {
+            let subdirs = [
+                ("overlay-images", "Image Layers & Manifests"),
+                ("overlay-containers", "Container Layers & Configs"),
+                ("volumes", "Named Data Volumes"),
+                ("overlay", "Storage Overlayfs Rootfs"),
+                ("mounts", "Bind & Ephemeral Mounts"),
+            ];
+            for (subdir, desc) in subdirs {
+                let p = format!("{}/{}", root, subdir);
+                if std::path::Path::new(&p).exists() {
+                    let size = get_dir_size(&p);
+                    if size > 0 {
+                        podman_total += size;
+                        podman_items.push(PackageStorageItem {
+                            name: format!("{}: {}", if root.starts_with("/var") { "sys" } else { "user" }, subdir),
+                            detail: format!("{} ({})", desc, kind),
+                            size_bytes: size,
+                            size_str: format_bytes_dyn(size as f64),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if podman_total > 0 || !podman_items.is_empty() {
+        podman_items.sort_by(|a, b| {
+            b.size_bytes
+                .cmp(&a.size_bytes)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        categories.push(PackageStorageCategory {
+            name: "Podman".to_string(),
+            total_str: format_bytes_dyn(podman_total as f64),
+            items: podman_items,
+        });
+    }
+
+    // 10. Cargo & Rust Toolchains
+    let cargo_home = format!("{}/.cargo", home);
+    let rustup_home = format!("{}/.rustup", home);
+    let mut cargo_items = Vec::new();
+    let mut cargo_total = 0;
+
+    // Installed binaries in ~/.cargo/bin
+    let cargo_bin = format!("{}/bin", cargo_home);
+    if let Ok(entries) = fs::read_dir(&cargo_bin) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_file()
+                && let Ok(meta) = p.metadata()
+            {
+                let size = meta.len();
+                if size > 0 {
+                    cargo_total += size;
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    cargo_items.push(PackageStorageItem {
+                        name: format!("bin: {}", name),
+                        detail: format!("Installed CLI Binary ({})", p.to_string_lossy()),
+                        size_bytes: size,
+                        size_str: format_bytes_dyn(size as f64),
+                    });
+                }
+            }
+        }
+    }
+
+    // Downloaded .crate archives in ~/.cargo/registry/cache/*
+    let registry_cache = format!("{}/registry/cache", cargo_home);
+    if let Ok(entries) = fs::read_dir(&registry_cache) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_dir() {
+                let cache_dir_size = get_dir_size(&p);
+                if cache_dir_size > 0 {
+                    cargo_total += cache_dir_size;
+                    let reg_name = entry.file_name().to_string_lossy().to_string();
+                    let clean_reg = if let Some(idx) = reg_name.find('-') {
+                        &reg_name[..idx]
+                    } else {
+                        &reg_name
+                    };
+                    let count = fs::read_dir(&p).map(|d| d.count()).unwrap_or(0);
+                    cargo_items.push(PackageStorageItem {
+                        name: format!("crates.io cache ({})", clean_reg),
+                        detail: format!("{} downloaded .crate packages", count),
+                        size_bytes: cache_dir_size,
+                        size_str: format_bytes_dyn(cache_dir_size as f64),
+                    });
+                }
+            }
+        }
+    }
+
+    // Extracted crate sources in ~/.cargo/registry/src/*
+    let registry_src = format!("{}/registry/src", cargo_home);
+    if std::path::Path::new(&registry_src).exists() {
+        let src_size = get_dir_size(&registry_src);
+        if src_size > 0 {
+            cargo_total += src_size;
+            cargo_items.push(PackageStorageItem {
+                name: "registry/src (Unpacked Sources)".to_string(),
+                detail: registry_src,
+                size_bytes: src_size,
+                size_str: format_bytes_dyn(src_size as f64),
+            });
+        }
+    }
+
+    // Git dependency repositories in ~/.cargo/git
+    let cargo_git = format!("{}/git", cargo_home);
+    if std::path::Path::new(&cargo_git).exists() {
+        let git_size = get_dir_size(&cargo_git);
+        if git_size > 0 {
+            cargo_total += git_size;
+            cargo_items.push(PackageStorageItem {
+                name: "git/db (Git Dependencies)".to_string(),
+                detail: cargo_git,
+                size_bytes: git_size,
+                size_str: format_bytes_dyn(git_size as f64),
+            });
+        }
+    }
+
+    // Rustup toolchains in ~/.rustup/toolchains/*
+    let toolchains_dir = format!("{}/toolchains", rustup_home);
+    if let Ok(entries) = fs::read_dir(&toolchains_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_dir() {
+                let size = get_dir_size(&p);
+                if size > 0 {
+                    cargo_total += size;
+                    let tc_name = entry.file_name().to_string_lossy().to_string();
+                    cargo_items.push(PackageStorageItem {
+                        name: format!("toolchain: {}", tc_name),
+                        detail: format!("Rust compiler & standard library ({})", p.to_string_lossy()),
+                        size_bytes: size,
+                        size_str: format_bytes_dyn(size as f64),
+                    });
+                }
+            }
+        }
+    }
+
+    // Shared compiler cache ~/.cache/sccache
+    let sccache_dir = format!("{}/.cache/sccache", home);
+    if std::path::Path::new(&sccache_dir).exists() {
+        let sc_size = get_dir_size(&sccache_dir);
+        if sc_size > 0 {
+            cargo_total += sc_size;
+            cargo_items.push(PackageStorageItem {
+                name: "sccache (Compilation Cache)".to_string(),
+                detail: sccache_dir,
+                size_bytes: sc_size,
+                size_str: format_bytes_dyn(sc_size as f64),
+            });
+        }
+    }
+
+    if cargo_total > 0 || !cargo_items.is_empty() {
+        cargo_items.sort_by(|a, b| {
+            b.size_bytes
+                .cmp(&a.size_bytes)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        categories.push(PackageStorageCategory {
+            name: "Cargo".to_string(),
+            total_str: format_bytes_dyn(cargo_total as f64),
+            items: cargo_items,
+        });
+    }
+
+    // 11. npm & Node.js Packages
     let mut npm_items = Vec::new();
     let mut npm_total = 0;
 
@@ -2074,16 +2255,33 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
             });
         }
 
-        let npx_cache = format!("{}/_npx", npm_cache);
-        let npx_size = get_dir_size(&npx_cache);
-        if npx_size > 0 {
-            npm_total += npx_size;
-            npm_items.push(PackageStorageItem {
-                name: "npx Cache (~/.npm/_npx)".to_string(),
-                detail: "Temporary executed packages".to_string(),
-                size_bytes: npx_size,
-                size_str: format_bytes_dyn(npx_size as f64),
-            });
+        // Scan npx cached packages in ~/.npm/_npx/*/node_modules/*
+        let npx_dir = format!("{}/_npx", npm_cache);
+        if let Ok(entries) = fs::read_dir(&npx_dir) {
+            for hash_entry in entries.filter_map(Result::ok) {
+                let nm = hash_entry.path().join("node_modules");
+                if let Ok(sub_entries) = fs::read_dir(&nm) {
+                    for pkg_entry in sub_entries.filter_map(Result::ok) {
+                        let p = pkg_entry.path();
+                        if p.is_dir() {
+                            let name = pkg_entry.file_name().to_string_lossy().to_string();
+                            if name.starts_with('.') {
+                                continue;
+                            }
+                            let size = get_dir_size(&p);
+                            if size > 0 {
+                                npm_total += size;
+                                npm_items.push(PackageStorageItem {
+                                    name: format!("npx: {}", name),
+                                    detail: format!("Cached npx runner package ({})", p.to_string_lossy()),
+                                    size_bytes: size,
+                                    size_str: format_bytes_dyn(size as f64),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let logs_cache = format!("{}/_logs", npm_cache);
@@ -2099,7 +2297,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
         }
     }
 
-    // Scan global node_modules
+    // Scan individual global node_modules packages
     for node_mod_dir in &[
         format!("{}/.npm-global/lib/node_modules", home),
         "/usr/lib/node_modules".to_string(),
@@ -2109,12 +2307,31 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
             for entry in entries.filter_map(Result::ok) {
                 let p = entry.path();
                 if p.is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
+                    let pkg_name = entry.file_name().to_string_lossy().to_string();
+                    if pkg_name.starts_with('.') {
+                        continue;
+                    }
+                    let mut ver = String::new();
+                    if let Ok(pkg_json) = fs::read_to_string(p.join("package.json")) {
+                        for line in pkg_json.lines() {
+                            if line.trim().starts_with("\"version\":")
+                                && let Some(v) = line.split('"').nth(3)
+                            {
+                                ver = format!("v{}", v);
+                                break;
+                            }
+                        }
+                    }
                     let size = get_dir_size(&p);
                     if size > 0 {
                         npm_total += size;
+                        let label = if !ver.is_empty() {
+                            format!("global: {} ({})", pkg_name, ver)
+                        } else {
+                            format!("global: {}", pkg_name)
+                        };
                         npm_items.push(PackageStorageItem {
-                            name: format!("global: {}", name),
+                            name: label,
                             detail: p.to_string_lossy().to_string(),
                             size_bytes: size,
                             size_str: format_bytes_dyn(size as f64),
@@ -2146,7 +2363,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
         }
     }
 
-    // pnpm & yarn
+    // pnpm global & store
     let pnpm_store = format!("{}/.local/share/pnpm", home);
     if std::path::Path::new(&pnpm_store).exists() {
         let pnpm_size = get_dir_size(&pnpm_store);
@@ -2157,6 +2374,40 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "Content-addressable package store".to_string(),
                 size_bytes: pnpm_size,
                 size_str: format_bytes_dyn(pnpm_size as f64),
+            });
+        }
+    }
+
+    // Yarn cache
+    for y_path in &[
+        format!("{}/.cache/yarn", home),
+        format!("{}/.yarn/berry/cache", home),
+    ] {
+        if std::path::Path::new(y_path).exists() {
+            let y_size = get_dir_size(y_path);
+            if y_size > 0 {
+                npm_total += y_size;
+                npm_items.push(PackageStorageItem {
+                    name: "Yarn Package Cache".to_string(),
+                    detail: y_path.to_string(),
+                    size_bytes: y_size,
+                    size_str: format_bytes_dyn(y_size as f64),
+                });
+            }
+        }
+    }
+
+    // Bun cache
+    let bun_cache = format!("{}/.bun/install/cache", home);
+    if std::path::Path::new(&bun_cache).exists() {
+        let bun_size = get_dir_size(&bun_cache);
+        if bun_size > 0 {
+            npm_total += bun_size;
+            npm_items.push(PackageStorageItem {
+                name: "Bun Package Cache".to_string(),
+                detail: bun_cache,
+                size_bytes: bun_size,
+                size_str: format_bytes_dyn(bun_size as f64),
             });
         }
     }
@@ -2603,3 +2854,82 @@ pub fn read_network_connections(
 
     Ok(conns)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_gpu_metrics() {
+        let metrics = read_gpu_metrics();
+        println!("GPU Name: {}", metrics.name);
+        println!("Driver: {}", metrics.driver);
+        println!("VRAM: {} MB / {} MB", metrics.vram_used_mb, metrics.vram_total_mb);
+        println!("Utilization: {}%", metrics.utilization_pct);
+        assert!(!metrics.name.is_empty());
+    }
+
+    #[test]
+    fn test_gpu_data_collection_under_workload() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let baseline = read_gpu_metrics();
+        println!("\n--- [GPU Test] Baseline ---");
+        println!("GPU: {} | VRAM: {}/{} MB | Utilization: {}% | Clock: {} MHz",
+            baseline.name, baseline.vram_used_mb, baseline.vram_total_mb, baseline.utilization_pct, baseline.cur_mhz);
+
+        // Run VAAPI hardware encode if ffmpeg is available
+        if let Ok(mut child) = Command::new("ffmpeg")
+            .args([
+                "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
+                "-filter_hw_device", "va",
+                "-f", "lavfi",
+                "-i", "testsrc=size=3840x2160:rate=60",
+                "-vf", "format=nv12,hwupload",
+                "-c:v", "h264_vaapi",
+                "-b:v", "50M",
+                "-t", "3",
+                "-f", "null",
+                "-",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let start = Instant::now();
+            let mut samples = Vec::new();
+            while start.elapsed() < Duration::from_secs(4) {
+                let m = read_gpu_metrics();
+                samples.push(m);
+                if let Ok(Some(_)) = child.try_wait() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(300));
+            }
+            let _ = child.wait();
+
+            println!("--- [GPU Test] Workload Samples ({} samples collected) ---", samples.len());
+            for (idx, s) in samples.iter().enumerate() {
+                println!("  Sample {}: Util: {:>3.0}%, VRAM: {:>4} MB, Clock: {:>4.0} MHz, Power: {:>4.1} W, Temp: {:>2}°C",
+                    idx + 1, s.utilization_pct, s.vram_used_mb, s.cur_mhz, s.power_w, s.temp_edge_c);
+            }
+            assert!(!samples.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_read_package_storage_categories() {
+        let cats = read_package_storage_categories();
+        // Check that any detected category has valid non-empty items and names
+        for cat in &cats {
+            assert!(!cat.name.is_empty());
+            for item in &cat.items {
+                assert!(!item.name.is_empty());
+            }
+        }
+    }
+}
+
+

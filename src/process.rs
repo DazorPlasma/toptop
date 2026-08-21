@@ -100,6 +100,47 @@ pub struct ProcessErrorPopup {
     pub message_lines: Vec<String>,
 }
 
+/// Detailed diagnostic and telemetry inspection for an individual process.
+#[derive(Clone, Default)]
+pub struct ProcessDetailInfo {
+    /// Basic process telemetry snapshot.
+    pub info: ProcessInfo,
+    /// Parent process command name.
+    pub parent_comm: String,
+    /// Target binary executable path from `/proc/[pid]/exe`.
+    pub exe_path: String,
+    /// Current working directory from `/proc/[pid]/cwd`.
+    pub cwd_path: String,
+    /// Full un-truncated command line invocation.
+    pub cmdline: String,
+    /// Virtual memory peak size in kilobytes (VmPeak).
+    pub vm_peak_kb: u64,
+    /// Virtual memory current size in kilobytes (VmSize).
+    pub vm_size_kb: u64,
+    /// Peak resident set size in kilobytes (VmHWM).
+    pub vm_hwm_kb: u64,
+    /// Swap consumption in kilobytes (VmSwap).
+    pub vm_swap_kb: u64,
+    /// Data segment size in kilobytes (VmData).
+    pub vm_data_kb: u64,
+    /// Stack size in kilobytes (VmStk).
+    pub vm_stk_kb: u64,
+    /// Executable code segment size in kilobytes (VmExe).
+    pub vm_exe_kb: u64,
+    /// Shared library size in kilobytes (VmLib).
+    pub vm_lib_kb: u64,
+    /// Number of open file descriptors in `/proc/[pid]/fd`.
+    pub open_fds: usize,
+    /// Priority level from `/proc/[pid]/stat`.
+    pub priority: i64,
+    /// Nice level from `/proc/[pid]/stat`.
+    pub nice: i64,
+    /// Voluntary context switches from `/proc/[pid]/status`.
+    pub voluntary_ctxt_switches: u64,
+    /// Involuntary context switches from `/proc/[pid]/status`.
+    pub nonvoluntary_ctxt_switches: u64,
+}
+
 /// Identifies the column currently selected for process sorting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessSortColumn {
@@ -361,6 +402,99 @@ pub fn read_processes(
     }
     *prev_procs = new_prev_procs;
     procs
+}
+
+/// Reads deep diagnostic telemetry for a specific process from `/proc/[pid]`.
+///
+/// # Arguments
+/// * `proc_info` - Baseline process info snapshot.
+/// * `proc_map` - Map of currently known processes for parent lookups.
+///
+/// # Returns
+/// A populated `ProcessDetailInfo` structure.
+pub fn read_process_detail(
+    proc_info: &ProcessInfo,
+    proc_map: &HashMap<u32, &ProcessInfo>,
+) -> ProcessDetailInfo {
+    let pid = proc_info.pid;
+    let mut detail = ProcessDetailInfo {
+        info: proc_info.clone(),
+        ..Default::default()
+    };
+
+    if let Some(parent) = proc_map.get(&proc_info.ppid) {
+        detail.parent_comm = parent.comm.clone();
+    } else if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", proc_info.ppid)) {
+        detail.parent_comm = comm.trim().to_string();
+    }
+
+    if let Ok(exe) = fs::read_link(format!("/proc/{}/exe", pid)) {
+        detail.exe_path = exe.to_string_lossy().to_string();
+    }
+
+    if let Ok(cwd) = fs::read_link(format!("/proc/{}/cwd", pid)) {
+        detail.cwd_path = cwd.to_string_lossy().to_string();
+    }
+
+    if let Ok(cmd_bytes) = fs::read(format!("/proc/{}/cmdline", pid)) {
+        detail.cmdline = String::from_utf8_lossy(&cmd_bytes)
+            .replace('\0', " ")
+            .trim()
+            .to_string();
+    }
+    if detail.cmdline.is_empty() {
+        detail.cmdline = proc_info.name.clone();
+    }
+
+    if let Ok(entries) = fs::read_dir(format!("/proc/{}/fd", pid)) {
+        detail.open_fds = entries.filter_map(Result::ok).count();
+    }
+
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid))
+        && let Some(rparen) = stat.rfind(')')
+    {
+        let rest = &stat[rparen + 1..];
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() >= 17 {
+            detail.priority = parts[15].parse().unwrap_or(0);
+            detail.nice = parts[16].parse().unwrap_or(0);
+        }
+    }
+
+    if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
+        for line in status.lines() {
+            let parse_val = |l: &str| -> u64 {
+                l.split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0)
+            };
+            if line.starts_with("VmPeak:") {
+                detail.vm_peak_kb = parse_val(line);
+            } else if line.starts_with("VmSize:") {
+                detail.vm_size_kb = parse_val(line);
+            } else if line.starts_with("VmHWM:") {
+                detail.vm_hwm_kb = parse_val(line);
+            } else if line.starts_with("VmSwap:") {
+                detail.vm_swap_kb = parse_val(line);
+            } else if line.starts_with("VmData:") {
+                detail.vm_data_kb = parse_val(line);
+            } else if line.starts_with("VmStk:") {
+                detail.vm_stk_kb = parse_val(line);
+            } else if line.starts_with("VmExe:") {
+                detail.vm_exe_kb = parse_val(line);
+            } else if line.starts_with("VmLib:") {
+                detail.vm_lib_kb = parse_val(line);
+            } else if line.starts_with("voluntary_ctxt_switches:") {
+                detail.voluntary_ctxt_switches = parse_val(line);
+            } else if line.starts_with("nonvoluntary_ctxt_switches:") {
+                detail.nonvoluntary_ctxt_switches = parse_val(line);
+            }
+        }
+    }
+
+    detail
 }
 
 /// Strips directory paths and packaging wrapper artifacts from an executable filename.
@@ -1256,4 +1390,29 @@ mod tests {
         assert_eq!(identify_process_group("/nix/store/abc-syncthing-1.27.0/bin/syncthing"), Some("Syncthing"));
         assert_eq!(identify_process_group("syncthing-inotify"), Some("Syncthing"));
     }
+
+    #[test]
+    fn test_read_process_detail() {
+        let current_pid = std::process::id();
+        let proc_info = ProcessInfo {
+            pid: current_pid,
+            ppid: 1,
+            comm: "toptop_test".to_string(),
+            name: "toptop_test".to_string(),
+            state: "R".to_string(),
+            rss_kb: 1024,
+            cpu_percent: 5.0,
+            ..Default::default()
+        };
+        let mut proc_map = HashMap::new();
+        proc_map.insert(current_pid, &proc_info);
+
+        let detail = read_process_detail(&proc_info, &proc_map);
+        assert_eq!(detail.info.pid, current_pid);
+        assert_eq!(detail.info.comm, "toptop_test");
+        assert!(!detail.cmdline.is_empty());
+        assert!(!detail.cwd_path.is_empty());
+        assert!(detail.open_fds > 0);
+    }
 }
+

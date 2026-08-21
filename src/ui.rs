@@ -16,8 +16,8 @@ use ratatui::{
 
 use crate::{
     process::{
-        ProcessErrorPopup, ProcessInfo, ProcessKillConfirmation, ProcessSortColumn,
-        group_processes_for_simple_view, matches_process_search,
+        ProcessDetailInfo, ProcessErrorPopup, ProcessInfo, ProcessKillConfirmation,
+        ProcessSortColumn, group_processes_for_simple_view, matches_process_search,
     },
     system::{
         BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo,
@@ -592,6 +592,310 @@ pub fn render_process_tab(
         .row_highlight_style(Style::default().bg(Color::Rgb(45, 45, 45)));
 
     frame.render_stateful_widget(table, area, table_state);
+}
+
+/// Renders the Process Details full-screen inspection view replacing the process table.
+///
+/// # Arguments
+/// * `frame` - Terminal rendering frame buffer.
+/// * `area` - Target bounding box for the view.
+/// * `detail` - Diagnostic telemetry and metadata for the selected process.
+/// * `total_mem` - Total system memory in megabytes for percentage calculations.
+/// * `num_cores` - Logical CPU core count for gradient scaling.
+pub fn render_process_detail(
+    frame: &mut Frame,
+    area: Rect,
+    detail: &ProcessDetailInfo,
+    total_mem: u64,
+    num_cores: usize,
+) {
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+        .title(
+            Line::from(format!(
+                " Process Details: {} (PID: {}) ('Esc' / 'q' / 'Enter' Back, 'c' Term, 't' Kill) ",
+                detail.info.comm, detail.info.pid
+            ))
+            .fg(Color::Rgb(255, 255, 255))
+            .bold(),
+        );
+
+    let inner = main_block.inner(area);
+    frame.render_widget(main_block, area);
+
+    if inner.width < 10 || inner.height < 5 {
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(0)])
+        .split(inner);
+
+    let top_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(rows[0]);
+
+    let bottom_cols = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
+        .split(rows[1]);
+
+    // Card 1: Execution & Process Identity
+    let mut exec_lines = Vec::new();
+    exec_lines.push(format!("PID:            {}", detail.info.pid));
+    exec_lines.push(if !detail.parent_comm.is_empty() {
+        format!("Parent PID:     {} ({})", detail.info.ppid, detail.parent_comm)
+    } else {
+        format!("Parent PID:     {}", detail.info.ppid)
+    });
+    exec_lines.push(format!("User:           {} (UID {})", detail.info.user, detail.info.uid));
+    exec_lines.push(format!("State:          {}", detail.info.state));
+    exec_lines.push(format!("Threads:        {}", detail.info.threads));
+    exec_lines.push(format!("Priority:       {} (Nice: {})", detail.priority, detail.nice));
+    if detail.voluntary_ctxt_switches > 0 || detail.nonvoluntary_ctxt_switches > 0 {
+        exec_lines.push(format!(
+            "Context Sw:     {} vol / {} non-vol",
+            detail.voluntary_ctxt_switches, detail.nonvoluntary_ctxt_switches
+        ));
+    }
+
+    let exec_block = Block::default()
+        .title(" Execution & Identity ".fg(Color::Rgb(170, 170, 170)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+    let exec_inner = exec_block.inner(top_cols[0]);
+    frame.render_widget(exec_block, top_cols[0]);
+
+    for (r, line) in exec_lines.iter().enumerate() {
+        let row_y = exec_inner.y + r as u16;
+        if row_y < exec_inner.bottom() {
+            let spans = vec![Span::styled(line, Style::default().fg(Color::Rgb(220, 220, 220)))];
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: exec_inner.x,
+                    y: row_y,
+                    width: exec_inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    // Card 2: CPU & Memory Breakdown
+    let total_mem_kb = (total_mem as f64) * 1024.0;
+    let mem_pct = if total_mem_kb > 0.0 {
+        (detail.info.rss_kb as f64 / total_mem_kb) * 100.0
+    } else {
+        0.0
+    };
+    let cpu_col = process_cpu_color(detail.info.cpu_percent, num_cores);
+    let mem_col = gradient_color(mem_pct * 2.0);
+
+    let mut mem_lines = Vec::new();
+    mem_lines.push((
+        "CPU Load:       ".to_string(),
+        format_percent(detail.info.cpu_percent),
+        cpu_col,
+    ));
+    mem_lines.push((
+        "Resident (RSS): ".to_string(),
+        format_bytes_dyn((detail.info.rss_kb * 1024) as f64),
+        mem_col,
+    ));
+    if detail.info.pss_kb > 0 {
+        mem_lines.push((
+            "Proportional:   ".to_string(),
+            format_bytes_dyn((detail.info.pss_kb * 1024) as f64),
+            Color::Rgb(180, 180, 180),
+        ));
+    }
+    if detail.vm_size_kb > 0 {
+        mem_lines.push((
+            "Virtual (VmSize): ".to_string(),
+            format_bytes_dyn((detail.vm_size_kb * 1024) as f64),
+            Color::Rgb(180, 180, 180),
+        ));
+    }
+    if detail.vm_swap_kb > 0 {
+        mem_lines.push((
+            "Swap Usage:     ".to_string(),
+            format_bytes_dyn((detail.vm_swap_kb * 1024) as f64),
+            Color::Rgb(255, 128, 0),
+        ));
+    }
+    if detail.vm_hwm_kb > 0 {
+        mem_lines.push((
+            "Peak RSS (HWM): ".to_string(),
+            format_bytes_dyn((detail.vm_hwm_kb * 1024) as f64),
+            Color::Rgb(150, 150, 150),
+        ));
+    }
+    if detail.vm_data_kb > 0 {
+        mem_lines.push((
+            "Data / Stack:   ".to_string(),
+            format!(
+                "{} / {}",
+                format_bytes_dyn((detail.vm_data_kb * 1024) as f64),
+                format_bytes_dyn((detail.vm_stk_kb * 1024) as f64)
+            ),
+            Color::Rgb(150, 150, 150),
+        ));
+    }
+
+    let mem_block = Block::default()
+        .title(" CPU & Memory Breakdown ".fg(Color::Rgb(170, 170, 170)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+    let mem_inner = mem_block.inner(top_cols[1]);
+    frame.render_widget(mem_block, top_cols[1]);
+
+    for (r, (label, val, col)) in mem_lines.iter().enumerate() {
+        let row_y = mem_inner.y + r as u16;
+        if row_y < mem_inner.bottom() {
+            let line = Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::Rgb(160, 160, 160))),
+                Span::styled(val, Style::default().fg(*col).bold()),
+            ]);
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(line),
+                Rect {
+                    x: mem_inner.x,
+                    y: row_y,
+                    width: mem_inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    // Card 3: Storage, Network & GPU Telemetry
+    let io_max = detail.info.read_speed.max(detail.info.write_speed);
+    let io_color = gradient_color(io_gradient_pct(io_max));
+    let mut io_lines = Vec::new();
+    io_lines.push((
+        "Read Rate:      ".to_string(),
+        format!("{} /s", format_bytes_dyn(detail.info.read_speed)),
+        io_color,
+    ));
+    io_lines.push((
+        "Write Rate:     ".to_string(),
+        format!("{} /s", format_bytes_dyn(detail.info.write_speed)),
+        io_color,
+    ));
+    io_lines.push((
+        "Total I/O:      ".to_string(),
+        format!(
+            "{} R / {} W",
+            format_bytes_dyn(detail.info.read_bytes as f64),
+            format_bytes_dyn(detail.info.write_bytes as f64)
+        ),
+        Color::Rgb(180, 180, 180),
+    ));
+    io_lines.push((
+        "Open FDs:       ".to_string(),
+        format!("{} file descriptors", detail.open_fds),
+        Color::Rgb(200, 200, 200),
+    ));
+    if detail.info.gpu_percent > 0.0 || detail.info.gpu_mem_kb > 0 {
+        io_lines.push((
+            "GPU Usage:      ".to_string(),
+            format_percent(detail.info.gpu_percent),
+            gradient_color(detail.info.gpu_percent),
+        ));
+        io_lines.push((
+            "GPU VRAM:       ".to_string(),
+            format_bytes_dyn((detail.info.gpu_mem_kb * 1024) as f64),
+            gradient_color((detail.info.gpu_mem_kb as f64 / (8.0 * 1024.0 * 1024.0) * 100.0).clamp(0.0, 100.0)),
+        ));
+    }
+
+    let io_block = Block::default()
+        .title(" I/O & GPU Telemetry ".fg(Color::Rgb(170, 170, 170)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+    let io_inner = io_block.inner(top_cols[2]);
+    frame.render_widget(io_block, top_cols[2]);
+
+    for (r, (label, val, col)) in io_lines.iter().enumerate() {
+        let row_y = io_inner.y + r as u16;
+        if row_y < io_inner.bottom() {
+            let line = Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::Rgb(160, 160, 160))),
+                Span::styled(val, Style::default().fg(*col).bold()),
+            ]);
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(line),
+                Rect {
+                    x: io_inner.x,
+                    y: row_y,
+                    width: io_inner.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    // Card 4: Executable Binary & Working Directory Paths
+    let paths_block = Block::default()
+        .title(" Executable & Working Directory ".fg(Color::Rgb(170, 170, 170)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+    let paths_inner = paths_block.inner(bottom_cols[0]);
+    frame.render_widget(paths_block, bottom_cols[0]);
+
+    if paths_inner.height > 0 {
+        let exe_str = if !detail.exe_path.is_empty() {
+            &detail.exe_path
+        } else {
+            "N/A (Kernel Thread or Permission Denied)"
+        };
+        let cwd_str = if !detail.cwd_path.is_empty() {
+            &detail.cwd_path
+        } else {
+            "N/A"
+        };
+
+        let p_lines = vec![
+            Line::from(vec![
+                Span::styled("Binary (exe): ", Style::default().fg(Color::Rgb(160, 160, 160))),
+                Span::styled(exe_str, Style::default().fg(Color::Rgb(0, 255, 255)).bold()),
+            ]),
+            Line::from(vec![
+                Span::styled("Working Dir:  ", Style::default().fg(Color::Rgb(160, 160, 160))),
+                Span::styled(cwd_str, Style::default().fg(Color::Rgb(220, 220, 220))),
+            ]),
+        ];
+        frame.render_widget(ratatui::widgets::Paragraph::new(p_lines), paths_inner);
+    }
+
+    // Card 5: Full Command Line Invocation
+    let cmd_block = Block::default()
+        .title(" Full Command Line ".fg(Color::Rgb(170, 170, 170)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+    let cmd_inner = cmd_block.inner(bottom_cols[1]);
+    frame.render_widget(cmd_block, bottom_cols[1]);
+
+    if cmd_inner.height > 0 && cmd_inner.width > 0 {
+        let spans = format_command_spans(&detail.cmdline, true);
+        let para = ratatui::widgets::Paragraph::new(spans)
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(para, cmd_inner);
+    }
 }
 
 /// Renders the CPU & RAM (Tab 3) historical Braille charts, frequency/temperature gauges, and per-core grid.
