@@ -990,6 +990,54 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .unwrap_or(0);
                                     table_state.select(Some(best_match));
                                 }
+                                KeyCode::Char('w')
+                                    if key.modifiers
+                                        == crossterm::event::KeyModifiers::CONTROL =>
+                                {
+                                    // Delete last word (vim Ctrl+W behaviour):
+                                    // trim trailing whitespace, then drop chars until whitespace
+                                    let trimmed = search_query.trim_end().to_string();
+                                    search_query = trimmed
+                                        .trim_end_matches(|c: char| !c.is_whitespace())
+                                        .to_string();
+                                    let grouped_cache;
+                                    let base_procs = if advanced_view {
+                                        &processes
+                                    } else {
+                                        grouped_cache = group_processes_for_simple_view(
+                                            &processes,
+                                            &expanded_groups,
+                                            current_sort_col,
+                                            sort_ascending,
+                                            &search_query,
+                                        );
+                                        &grouped_cache
+                                    };
+                                    let displayed: Vec<&ProcessInfo> = base_procs
+                                        .iter()
+                                        .filter(|p| advanced_view || p.rss_kb > 0)
+                                        .filter(|p| {
+                                            matches_process_search(
+                                                p,
+                                                &search_query,
+                                                Some(&proc_map),
+                                            )
+                                        })
+                                        .collect();
+                                    let best_match = displayed
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, p)| directly_matches_search(p, &search_query))
+                                        .max_by_key(|(idx, p)| {
+                                            (
+                                                process_search_score(p, &search_query),
+                                                usize::MAX - idx,
+                                            )
+                                        })
+                                        .map(|(idx, _)| idx)
+                                        .unwrap_or(0);
+                                    table_state.select(Some(best_match));
+                                }
                                 KeyCode::Char(c) => {
                                     search_query.push(c);
                                     let grouped_cache;
