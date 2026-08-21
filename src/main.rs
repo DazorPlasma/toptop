@@ -41,7 +41,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Style, Stylize},
     text::Line,
     widgets::{Block, BorderType, Borders, Paragraph, TableState, Tabs},
 };
@@ -67,7 +67,7 @@ use crate::{
         render_disks_tab, render_general_tab, render_gpu_tab, render_kill_confirmation_modal,
         render_network_tab, render_process_error_popup, render_process_tab,
     },
-    utils::copy_to_clipboard,
+    utils::{copy_to_clipboard, format_datetime},
 };
 
 /// Maximum number of historical 2-second telemetry snapshots retained in memory.
@@ -463,18 +463,41 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     " - Space to pause ".to_string()
                 };
 
+                let (topbar_border, topbar_title_style) = if is_paused {
+                    (
+                        Color::Rgb(255, 255, 0),
+                        Style::default().fg(Color::Rgb(255, 255, 0)).bold(),
+                    )
+                } else {
+                    (
+                        Color::Rgb(60, 60, 60),
+                        Style::default().fg(Color::Rgb(170, 170, 170)),
+                    )
+                };
+
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let target_unix = now_unix.saturating_sub(secs_back as i64);
+                let datetime_str = format_datetime(target_unix);
+
                 let tabs_title = format!(" System Monitor{} ", time_badge);
                 #[allow(unused_mut)]
                 let mut tabs_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Plain)
-                    .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-                    .title(tabs_title);
+                    .border_style(Style::default().fg(topbar_border))
+                    .title(Line::from(tabs_title).style(topbar_title_style))
+                    .title(
+                        Line::from(format!(" {} ", datetime_str))
+                            .fg(topbar_border)
+                            .alignment(ratatui::layout::Alignment::Right),
+                    );
 
                 #[cfg(debug_assertions)]
                 {
-                    use ratatui::style::Stylize;
-                    tabs_block = tabs_block.title(
+                    tabs_block = tabs_block.title_bottom(
                         Line::from(
                             format!(" [{}x{}] ", area.width, area.height)
                                 .fg(Color::Rgb(150, 150, 150)),

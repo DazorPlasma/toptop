@@ -97,7 +97,7 @@ All live charts, core gauges, memory usage bars, and process metrics share a uni
 - **Tab Bar (Top)**:
   - **Active Tab**: Bold Pure White (`RGB(255, 255, 255)`, `.bold()`).
   - **Inactive Tab**: Unbold Off-White / Gray (`RGB(170, 170, 170)`, `.not_bold()`).
-  - **Pause Badge**: Bold Yellow `[PAUSED]` indicator when spacebar pause is active.
+  - **Pause Badge & Outline**: When paused, the topbar outline and "System Monitor" title text are highlighted in Bold Yellow (`RGB(255, 255, 0)` / `#FFFF00`).
 
 - **Window Box Outlines**:
   - Thin single-line borders (`BorderType::Plain`) styled with subtle Dark Gray (`RGB(60, 60, 60)` / `#3C3C3C`).

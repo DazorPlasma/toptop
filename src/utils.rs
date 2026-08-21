@@ -154,6 +154,149 @@ pub fn format_uptime(total_secs: u64) -> String {
     }
 }
 
+/// Reads the local timezone UTC offset in seconds from `/etc/localtime` (TZif format)
+/// for the specified Unix timestamp.
+///
+/// # Arguments
+/// * `now_unix` - Target Unix timestamp in seconds.
+///
+/// # Returns
+/// Timezone offset in seconds from UTC (e.g. `+10800` for UTC+3).
+fn get_local_timezone_offset_secs(now_unix: i64) -> i32 {
+    if let Ok(bytes) = std::fs::read("/etc/localtime")
+        && bytes.len() >= 44
+        && &bytes[0..4] == b"TZif"
+    {
+        let is_v2_or_v3 = bytes[4] == b'2' || bytes[4] == b'3';
+        let parse_block = |start: usize, is_64: bool| -> Option<i32> {
+            if bytes.len() < start + 44 {
+                return None;
+            }
+            let parse_i32 = |offset: usize| -> i32 {
+                if bytes.len() < offset + 4 {
+                    0
+                } else {
+                    i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap_or_default())
+                }
+            };
+            let leapcnt = parse_i32(start + 28) as usize;
+            let timecnt = parse_i32(start + 32) as usize;
+            let typecnt = parse_i32(start + 36) as usize;
+            let charcnt = parse_i32(start + 40) as usize;
+            let _ = (leapcnt, charcnt);
+
+            let time_size = if is_64 { 8 } else { 4 };
+            let times_start = start + 44;
+            let types_start = times_start + timecnt * time_size;
+            let ttinfo_start = types_start + timecnt;
+
+            if bytes.len() < ttinfo_start + typecnt * 6 {
+                return None;
+            }
+
+            let mut chosen_type = 0usize;
+            if timecnt > 0 {
+                let mut prev_idx = None;
+                for i in 0..timecnt {
+                    let t = if is_64 {
+                        if bytes.len() < times_start + i * 8 + 8 {
+                            0
+                        } else {
+                            i64::from_be_bytes(
+                                bytes[times_start + i * 8..times_start + i * 8 + 8]
+                                    .try_into()
+                                    .unwrap_or_default(),
+                            )
+                        }
+                    } else {
+                        parse_i32(times_start + i * 4) as i64
+                    };
+                    if now_unix >= t {
+                        prev_idx = Some(i);
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(idx) = prev_idx
+                    && types_start + idx < bytes.len()
+                {
+                    chosen_type = bytes[types_start + idx] as usize;
+                }
+            }
+
+            if chosen_type < typecnt {
+                let info_offset = ttinfo_start + chosen_type * 6;
+                let utoff = parse_i32(info_offset);
+                return Some(utoff);
+            }
+            None
+        };
+
+        if is_v2_or_v3 {
+            let parse_i32 = |offset: usize| -> i32 {
+                if bytes.len() < offset + 4 {
+                    0
+                } else {
+                    i32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap_or_default())
+                }
+            };
+            let leapcnt = parse_i32(28) as usize;
+            let timecnt = parse_i32(32) as usize;
+            let typecnt = parse_i32(36) as usize;
+            let charcnt = parse_i32(40) as usize;
+            let isstdcnt = parse_i32(20) as usize;
+            let isgmtcnt = parse_i32(24) as usize;
+            let first_block_len =
+                44 + timecnt * 5 + typecnt * 6 + charcnt + leapcnt * 8 + isstdcnt + isgmtcnt;
+            if bytes.len() > first_block_len + 44
+                && &bytes[first_block_len..first_block_len + 4] == b"TZif"
+                && let Some(off) = parse_block(first_block_len, true)
+            {
+                return off;
+            }
+        }
+        if let Some(off) = parse_block(0, false) {
+            return off;
+        }
+    }
+    0
+}
+
+/// Formats a Unix timestamp in seconds into a local human-readable date and time (`YYYY-MM-DD HH:MM:SS`).
+///
+/// # Arguments
+/// * `unix_secs` - Seconds elapsed since the Unix epoch (1970-01-01 00:00:00 UTC).
+///
+/// # Returns
+/// A formatted date and time string such as `"2026-08-21 10:07:52"`.
+pub fn format_datetime(unix_secs: i64) -> String {
+    let offset = get_local_timezone_offset_secs(unix_secs);
+    let local_secs = unix_secs + (offset as i64);
+
+    let days = local_secs.div_euclid(86400);
+    let secs_of_day = local_secs.rem_euclid(86400);
+
+    let hours = secs_of_day / 3600;
+    let minutes = (secs_of_day % 3600) / 60;
+    let seconds = secs_of_day % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y, m, d, hours, minutes, seconds
+    )
+}
+
 /// Copies arbitrary text to the system clipboard using Wayland `wl-copy`, X11 `xclip`/`xsel`,
 /// or standard terminal OSC 52 escape sequences.
 ///
@@ -488,5 +631,17 @@ mod tests {
             }
             tab_x += tab_w + 1;
         }
+    }
+
+    #[test]
+    fn test_format_datetime() {
+        let dt = format_datetime(0);
+        assert!(!dt.is_empty());
+        assert_eq!(dt.len(), 19);
+        assert_eq!(&dt[4..5], "-");
+        assert_eq!(&dt[7..8], "-");
+        assert_eq!(&dt[10..11], " ");
+        assert_eq!(&dt[13..14], ":");
+        assert_eq!(&dt[16..17], ":");
     }
 }
