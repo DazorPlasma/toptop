@@ -3,11 +3,17 @@ name = "toptop"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+description = "modern CLI system monitor"
+readme = "README.md"
+repository = "https://github.com/DazorPlasma/toptop"
+homepage = "https://github.com/DazorPlasma/toptop"
+keywords = ["system-monitor", "tui", "cli", "linux", "btop"]
+categories = ["command-line-utilities", "system::monitoring"]
 
 [dependencies]
 crossterm = "0.29.0"
 ratatui = "0.30.2"
-dlmalloc = { version = "0.2.6", features = ["global"] }
+dlmalloc = { version = "0.2.14", features = ["global"] }
 rustix = { version = "0.38", features = ["fs", "process", "system"] }
 
 
@@ -15,6 +21,4 @@ rustix = { version = "0.38", features = ["fs", "process", "system"] }
 lto = true
 codegen-units = 1
 panic = "abort"
-opt-level = "z"
 strip = true
-
