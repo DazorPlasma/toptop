@@ -53,10 +53,12 @@ use crate::{
         matches_process_search, process_search_score, read_processes, sort_processes,
     },
     system::{
-        DnsResolver, PackageStorageCategory, calculate_usage, get_cpu_model, get_ram_info,
-        get_users, read_battery, read_cpu_freq_info, read_cpu_temp, read_cpu_ticks, read_disk_io,
-        read_disk_mounts, read_gpu_metrics, read_memory, read_network_connections,
-        read_network_interfaces, read_package_storage_categories, read_system_general_info,
+        calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery,
+        read_cpu_freq_info, read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts,
+        read_gpu_metrics, read_memory, read_network_connections, read_network_interfaces,
+        read_package_storage_categories, read_system_general_info, BatteryInfo, DiskIoInfo,
+        DnsResolver, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo, NetInterfaceInfo,
+        PackageStorageCategory, SystemGeneralInfo,
     },
     theme::io_gradient_pct,
     ui::{
@@ -67,6 +69,9 @@ use crate::{
     utils::copy_to_clipboard,
 };
 
+/// Maximum number of historical 2-second telemetry snapshots retained in memory.
+const MAX_SNAPSHOTS: usize = 300;
+
 /// Tab navigation title headers for the 6 primary dashboard views.
 const TAB_TITLES: [&str; 6] = [
     "General (1)",
@@ -76,6 +81,119 @@ const TAB_TITLES: [&str; 6] = [
     "Network (5)",
     "Disk (6)",
 ];
+
+/// Telemetry snapshot captured at a 2-second interval, enabling historical time-travel inspection.
+#[derive(Clone)]
+struct Snapshot {
+    /// System overview metadata.
+    sys_info: SystemGeneralInfo,
+    /// Battery telemetry status.
+    battery: Option<BatteryInfo>,
+    /// Overall CPU busy percentage.
+    global_usage: f64,
+    /// Per-core CPU busy percentages.
+    core_usages: Vec<f64>,
+    /// Current CPU clock frequency in MHz.
+    cpu_cur_mhz: f64,
+    /// Minimum CPU clock frequency in MHz.
+    cpu_min_mhz: f64,
+    /// Maximum CPU clock frequency in MHz.
+    cpu_max_mhz: f64,
+    /// Package CPU temperature in degrees Celsius.
+    cpu_temp: u32,
+    /// Memory metrics.
+    mem: MemoryMetrics,
+    /// Formatted RAM capacity and speed info string.
+    ram_info: String,
+    /// GPU telemetry and clock/power metrics.
+    gpu_metrics: GpuMetrics,
+    /// Active network interfaces and throughput rates.
+    net_ifaces: Vec<NetInterfaceInfo>,
+    /// Active socket connections.
+    net_connections: Result<Vec<NetConnectionInfo>, &'static str>,
+    /// Disk I/O throughput rates.
+    disk_io: DiskIoInfo,
+    /// Mounted partition usage.
+    disk_mounts: Vec<MountInfo>,
+    /// Process list snapshot.
+    processes: Vec<ProcessInfo>,
+    /// Historical CPU percentage samples.
+    cpu_history: Vec<Option<f64>>,
+    /// Historical RAM percentage samples.
+    mem_history: Vec<Option<f64>>,
+    /// Historical swap percentage samples.
+    swap_history: Vec<Option<f64>>,
+    /// Historical GPU core percentage samples.
+    gpu_history: Vec<Option<f64>>,
+    /// Historical GPU VRAM percentage samples.
+    gpu_vram_history: Vec<Option<f64>>,
+    /// Historical network RX rate samples.
+    net_rx_history: Vec<Option<f64>>,
+    /// Historical network TX rate samples.
+    net_tx_history: Vec<Option<f64>>,
+    /// Historical disk read rate samples.
+    disk_read_history: Vec<Option<f64>>,
+    /// Historical disk write rate samples.
+    disk_write_history: Vec<Option<f64>>,
+}
+
+/// Helper to construct a Snapshot from current telemetry metrics.
+#[allow(clippy::too_many_arguments)]
+fn create_snapshot(
+    sys_info: &SystemGeneralInfo,
+    battery: Option<&BatteryInfo>,
+    global_usage: f64,
+    core_usages: &[f64],
+    cpu_cur_mhz: f64,
+    cpu_min_mhz: f64,
+    cpu_max_mhz: f64,
+    cpu_temp: u32,
+    mem: &MemoryMetrics,
+    ram_info: &str,
+    gpu_metrics: &GpuMetrics,
+    net_ifaces: &[NetInterfaceInfo],
+    net_connections: &Result<Vec<NetConnectionInfo>, &'static str>,
+    disk_io: &DiskIoInfo,
+    disk_mounts: &[MountInfo],
+    processes: &[ProcessInfo],
+    cpu_history: &[Option<f64>],
+    mem_history: &[Option<f64>],
+    swap_history: &[Option<f64>],
+    gpu_history: &[Option<f64>],
+    gpu_vram_history: &[Option<f64>],
+    net_rx_history: &[Option<f64>],
+    net_tx_history: &[Option<f64>],
+    disk_read_history: &[Option<f64>],
+    disk_write_history: &[Option<f64>],
+) -> Snapshot {
+    Snapshot {
+        sys_info: sys_info.clone(),
+        battery: battery.cloned(),
+        global_usage,
+        core_usages: core_usages.to_vec(),
+        cpu_cur_mhz,
+        cpu_min_mhz,
+        cpu_max_mhz,
+        cpu_temp,
+        mem: *mem,
+        ram_info: ram_info.to_string(),
+        gpu_metrics: gpu_metrics.clone(),
+        net_ifaces: net_ifaces.to_vec(),
+        net_connections: net_connections.clone(),
+        disk_io: disk_io.clone(),
+        disk_mounts: disk_mounts.to_vec(),
+        processes: processes.to_vec(),
+        cpu_history: cpu_history.to_vec(),
+        mem_history: mem_history.to_vec(),
+        swap_history: swap_history.to_vec(),
+        gpu_history: gpu_history.to_vec(),
+        gpu_vram_history: gpu_vram_history.to_vec(),
+        net_rx_history: net_rx_history.to_vec(),
+        net_tx_history: net_tx_history.to_vec(),
+        disk_read_history: disk_read_history.to_vec(),
+        disk_write_history: disk_write_history.to_vec(),
+    }
+}
 
 /// Entry point for `toptop`. Initializes terminal raw mode, sets up panic hooks,
 /// runs the event loop, and cleanly restores terminal state on exit.
@@ -238,6 +356,36 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut modal_btn_rects: Option<(Rect, Rect)> = None;
     let mut needs_redraw = true;
 
+    let mut snapshots = Vec::with_capacity(MAX_SNAPSHOTS);
+    snapshots.push(create_snapshot(
+        &sys_info,
+        battery.as_ref(),
+        global_usage,
+        &core_usages,
+        cpu_cur_mhz,
+        cpu_min_mhz,
+        cpu_max_mhz,
+        cpu_temp,
+        &mem,
+        &ram_info,
+        &gpu_metrics,
+        &net_ifaces,
+        &net_connections,
+        &disk_io,
+        &disk_mounts,
+        &processes,
+        &cpu_history,
+        &mem_history,
+        &swap_history,
+        &gpu_history,
+        &gpu_vram_history,
+        &net_rx_history,
+        &net_tx_history,
+        &disk_read_history,
+        &disk_write_history,
+    ));
+    let mut snapshot_idx = 0;
+
     'main_loop: loop {
         while let Ok(new_cats) = storage_rx.try_recv() {
             storage_categories = new_cats;
@@ -296,8 +444,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 table_area = chunks[1];
 
                 let titles: Vec<Line> = TAB_TITLES.iter().map(|&t| Line::from(t)).collect();
-                let pause_badge = if is_paused { " [PAUSED] " } else { "" };
-                let tabs_title = format!(" System Monitor - Space to pause{} ", pause_badge);
+                let total_snaps = snapshots.len();
+                let cur_snap = if total_snaps > 0 { snapshot_idx + 1 } else { 0 };
+                let steps_back = total_snaps.saturating_sub(1 + snapshot_idx);
+                let secs_back = steps_back * 2;
+
+                let time_badge = if is_paused && steps_back > 0 {
+                    format!(
+                        " [PAUSED -{}s ({}/{}) | [/] time travel, Space to resume] ",
+                        secs_back, cur_snap, total_snaps
+                    )
+                } else if is_paused {
+                    " [PAUSED (LIVE) | [/] time travel, Space to resume] ".to_string()
+                } else {
+                    " - Space to pause | [/] time travel ".to_string()
+                };
+
+                let tabs_title = format!(" System Monitor{} ", time_badge);
                 #[allow(unused_mut)]
                 let mut tabs_block = Block::default()
                     .borders(Borders::ALL)
@@ -331,44 +494,73 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     .map(|t| Instant::now() < t)
                     .unwrap_or(false);
 
+                let default_snap = create_snapshot(
+                    &sys_info,
+                    battery.as_ref(),
+                    global_usage,
+                    &core_usages,
+                    cpu_cur_mhz,
+                    cpu_min_mhz,
+                    cpu_max_mhz,
+                    cpu_temp,
+                    &mem,
+                    &ram_info,
+                    &gpu_metrics,
+                    &net_ifaces,
+                    &net_connections,
+                    &disk_io,
+                    &disk_mounts,
+                    &processes,
+                    &cpu_history,
+                    &mem_history,
+                    &swap_history,
+                    &gpu_history,
+                    &gpu_vram_history,
+                    &net_rx_history,
+                    &net_tx_history,
+                    &disk_read_history,
+                    &disk_write_history,
+                );
+                let snap = snapshots.get(snapshot_idx).unwrap_or(&default_snap);
+
                 match current_tab {
                     0 => {
                         render_general_tab(
                             frame,
                             chunks[1],
-                            &sys_info,
-                            battery.as_ref(),
-                            global_usage,
-                            &core_usages,
-                            cpu_cur_mhz,
-                            cpu_min_mhz,
-                            cpu_max_mhz,
-                            cpu_temp,
+                            &snap.sys_info,
+                            snap.battery.as_ref(),
+                            snap.global_usage,
+                            &snap.core_usages,
+                            snap.cpu_cur_mhz,
+                            snap.cpu_min_mhz,
+                            snap.cpu_max_mhz,
+                            snap.cpu_temp,
                             &cpu_model,
-                            &mem,
-                            &ram_info,
-                            &gpu_metrics,
-                            &net_ifaces,
-                            &disk_io,
-                            &disk_mounts,
-                            &processes,
+                            &snap.mem,
+                            &snap.ram_info,
+                            &snap.gpu_metrics,
+                            &snap.net_ifaces,
+                            &snap.disk_io,
+                            &snap.disk_mounts,
+                            &snap.processes,
                             is_copied,
                             general_sub_tab,
                         );
                     }
                     1 => {
-                        let num_cores = core_usages.len().max(1);
+                        let num_cores = snap.core_usages.len().max(1);
                         render_process_tab(
                             frame,
                             chunks[1],
-                            &processes,
+                            &snap.processes,
                             advanced_view,
                             &expanded_groups,
                             &search_query,
                             is_searching,
                             current_sort_col,
                             sort_ascending,
-                            mem.total_mem_mb,
+                            snap.mem.total_mem_mb,
                             num_cores,
                             &mut table_state,
                         );
@@ -377,26 +569,26 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         render_cpu_ram_tab(
                             frame,
                             chunks[1],
-                            &cpu_history,
-                            &core_usages,
-                            cpu_cur_mhz,
-                            cpu_min_mhz,
-                            cpu_max_mhz,
-                            cpu_temp,
+                            &snap.cpu_history,
+                            &snap.core_usages,
+                            snap.cpu_cur_mhz,
+                            snap.cpu_min_mhz,
+                            snap.cpu_max_mhz,
+                            snap.cpu_temp,
                             &cpu_model,
-                            &mem,
-                            &mem_history,
-                            &swap_history,
-                            &ram_info,
+                            &snap.mem,
+                            &snap.mem_history,
+                            &snap.swap_history,
+                            &snap.ram_info,
                         );
                     }
                     3 => {
                         render_gpu_tab(
                             frame,
                             chunks[1],
-                            &gpu_metrics,
-                            &gpu_history,
-                            &gpu_vram_history,
+                            &snap.gpu_metrics,
+                            &snap.gpu_history,
+                            &snap.gpu_vram_history,
                             gpu_sub_tab,
                         );
                     }
@@ -404,25 +596,27 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         render_network_tab(
                             frame,
                             chunks[1],
-                            &net_ifaces,
-                            &net_rx_history,
-                            &net_tx_history,
-                            &net_connections,
+                            &snap.net_ifaces,
+                            &snap.net_rx_history,
+                            &snap.net_tx_history,
+                            &snap.net_connections,
                             net_scroll_offset,
                         );
                     }
                     5 => {
+                        let is_snapshot = steps_back > 0;
                         render_disks_tab(
                             frame,
                             chunks[1],
-                            &disk_io,
-                            &disk_mounts,
-                            &disk_read_history,
-                            &disk_write_history,
+                            &snap.disk_io,
+                            &snap.disk_mounts,
+                            &snap.disk_read_history,
+                            &snap.disk_write_history,
                             &storage_categories,
                             disks_sub_tab,
                             disks_scroll_offset,
                             disks_box_tab,
+                            is_snapshot,
                         );
                     }
                     _ => {}
@@ -706,13 +900,24 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             current_tab = 4;
                         } else if key.code == KeyCode::Char('6') {
                             current_tab = 5;
+                        } else if key.code == KeyCode::Char('[') {
+                            is_paused = true;
+                            snapshot_idx = snapshot_idx.saturating_sub(1);
+                            needs_redraw = true;
+                        } else if key.code == KeyCode::Char(']') {
+                            is_paused = true;
+                            if !snapshots.is_empty() && snapshot_idx + 1 < snapshots.len() {
+                                snapshot_idx += 1;
+                            }
+                            needs_redraw = true;
                         } else if current_tab == 0 {
                             if key.code == KeyCode::Char('c') || key.code == KeyCode::Char('y') {
+                                let cur_snap = snapshots.get(snapshot_idx);
                                 let text = format_system_overview_copy_text(
-                                    &sys_info,
+                                    cur_snap.map(|s| &s.sys_info).unwrap_or(&sys_info),
                                     &cpu_model,
-                                    &gpu_metrics,
-                                    &ram_info,
+                                    cur_snap.map(|s| &s.gpu_metrics).unwrap_or(&gpu_metrics),
+                                    cur_snap.map(|s| s.ram_info.as_str()).unwrap_or(&ram_info),
                                 );
                                 copy_to_clipboard(&text);
                                 copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
@@ -730,6 +935,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             } else if key.code == KeyCode::Char(' ') {
                                 is_paused = !is_paused;
                                 if !is_paused {
+                                    if !snapshots.is_empty() {
+                                        snapshot_idx = snapshots.len() - 1;
+                                    }
                                     last_tick = Instant::now();
                                 }
                                 needs_redraw = true;
@@ -747,12 +955,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 .filter(|&c| show_pid || c != ProcessSortColumn::Pid)
                                 .collect();
 
+                            let active_procs = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.processes)
+                                .unwrap_or(&processes);
                             let grouped_cache;
                             let base_procs = if advanced_view {
-                                &processes
+                                active_procs
                             } else {
                                 grouped_cache = group_processes_for_simple_view(
-                                    &processes,
+                                    active_procs,
                                     &expanded_groups,
                                     current_sort_col,
                                     sort_ascending,
@@ -762,7 +974,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             };
 
                             let proc_map: HashMap<u32, &ProcessInfo> =
-                                processes.iter().map(|p| (p.pid, p)).collect();
+                                active_procs.iter().map(|p| (p.pid, p)).collect();
 
                             let num_procs = base_procs
                                 .iter()
@@ -818,6 +1030,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         cur_idx - 1
                                     };
                                     current_sort_col = cols[new_idx];
+                                    for s in &mut snapshots {
+                                        sort_processes(
+                                            &mut s.processes,
+                                            current_sort_col,
+                                            sort_ascending,
+                                        );
+                                    }
                                     sort_processes(
                                         &mut processes,
                                         current_sort_col,
@@ -831,6 +1050,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .unwrap_or(0);
                                     let new_idx = (cur_idx + 1) % cols.len();
                                     current_sort_col = cols[new_idx];
+                                    for s in &mut snapshots {
+                                        sort_processes(
+                                            &mut s.processes,
+                                            current_sort_col,
+                                            sort_ascending,
+                                        );
+                                    }
                                     sort_processes(
                                         &mut processes,
                                         current_sort_col,
@@ -839,6 +1065,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 }
                                 KeyCode::Char('r') => {
                                     sort_ascending = !sort_ascending;
+                                    for s in &mut snapshots {
+                                        sort_processes(
+                                            &mut s.processes,
+                                            current_sort_col,
+                                            sort_ascending,
+                                        );
+                                    }
                                     sort_processes(
                                         &mut processes,
                                         current_sort_col,
@@ -851,6 +1084,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         && !NORMAL_SORT_COLUMNS.contains(&current_sort_col)
                                     {
                                         current_sort_col = ProcessSortColumn::Mem;
+                                    }
+                                    for s in &mut snapshots {
+                                        sort_processes(
+                                            &mut s.processes,
+                                            current_sort_col,
+                                            sort_ascending,
+                                        );
                                     }
                                     sort_processes(
                                         &mut processes,
@@ -971,13 +1211,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 KeyCode::Char(' ') => {
                                     is_paused = !is_paused;
                                     if !is_paused {
+                                        if !snapshots.is_empty() {
+                                            snapshot_idx = snapshots.len() - 1;
+                                        }
                                         last_tick = Instant::now();
                                     }
+                                    needs_redraw = true;
                                 }
                                 _ => {}
                             }
                         } else if current_tab == 3 {
-                            let is_tabbed = is_gpu_overflow(table_area, &gpu_metrics);
+                            let cur_gpu = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.gpu_metrics)
+                                .unwrap_or(&gpu_metrics);
+                            let is_tabbed = is_gpu_overflow(table_area, cur_gpu);
                             match key.code {
                                 KeyCode::Left | KeyCode::Char('h') => {
                                     if is_tabbed {
@@ -995,6 +1243,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 KeyCode::Char(' ') => {
                                     is_paused = !is_paused;
                                     if !is_paused {
+                                        if !snapshots.is_empty() {
+                                            snapshot_idx = snapshots.len() - 1;
+                                        }
                                         last_tick = Instant::now();
                                     }
                                     needs_redraw = true;
@@ -1002,7 +1253,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 4 {
-                            let num_conns = net_connections.as_ref().map(|c| c.len()).unwrap_or(0);
+                            let cur_conns = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.net_connections)
+                                .unwrap_or(&net_connections);
+                            let num_conns = cur_conns.as_ref().map(|c| c.len()).unwrap_or(0);
                             let visible_rows =
                                 (table_area.height * 55 / 100).saturating_sub(3) as usize;
                             let max_scroll = num_conns.saturating_sub(visible_rows);
@@ -1034,12 +1289,25 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 KeyCode::Char(' ') => {
                                     is_paused = !is_paused;
                                     if !is_paused {
+                                        if !snapshots.is_empty() {
+                                            snapshot_idx = snapshots.len() - 1;
+                                        }
                                         last_tick = Instant::now();
                                     }
+                                    needs_redraw = true;
                                 }
                                 _ => {}
                             }
                         } else if current_tab == 5 {
+                            let cur_disk_io = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.disk_io)
+                                .unwrap_or(&disk_io);
+                            let cur_mounts = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.disk_mounts[..])
+                                .unwrap_or(&disk_mounts[..]);
+                            let is_tabbed = is_disks_overflow(table_area, cur_disk_io, cur_mounts);
                             match key.code {
                                 KeyCode::Char('a') | KeyCode::Char('A') => {
                                     disks_box_tab = 0;
@@ -1087,8 +1355,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .get(cat_idx)
                                         .map(|c| c.items.len())
                                         .unwrap_or(0);
-                                    let is_tabbed =
-                                        is_disks_overflow(table_area, &disk_io, &disk_mounts);
                                     let box_h = if is_tabbed {
                                         table_area.height.saturating_sub(3)
                                     } else {
@@ -1110,8 +1376,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .get(cat_idx)
                                         .map(|c| c.items.len())
                                         .unwrap_or(0);
-                                    let is_tabbed =
-                                        is_disks_overflow(table_area, &disk_io, &disk_mounts);
                                     let box_h = if is_tabbed {
                                         table_area.height.saturating_sub(3)
                                     } else {
@@ -1133,8 +1397,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .get(cat_idx)
                                         .map(|c| c.items.len())
                                         .unwrap_or(0);
-                                    let is_tabbed =
-                                        is_disks_overflow(table_area, &disk_io, &disk_mounts);
                                     let box_h = if is_tabbed {
                                         table_area.height.saturating_sub(3)
                                     } else {
@@ -1148,6 +1410,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 KeyCode::Char(' ') => {
                                     is_paused = !is_paused;
                                     if !is_paused {
+                                        if !snapshots.is_empty() {
+                                            snapshot_idx = snapshots.len() - 1;
+                                        }
                                         last_tick = Instant::now();
                                     }
                                     needs_redraw = true;
@@ -1157,6 +1422,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         } else if key.code == KeyCode::Char(' ') {
                             is_paused = !is_paused;
                             if !is_paused {
+                                if !snapshots.is_empty() {
+                                    snapshot_idx = snapshots.len() - 1;
+                                }
                                 last_tick = Instant::now();
                             }
                         }
@@ -1232,11 +1500,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             && my >= top_box_bottom.saturating_sub(3)
                                             && my <= top_box_bottom
                                         {
+                                            let cur_snap = snapshots.get(snapshot_idx);
                                             let text = format_system_overview_copy_text(
-                                                &sys_info,
+                                                cur_snap.map(|s| &s.sys_info).unwrap_or(&sys_info),
                                                 &cpu_model,
-                                                &gpu_metrics,
-                                                &ram_info,
+                                                cur_snap
+                                                    .map(|s| &s.gpu_metrics)
+                                                    .unwrap_or(&gpu_metrics),
+                                                cur_snap
+                                                    .map(|s| s.ram_info.as_str())
+                                                    .unwrap_or(&ram_info),
                                             );
                                             copy_to_clipboard(&text);
                                             copy_feedback_until =
@@ -1248,12 +1521,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 1 {
+                            let active_procs = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.processes)
+                                .unwrap_or(&processes);
                             let grouped_cache;
                             let base_procs = if advanced_view {
-                                &processes
+                                active_procs
                             } else {
                                 grouped_cache = group_processes_for_simple_view(
-                                    &processes,
+                                    active_procs,
                                     &expanded_groups,
                                     current_sort_col,
                                     sort_ascending,
@@ -1262,7 +1539,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 &grouped_cache
                             };
                             let proc_map: HashMap<u32, &ProcessInfo> =
-                                processes.iter().map(|p| (p.pid, p)).collect();
+                                active_procs.iter().map(|p| (p.pid, p)).collect();
                             let num_procs = base_procs
                                 .iter()
                                 .filter(|p| advanced_view || p.rss_kb > 0)
@@ -1354,6 +1631,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                                 } else {
                                                     current_sort_col = cols[i];
                                                 }
+                                                for s in &mut snapshots {
+                                                    sort_processes(
+                                                        &mut s.processes,
+                                                        current_sort_col,
+                                                        sort_ascending,
+                                                    );
+                                                }
                                                 sort_processes(
                                                     &mut processes,
                                                     current_sort_col,
@@ -1401,7 +1685,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 3 {
-                            let is_tabbed = is_gpu_overflow(table_area, &gpu_metrics);
+                            let cur_gpu = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.gpu_metrics)
+                                .unwrap_or(&gpu_metrics);
+                            let is_tabbed = is_gpu_overflow(table_area, cur_gpu);
                             match mouse_event.kind {
                                 MouseEventKind::ScrollDown => {
                                     if is_tabbed {
@@ -1439,7 +1727,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 4 {
-                            let num_conns = net_connections.as_ref().map(|c| c.len()).unwrap_or(0);
+                            let cur_conns = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.net_connections)
+                                .unwrap_or(&net_connections);
+                            let num_conns = cur_conns.as_ref().map(|c| c.len()).unwrap_or(0);
                             let visible_rows =
                                 (table_area.height * 55 / 100).saturating_sub(3) as usize;
                             let max_scroll = num_conns.saturating_sub(visible_rows);
@@ -1455,7 +1747,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 5 {
-                            let is_tabbed = is_disks_overflow(table_area, &disk_io, &disk_mounts);
+                            let cur_disk_io = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.disk_io)
+                                .unwrap_or(&disk_io);
+                            let cur_mounts = snapshots
+                                .get(snapshot_idx)
+                                .map(|s| &s.disk_mounts[..])
+                                .unwrap_or(&disk_mounts[..]);
+                            let is_tabbed = is_disks_overflow(table_area, cur_disk_io, cur_mounts);
                             let (tab_row_y, storage_w) = if is_tabbed {
                                 (table_area.y + 4, table_area.width)
                             } else {
@@ -1632,10 +1932,114 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             disk_read_history[99] = Some(d_read_pct);
             disk_write_history[99] = Some(d_write_pct);
 
+            snapshots.push(create_snapshot(
+                &sys_info,
+                battery.as_ref(),
+                global_usage,
+                &core_usages,
+                cpu_cur_mhz,
+                cpu_min_mhz,
+                cpu_max_mhz,
+                cpu_temp,
+                &mem,
+                &ram_info,
+                &gpu_metrics,
+                &net_ifaces,
+                &net_connections,
+                &disk_io,
+                &disk_mounts,
+                &processes,
+                &cpu_history,
+                &mem_history,
+                &swap_history,
+                &gpu_history,
+                &gpu_vram_history,
+                &net_rx_history,
+                &net_tx_history,
+                &disk_read_history,
+                &disk_write_history,
+            ));
+            if snapshots.len() > MAX_SNAPSHOTS {
+                snapshots.remove(0);
+            }
+            snapshot_idx = snapshots.len().saturating_sub(1);
+
             last_tick = Instant::now();
             needs_redraw = true;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snapshot_navigation_and_clamping() {
+        let mut snapshots = Vec::new();
+        let sys_info = SystemGeneralInfo::default();
+        let gpu = GpuMetrics::default();
+        let mem = MemoryMetrics::default();
+        let disk = DiskIoInfo::default();
+        let dummy_net_conns: Result<Vec<NetConnectionInfo>, &'static str> = Ok(Vec::new());
+
+        for i in 0..5 {
+            snapshots.push(create_snapshot(
+                &sys_info,
+                None,
+                i as f64 * 10.0,
+                &[i as f64 * 10.0],
+                2000.0,
+                1000.0,
+                3000.0,
+                45,
+                &mem,
+                "16 GB",
+                &gpu,
+                &[],
+                &dummy_net_conns,
+                &disk,
+                &[],
+                &[],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+                &vec![None; 100],
+            ));
+        }
+
+        assert_eq!(snapshots.len(), 5);
+        let mut snapshot_idx = snapshots.len() - 1; // 4 (live)
+
+        // Step back in time: 4 -> 3 -> 2 -> 1 -> 0
+        for expected in (0..4).rev() {
+            snapshot_idx = snapshot_idx.saturating_sub(1);
+            assert_eq!(snapshot_idx, expected);
+        }
+
+        // Stepping back beyond 0 clamps at 0
+        snapshot_idx = snapshot_idx.saturating_sub(1);
+        assert_eq!(snapshot_idx, 0);
+
+        // Step forward in time: 0 -> 1 -> 2 -> 3 -> 4
+        for expected in 1..=4 {
+            if snapshot_idx + 1 < snapshots.len() {
+                snapshot_idx += 1;
+            }
+            assert_eq!(snapshot_idx, expected);
+        }
+
+        // Stepping forward beyond latest clamps at 4
+        if snapshot_idx + 1 < snapshots.len() {
+            snapshot_idx += 1;
+        }
+        assert_eq!(snapshot_idx, 4);
+    }
 }

@@ -1721,6 +1721,7 @@ pub fn is_disks_overflow(area: Rect, disk_io: &DiskIoInfo, disk_mounts: &[MountI
 /// * `active_cat_idx` - Selected sub-tab category index.
 /// * `scroll_offset` - Vertical scroll offset within the active category's item list.
 /// * `box_tab` - Selected box index when in tabbed view (0: Graphs, 1: Physical Disks, 2: Storage, 3: Mounted Filesystems).
+/// * `is_snapshot` - Whether historical snapshot telemetry is currently being inspected.
 #[allow(clippy::too_many_arguments)]
 pub fn render_disks_tab(
     frame: &mut Frame,
@@ -1733,6 +1734,7 @@ pub fn render_disks_tab(
     active_cat_idx: usize,
     scroll_offset: usize,
     box_tab: usize,
+    is_snapshot: bool,
 ) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -1830,6 +1832,7 @@ pub fn render_disks_tab(
                     storage_categories,
                     active_cat_idx,
                     scroll_offset,
+                    is_snapshot,
                 );
             }
             _ => {
@@ -1887,6 +1890,7 @@ pub fn render_disks_tab(
             storage_categories,
             active_cat_idx,
             scroll_offset,
+            is_snapshot,
         );
         render_mounted_filesystems_card(frame, bottom_chunks[1], disk_mounts);
     }
@@ -1979,9 +1983,10 @@ fn render_package_storage_card(
     storage_categories: &[PackageStorageCategory],
     active_cat_idx: usize,
     scroll_offset: usize,
+    is_snapshot: bool,
 ) {
-    let card_title = if storage_categories.is_empty() {
-        " Storage ".to_string()
+    let card_title = if is_snapshot || storage_categories.is_empty() {
+        " Store ".to_string()
     } else {
         let cat_idx = active_cat_idx.min(storage_categories.len().saturating_sub(1));
         format!(" {} ", storage_categories[cat_idx].name)
@@ -1995,7 +2000,20 @@ fn render_package_storage_card(
     frame.render_widget(pkg_block, area);
 
     if pkg_inner.height > 0 && pkg_inner.width > 0 {
-        if storage_categories.is_empty() {
+        if is_snapshot {
+            let msg = "Not available during snapshot.";
+            let msg_len = msg.chars().count() as u16;
+            let row = pkg_inner.y + pkg_inner.height / 2;
+            let start_col = pkg_inner.x + (pkg_inner.width.saturating_sub(msg_len)) / 2;
+            for (c_idx, ch) in msg.chars().enumerate() {
+                let col = start_col + c_idx as u16;
+                if col < pkg_inner.right() && row < pkg_inner.bottom() {
+                    frame.buffer_mut()[(col, row)]
+                        .set_char(ch)
+                        .set_style(Style::default().fg(Color::Rgb(140, 140, 140)));
+                }
+            }
+        } else if storage_categories.is_empty() {
             let msg = "Scanning package and runtime storage in background...";
             let sub = "(Supported: Docker, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm • 20s refresh)";
             let row = pkg_inner.y + 1;
