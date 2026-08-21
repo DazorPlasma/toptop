@@ -589,17 +589,33 @@ pub fn get_users() -> HashMap<u32, String> {
     users
 }
 
-/// GPU core utilization, VRAM metrics, clocks, and temperature.
+/// GPU core utilization, VRAM metrics, clocks, power, fans, and temperatures.
 #[derive(Clone, Default)]
 pub struct GpuMetrics {
     /// Human-readable GPU device model name.
     pub name: String,
+    /// GPU driver name (e.g. "amdgpu", "i915", "nvidia").
+    pub driver: String,
+    /// VRAM memory vendor (e.g. "Samsung", "Micron", "Hynix").
+    pub memory_vendor: String,
+    /// PCIe Link generation and width (e.g. "PCIe 4.0 x8 (16.0 GT/s)").
+    pub pcie_link: String,
     /// GPU core busy percentage (0.0 to 100.0).
     pub utilization_pct: f64,
-    /// Allocated VRAM memory in megabytes.
+    /// Allocated dedicated VRAM memory in megabytes.
     pub vram_used_mb: u64,
-    /// Total available VRAM capacity in megabytes.
+    /// Total available dedicated VRAM capacity in megabytes.
     pub vram_total_mb: u64,
+    /// Shared system memory (GTT) allocated in megabytes.
+    pub gtt_used_mb: u64,
+    /// Total shared system memory (GTT) capacity in megabytes.
+    pub gtt_total_mb: u64,
+    /// GPU junction / hotspot temperature in degrees Celsius.
+    pub temp_junction_c: u32,
+    /// GPU edge / core temperature in degrees Celsius.
+    pub temp_edge_c: u32,
+    /// GPU VRAM / memory temperature in degrees Celsius.
+    pub temp_mem_c: u32,
     /// GPU junction/core temperature in degrees Celsius.
     pub temp_c: u32,
     /// Current GPU core clock speed in MHz.
@@ -608,6 +624,20 @@ pub struct GpuMetrics {
     pub min_mhz: f64,
     /// Maximum boost core clock in MHz.
     pub max_mhz: f64,
+    /// Memory clock frequency in MHz.
+    pub mem_cur_mhz: f64,
+    /// Current power consumption in Watts.
+    pub power_w: f64,
+    /// Power limit / cap in Watts.
+    pub power_cap_w: f64,
+    /// Core voltage in millivolts.
+    pub voltage_mv: u32,
+    /// Fan speed in RPM.
+    pub fan_rpm: u32,
+    /// Fan maximum speed in RPM.
+    pub fan_max_rpm: u32,
+    /// Fan duty percentage (0 to 100).
+    pub fan_pct: u32,
 }
 
 /// Reads `/sys/class/drm` and `/sys/class/hwmon` to query AMD, NVIDIA, or Intel GPU metrics.
@@ -617,13 +647,28 @@ pub struct GpuMetrics {
 pub fn read_gpu_metrics() -> GpuMetrics {
     let mut metrics = GpuMetrics {
         name: "GPU".to_string(),
+        driver: String::new(),
+        memory_vendor: String::new(),
+        pcie_link: String::new(),
         utilization_pct: 0.0,
         vram_used_mb: 0,
         vram_total_mb: 0,
+        gtt_used_mb: 0,
+        gtt_total_mb: 0,
+        temp_junction_c: 0,
+        temp_edge_c: 0,
+        temp_mem_c: 0,
         temp_c: 0,
         cur_mhz: 0.0,
         min_mhz: 0.0,
         max_mhz: 0.0,
+        mem_cur_mhz: 0.0,
+        power_w: 0.0,
+        power_cap_w: 0.0,
+        voltage_mv: 0,
+        fan_rpm: 0,
+        fan_max_rpm: 0,
+        fan_pct: 0,
     };
 
     if let Ok(entries) = fs::read_dir("/sys/class/drm") {
@@ -635,9 +680,9 @@ pub fn read_gpu_metrics() -> GpuMetrics {
                 if dev_path.exists() {
                     if let Ok(uevent) = fs::read_to_string(dev_path.join("uevent")) {
                         for line in uevent.lines() {
-                            if line.starts_with("DRIVER=") {
-                                metrics.name =
-                                    format!("GPU ({})", line.trim_start_matches("DRIVER="));
+                            if let Some(drv) = line.strip_prefix("DRIVER=") {
+                                metrics.driver = drv.to_string();
+                                metrics.name = format!("GPU ({})", drv);
                             }
                         }
                     }
@@ -680,6 +725,39 @@ pub fn read_gpu_metrics() -> GpuMetrics {
                         metrics.vram_used_mb = used_bytes / (1024 * 1024);
                     }
 
+                    if let Ok(gtt_tot) = fs::read_to_string(dev_path.join("mem_info_gtt_total"))
+                        && let Ok(tot_bytes) = gtt_tot.trim().parse::<u64>()
+                    {
+                        metrics.gtt_total_mb = tot_bytes / (1024 * 1024);
+                    }
+                    if let Ok(gtt_u) = fs::read_to_string(dev_path.join("mem_info_gtt_used"))
+                        && let Ok(u_bytes) = gtt_u.trim().parse::<u64>()
+                    {
+                        metrics.gtt_used_mb = u_bytes / (1024 * 1024);
+                    }
+
+                    if let Ok(vendor_str) = fs::read_to_string(dev_path.join("mem_info_vram_vendor")) {
+                        let v = vendor_str.trim();
+                        if !v.is_empty() {
+                            let mut chars = v.chars();
+                            if let Some(first) = chars.next() {
+                                metrics.memory_vendor = format!("{}{}", first.to_uppercase(), chars.as_str());
+                            }
+                        }
+                    }
+
+                    let cur_speed = fs::read_to_string(dev_path.join("current_link_speed"))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    let cur_width = fs::read_to_string(dev_path.join("current_link_width"))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    if !cur_speed.is_empty() && !cur_width.is_empty() {
+                        metrics.pcie_link = format!("{} x{}", cur_speed, cur_width);
+                    } else if !cur_speed.is_empty() {
+                        metrics.pcie_link = cur_speed;
+                    }
+
                     if let Ok(pp_sclk) = fs::read_to_string(dev_path.join("pp_dpm_sclk")) {
                         let mut first_mhz = None;
                         let mut last_mhz = None;
@@ -711,20 +789,90 @@ pub fn read_gpu_metrics() -> GpuMetrics {
 
                     if let Ok(hwmon_entries) = fs::read_dir(dev_path.join("hwmon")) {
                         for h_entry in hwmon_entries.filter_map(Result::ok) {
-                            if let Ok(temp_str) =
-                                fs::read_to_string(h_entry.path().join("temp1_input"))
-                                && let Ok(temp_milli) = temp_str.trim().parse::<u32>()
-                            {
-                                metrics.temp_c = temp_milli / 1000;
+                            let h_path = h_entry.path();
+                            
+                            // Temperatures
+                            for i in 1..=4 {
+                                if let Ok(input_str) = fs::read_to_string(h_path.join(format!("temp{}_input", i)))
+                                    && let Ok(temp_milli) = input_str.trim().parse::<u32>()
+                                {
+                                    let temp_val = temp_milli / 1000;
+                                    let label = fs::read_to_string(h_path.join(format!("temp{}_label", i)))
+                                        .map(|s| s.trim().to_lowercase())
+                                        .unwrap_or_default();
+                                    if label == "edge" || (i == 1 && metrics.temp_edge_c == 0) {
+                                        metrics.temp_edge_c = temp_val;
+                                    } else if label == "junction" || label == "hotspot" || (i == 2 && metrics.temp_junction_c == 0) {
+                                        metrics.temp_junction_c = temp_val;
+                                    } else if label == "mem" || label == "vram" || (i == 3 && metrics.temp_mem_c == 0) {
+                                        metrics.temp_mem_c = temp_val;
+                                    }
+                                }
                             }
+
+                            // Power
+                            if let Ok(p_str) = fs::read_to_string(h_path.join("power1_average"))
+                                .or_else(|_| fs::read_to_string(h_path.join("power1_input")))
+                                && let Ok(p_micro) = p_str.trim().parse::<f64>()
+                            {
+                                metrics.power_w = p_micro / 1_000_000.0;
+                            }
+                            if let Ok(cap_str) = fs::read_to_string(h_path.join("power1_cap"))
+                                && let Ok(cap_micro) = cap_str.trim().parse::<f64>()
+                            {
+                                metrics.power_cap_w = cap_micro / 1_000_000.0;
+                            }
+
+                            // Voltage
+                            if let Ok(v_str) = fs::read_to_string(h_path.join("in0_input"))
+                                && let Ok(v_milli) = v_str.trim().parse::<u32>()
+                            {
+                                metrics.voltage_mv = v_milli;
+                            }
+
+                            // Fan speed & duty
+                            if let Ok(fan_str) = fs::read_to_string(h_path.join("fan1_input"))
+                                && let Ok(rpm) = fan_str.trim().parse::<u32>()
+                            {
+                                metrics.fan_rpm = rpm;
+                            }
+                            if let Ok(fan_max_str) = fs::read_to_string(h_path.join("fan1_max"))
+                                && let Ok(max_rpm) = fan_max_str.trim().parse::<u32>()
+                            {
+                                metrics.fan_max_rpm = max_rpm;
+                            }
+                            if let Ok(pwm_str) = fs::read_to_string(h_path.join("pwm1"))
+                                && let Ok(pwm) = pwm_str.trim().parse::<u32>()
+                            {
+                                let pwm_max = fs::read_to_string(h_path.join("pwm1_max"))
+                                    .ok()
+                                    .and_then(|s| s.trim().parse::<u32>().ok())
+                                    .unwrap_or(255);
+                                if let Some(pct) = (pwm * 100).checked_div(pwm_max) {
+                                    metrics.fan_pct = pct;
+                                }
+                            }
+
+                            // Frequencies
                             if metrics.cur_mhz <= 0.0
                                 && let Ok(freq_str) =
-                                    fs::read_to_string(h_entry.path().join("freq1_input"))
+                                    fs::read_to_string(h_path.join("freq1_input"))
                                 && let Ok(freq_hz) = freq_str.trim().parse::<f64>()
                             {
                                 metrics.cur_mhz = freq_hz / 1_000_000.0;
                             }
+                            if let Ok(mclk_str) = fs::read_to_string(h_path.join("freq2_input"))
+                                && let Ok(mclk_hz) = mclk_str.trim().parse::<f64>()
+                            {
+                                metrics.mem_cur_mhz = mclk_hz / 1_000_000.0;
+                            }
                         }
+                    }
+
+                    if metrics.temp_edge_c > 0 {
+                        metrics.temp_c = metrics.temp_edge_c;
+                    } else if metrics.temp_junction_c > 0 {
+                        metrics.temp_c = metrics.temp_junction_c;
                     }
 
                     if metrics.min_mhz <= 0.0 {

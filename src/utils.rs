@@ -258,10 +258,190 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Returns true if the kernel version string is considered an official LTS release or the latest series.
+pub fn is_lts_or_latest_kernel(kernel_str: &str) -> bool {
+    let lower = kernel_str.to_lowercase();
+    if lower.contains("lts") {
+        return true;
+    }
+
+    let parts: Vec<&str> = kernel_str.split(['.', '-', '_']).collect();
+
+    if parts.len() >= 2 {
+        let major = parts[0].parse::<u32>().ok();
+        let minor = parts[1].parse::<u32>().ok();
+
+        if let (Some(maj), Some(min)) = (major, minor) {
+            // Known official Longterm (LTS) kernel releases:
+            // 6.12, 6.6, 6.1, 5.15, 5.10, 5.4, 4.19, 4.14, 4.9, 4.4, 3.16
+            let is_lts = matches!(
+                (maj, min),
+                (6, 12)
+                    | (6, 6)
+                    | (6, 1)
+                    | (5, 15)
+                    | (5, 10)
+                    | (5, 4)
+                    | (4, 19)
+                    | (4, 14)
+                    | (4, 9)
+                    | (4, 4)
+                    | (3, 16)
+            );
+
+            if is_lts {
+                return true;
+            }
+
+            // Consider kernels at or above 6.13 (or >= 7.0) as the modern / latest series
+            if (maj == 6 && min >= 13) || maj >= 7 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Returns true if the formatted RAM string represents capacity less than 8GB.
+pub fn is_ram_under_8gb(ram_info: &str) -> bool {
+    let lower = ram_info.to_lowercase();
+    if let Some(gb_pos) = lower.find("gb") {
+        let num_str: String = lower[..gb_pos]
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if let Ok(gb) = num_str.parse::<f64>() {
+            return gb < 8.0;
+        }
+    } else if lower.contains("mb") || lower.contains("kb") {
+        return true;
+    }
+    false
+}
+
+/// Wraps a given string into multiple lines such that each line fits within `max_width`.
+/// Words are separated by whitespace; words exceeding `max_width` are broken across lines.
+pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current_line = String::new();
+    let mut current_len = 0;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current_len == 0 {
+            if word_len <= max_width {
+                current_line.push_str(word);
+                current_len = word_len;
+            } else {
+                let mut word_rem = word;
+                while !word_rem.is_empty() {
+                    let chunk: String = word_rem.chars().take(max_width).collect();
+                    let chunk_len = chunk.chars().count();
+                    word_rem = &word_rem[chunk.len()..];
+                    if chunk_len == max_width && !word_rem.is_empty() {
+                        lines.push(chunk);
+                    } else {
+                        current_line = chunk;
+                        current_len = chunk_len;
+                    }
+                }
+            }
+        } else if current_len + 1 + word_len <= max_width {
+            current_line.push(' ');
+            current_line.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            lines.push(current_line);
+            current_line = String::new();
+            current_len = 0;
+            if word_len <= max_width {
+                current_line.push_str(word);
+                current_len = word_len;
+            } else {
+                let mut word_rem = word;
+                while !word_rem.is_empty() {
+                    let chunk: String = word_rem.chars().take(max_width).collect();
+                    let chunk_len = chunk.chars().count();
+                    word_rem = &word_rem[chunk.len()..];
+                    if chunk_len == max_width && !word_rem.is_empty() {
+                        lines.push(chunk);
+                    } else {
+                        current_line = chunk;
+                        current_len = chunk_len;
+                    }
+                }
+            }
+        }
+    }
+
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use ratatui::prelude::*;
     use ratatui::widgets::{Block, Borders, Tabs};
+
+    #[test]
+    fn test_wrap_text() {
+        let text = "/home [/dev/nvme0n1p2] (ext4)";
+        assert_eq!(wrap_text(text, 50), vec!["/home [/dev/nvme0n1p2] (ext4)"]);
+        assert_eq!(
+            wrap_text(text, 20),
+            vec!["/home", "[/dev/nvme0n1p2]", "(ext4)"]
+        );
+        assert_eq!(
+            wrap_text(text, 25),
+            vec!["/home [/dev/nvme0n1p2]", "(ext4)"]
+        );
+        assert_eq!(
+            wrap_text("abcdefghijklmn", 5),
+            vec!["abcde", "fghij", "klmn"]
+        );
+        assert_eq!(wrap_text("", 10), vec![""]);
+    }
+
+    #[test]
+    fn test_is_ram_under_8gb() {
+        assert!(!is_ram_under_8gb("16GB DDR4@3200MHz"));
+        assert!(!is_ram_under_8gb("32GB DDR5@5600MHz"));
+        assert!(!is_ram_under_8gb("8GB DDR4@2666MHz"));
+        assert!(is_ram_under_8gb("6GB DDR4"));
+        assert!(is_ram_under_8gb("4GB DDR3@1333MHz"));
+        assert!(is_ram_under_8gb("2GB"));
+        assert!(is_ram_under_8gb("512MB"));
+    }
+
+    #[test]
+    fn test_is_lts_or_latest_kernel() {
+        assert!(is_lts_or_latest_kernel("7.2.0"));
+        assert!(is_lts_or_latest_kernel("6.13.1-arch1"));
+        assert!(is_lts_or_latest_kernel("6.12.10-lts"));
+        assert!(is_lts_or_latest_kernel("6.12.10-arch1"));
+        assert!(is_lts_or_latest_kernel("6.6.70-1-lts"));
+        assert!(is_lts_or_latest_kernel("6.1.100-generic"));
+        assert!(is_lts_or_latest_kernel("5.15.0-91-generic"));
+        assert!(is_lts_or_latest_kernel("5.10.200"));
+        assert!(is_lts_or_latest_kernel("linux-custom-lts"));
+
+        // Non-LTS and older than latest (should be yellow)
+        assert!(!is_lts_or_latest_kernel("6.11.2-arch1"));
+        assert!(!is_lts_or_latest_kernel("6.10.14-200.fc40.x86_64"));
+        assert!(!is_lts_or_latest_kernel("6.8.0-45-generic"));
+        assert!(!is_lts_or_latest_kernel("6.5.0-28-generic"));
+        assert!(!is_lts_or_latest_kernel("5.19.0-50-generic"));
+    }
 
     #[test]
     fn test_tabs_coords() {

@@ -43,26 +43,26 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, BorderType, Borders, TableState, Tabs},
+    widgets::{Block, BorderType, Borders, Paragraph, TableState, Tabs},
 };
 
 use crate::{
     process::{
-        directly_matches_search, group_processes_for_simple_view, matches_process_search,
-        process_search_score, read_processes, sort_processes, ProcessInfo, ProcessKillConfirmation,
-        ProcessSortColumn, ADVANCED_SORT_COLUMNS, NORMAL_SORT_COLUMNS,
+        ADVANCED_SORT_COLUMNS, NORMAL_SORT_COLUMNS, ProcessInfo, ProcessKillConfirmation,
+        ProcessSortColumn, directly_matches_search, group_processes_for_simple_view,
+        matches_process_search, process_search_score, read_processes, sort_processes,
     },
     system::{
-        calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery,
-        read_cpu_freq_info, read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts,
-        read_gpu_metrics, read_memory, read_network_connections, read_network_interfaces,
-        read_package_storage_categories, read_system_general_info, DnsResolver,
-        PackageStorageCategory,
+        DnsResolver, PackageStorageCategory, calculate_usage, get_cpu_model, get_ram_info,
+        get_users, read_battery, read_cpu_freq_info, read_cpu_temp, read_cpu_ticks, read_disk_io,
+        read_disk_mounts, read_gpu_metrics, read_memory, read_network_connections,
+        read_network_interfaces, read_package_storage_categories, read_system_general_info,
     },
     theme::io_gradient_pct,
     ui::{
-        format_system_overview_copy_text, render_cpu_ram_tab, render_disks_tab, render_general_tab,
-        render_gpu_tab, render_kill_confirmation_modal, render_network_tab, render_process_tab,
+        format_system_overview_copy_text, is_disks_overflow, render_cpu_ram_tab, render_disks_tab,
+        render_general_tab, render_gpu_tab, render_kill_confirmation_modal, render_network_tab,
+        render_process_tab,
     },
     utils::copy_to_clipboard,
 };
@@ -172,6 +172,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut storage_categories = Vec::new();
     let mut general_sub_tab = 0;
     let mut disks_sub_tab = 0;
+    let mut disks_box_tab = 0;
     let mut disks_scroll_offset = 0;
 
     let cpu_model = get_cpu_model();
@@ -256,6 +257,34 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             terminal.draw(|frame| {
                 let area = frame.area();
 
+                if area.width < 98 || area.height < 20 {
+                    let block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(Style::default().fg(Color::Rgb(255, 80, 80)));
+                    let inner = block.inner(area);
+                    frame.render_widget(block, area);
+
+                    if inner.height > 0 {
+                        use ratatui::style::Stylize;
+                        let text = vec![
+                            Line::from("Terminal too small, minimum of 98x20 required.")
+                                .fg(Color::Rgb(255, 100, 100))
+                                .bold()
+                                .alignment(ratatui::layout::Alignment::Center),
+                        ];
+                        let msg_y = inner.y + inner.height / 2;
+                        let msg_area = Rect {
+                            x: inner.x,
+                            y: msg_y,
+                            width: inner.width,
+                            height: 1,
+                        };
+                        frame.render_widget(Paragraph::new(text), msg_area);
+                    }
+                    return;
+                }
+
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .margin(1)
@@ -271,16 +300,29 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     " System Monitor - 'q' to quit, Space to pause{} ",
                     pause_badge
                 );
+                #[allow(unused_mut)]
+                let mut tabs_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Plain)
+                    .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                    .title(tabs_title);
+
+                #[cfg(debug_assertions)]
+                {
+                    use ratatui::style::Stylize;
+                    tabs_block = tabs_block.title(
+                        Line::from(
+                            format!(" [{}x{}] ", area.width, area.height)
+                                .fg(Color::Rgb(150, 150, 150)),
+                        )
+                        .alignment(ratatui::layout::Alignment::Right),
+                    );
+                }
+
                 let tabs = Tabs::new(titles)
                     .style(Style::default().not_bold().fg(Color::Rgb(170, 170, 170)))
                     .select(current_tab)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Plain)
-                            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-                            .title(tabs_title),
-                    )
+                    .block(tabs_block)
                     .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold())
                     .divider("|")
                     .padding(" ", " ");
@@ -381,6 +423,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             &storage_categories,
                             disks_sub_tab,
                             disks_scroll_offset,
+                            disks_box_tab,
                         );
                     }
                     _ => {}
@@ -428,14 +471,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             match key.code {
                                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                     for &p_id in &confirm.pids {
-                                        if let Some(pid) = rustix::process::Pid::from_raw(p_id as i32) {
-                                            let _ = rustix::process::kill_process(pid, confirm.signal);
+                                        if let Some(pid) =
+                                            rustix::process::Pid::from_raw(p_id as i32)
+                                        {
+                                            let _ =
+                                                rustix::process::kill_process(pid, confirm.signal);
                                         }
                                     }
                                     std::thread::sleep(Duration::from_millis(40));
                                     let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
                                     processes = read_processes(&mut prev_procs, &users, cur_dt);
-                                    sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                    sort_processes(
+                                        &mut processes,
+                                        current_sort_col,
+                                        sort_ascending,
+                                    );
                                     mem = read_memory(&mut io_buf);
                                     if !is_paused {
                                         last_tick = Instant::now();
@@ -468,7 +518,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             let num_procs = base_procs
                                 .iter()
                                 .filter(|p| advanced_view || p.rss_kb > 0)
-                                .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                .filter(|p| {
+                                    matches_process_search(p, &search_query, Some(&proc_map))
+                                })
                                 .count();
                             match key.code {
                                 KeyCode::Esc => {
@@ -497,14 +549,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     let displayed: Vec<&ProcessInfo> = base_procs
                                         .iter()
                                         .filter(|p| advanced_view || p.rss_kb > 0)
-                                        .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                        .filter(|p| {
+                                            matches_process_search(
+                                                p,
+                                                &search_query,
+                                                Some(&proc_map),
+                                            )
+                                        })
                                         .collect();
                                     let best_match = displayed
                                         .iter()
                                         .enumerate()
                                         .filter(|(_, p)| directly_matches_search(p, &search_query))
                                         .max_by_key(|(idx, p)| {
-                                            (process_search_score(p, &search_query), usize::MAX - idx)
+                                            (
+                                                process_search_score(p, &search_query),
+                                                usize::MAX - idx,
+                                            )
                                         })
                                         .map(|(idx, _)| idx)
                                         .unwrap_or(0);
@@ -528,14 +589,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     let displayed: Vec<&ProcessInfo> = base_procs
                                         .iter()
                                         .filter(|p| advanced_view || p.rss_kb > 0)
-                                        .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                        .filter(|p| {
+                                            matches_process_search(
+                                                p,
+                                                &search_query,
+                                                Some(&proc_map),
+                                            )
+                                        })
                                         .collect();
                                     let best_match = displayed
                                         .iter()
                                         .enumerate()
                                         .filter(|(_, p)| directly_matches_search(p, &search_query))
                                         .max_by_key(|(idx, p)| {
-                                            (process_search_score(p, &search_query), usize::MAX - idx)
+                                            (
+                                                process_search_score(p, &search_query),
+                                                usize::MAX - idx,
+                                            )
                                         })
                                         .map(|(idx, _)| idx)
                                         .unwrap_or(0);
@@ -653,7 +723,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             let num_procs = base_procs
                                 .iter()
                                 .filter(|p| advanced_view || p.rss_kb > 0)
-                                .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                .filter(|p| {
+                                    matches_process_search(p, &search_query, Some(&proc_map))
+                                })
                                 .count();
                             match key.code {
                                 KeyCode::Enter => {
@@ -661,7 +733,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         let displayed: Vec<&ProcessInfo> = base_procs
                                             .iter()
                                             .filter(|p| advanced_view || p.rss_kb > 0)
-                                            .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                            .filter(|p| {
+                                                matches_process_search(
+                                                    p,
+                                                    &search_query,
+                                                    Some(&proc_map),
+                                                )
+                                            })
                                             .collect();
                                         if let Some(target) = displayed.get(sel)
                                             && let Some(grp) = &target.group_name
@@ -696,7 +774,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         cur_idx - 1
                                     };
                                     current_sort_col = cols[new_idx];
-                                    sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                    sort_processes(
+                                        &mut processes,
+                                        current_sort_col,
+                                        sort_ascending,
+                                    );
                                 }
                                 KeyCode::Right => {
                                     let cur_idx = cols
@@ -705,11 +787,19 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .unwrap_or(0);
                                     let new_idx = (cur_idx + 1) % cols.len();
                                     current_sort_col = cols[new_idx];
-                                    sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                    sort_processes(
+                                        &mut processes,
+                                        current_sort_col,
+                                        sort_ascending,
+                                    );
                                 }
                                 KeyCode::Char('r') => {
                                     sort_ascending = !sort_ascending;
-                                    sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                    sort_processes(
+                                        &mut processes,
+                                        current_sort_col,
+                                        sort_ascending,
+                                    );
                                 }
                                 KeyCode::Char('a') => {
                                     advanced_view = !advanced_view;
@@ -718,14 +808,24 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     {
                                         current_sort_col = ProcessSortColumn::Mem;
                                     }
-                                    sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                    sort_processes(
+                                        &mut processes,
+                                        current_sort_col,
+                                        sort_ascending,
+                                    );
                                 }
                                 KeyCode::Char('c') => {
                                     if let Some(sel) = table_state.selected() {
                                         let displayed: Vec<&ProcessInfo> = base_procs
                                             .iter()
                                             .filter(|p| advanced_view || p.rss_kb > 0)
-                                            .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                            .filter(|p| {
+                                                matches_process_search(
+                                                    p,
+                                                    &search_query,
+                                                    Some(&proc_map),
+                                                )
+                                            })
                                             .collect();
                                         if let Some(target) = displayed.get(sel) {
                                             let pids = if !target.grouped_pids.is_empty() {
@@ -756,7 +856,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         let displayed: Vec<&ProcessInfo> = base_procs
                                             .iter()
                                             .filter(|p| advanced_view || p.rss_kb > 0)
-                                            .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                            .filter(|p| {
+                                                matches_process_search(
+                                                    p,
+                                                    &search_query,
+                                                    Some(&proc_map),
+                                                )
+                                            })
                                             .collect();
                                         if let Some(target) = displayed.get(sel) {
                                             let pids = if !target.grouped_pids.is_empty() {
@@ -827,11 +933,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 4 {
-                            let num_conns = net_connections
-                                .as_ref()
-                                .map(|c| c.len())
-                                .unwrap_or(0);
-                            let visible_rows = (table_area.height * 55 / 100).saturating_sub(3) as usize;
+                            let num_conns = net_connections.as_ref().map(|c| c.len()).unwrap_or(0);
+                            let visible_rows =
+                                (table_area.height * 55 / 100).saturating_sub(3) as usize;
                             let max_scroll = num_conns.saturating_sub(visible_rows);
                             match key.code {
                                 KeyCode::Up | KeyCode::Char('k') => {
@@ -868,6 +972,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             }
                         } else if current_tab == 5 {
                             match key.code {
+                                KeyCode::Char('a') | KeyCode::Char('A') => {
+                                    disks_box_tab = 0;
+                                    needs_redraw = true;
+                                }
+                                KeyCode::Char('s') | KeyCode::Char('S') => {
+                                    disks_box_tab = 1;
+                                    needs_redraw = true;
+                                }
+                                KeyCode::Char('d') | KeyCode::Char('D') => {
+                                    disks_box_tab = 2;
+                                    needs_redraw = true;
+                                }
+                                KeyCode::Char('f') | KeyCode::Char('F') => {
+                                    disks_box_tab = 3;
+                                    needs_redraw = true;
+                                }
                                 KeyCode::Left | KeyCode::Char('h') => {
                                     if !storage_categories.is_empty() {
                                         disks_sub_tab = if disks_sub_tab == 0 {
@@ -876,37 +996,47 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             disks_sub_tab - 1
                                         };
                                         disks_scroll_offset = 0;
+                                        needs_redraw = true;
                                     }
                                 }
                                 KeyCode::Right | KeyCode::Char('l') => {
                                     if !storage_categories.is_empty() {
-                                        disks_sub_tab = (disks_sub_tab + 1) % storage_categories.len();
+                                        disks_sub_tab =
+                                            (disks_sub_tab + 1) % storage_categories.len();
                                         disks_scroll_offset = 0;
+                                        needs_redraw = true;
                                     }
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     disks_scroll_offset = disks_scroll_offset.saturating_sub(1);
+                                    needs_redraw = true;
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
                                     disks_scroll_offset = disks_scroll_offset.saturating_add(1);
+                                    needs_redraw = true;
                                 }
                                 KeyCode::PageUp => {
                                     disks_scroll_offset = disks_scroll_offset.saturating_sub(5);
+                                    needs_redraw = true;
                                 }
                                 KeyCode::PageDown => {
                                     disks_scroll_offset = disks_scroll_offset.saturating_add(5);
+                                    needs_redraw = true;
                                 }
                                 KeyCode::Home | KeyCode::Char('g') => {
                                     disks_scroll_offset = 0;
+                                    needs_redraw = true;
                                 }
                                 KeyCode::End | KeyCode::Char('G') => {
                                     disks_scroll_offset = usize::MAX;
+                                    needs_redraw = true;
                                 }
                                 KeyCode::Char(' ') => {
                                     is_paused = !is_paused;
                                     if !is_paused {
                                         last_tick = Instant::now();
                                     }
+                                    needs_redraw = true;
                                 }
                                 _ => {}
                             }
@@ -931,14 +1061,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     && my < yes_rect.bottom()
                                 {
                                     for &p_id in &confirm.pids {
-                                        if let Some(pid) = rustix::process::Pid::from_raw(p_id as i32) {
-                                            let _ = rustix::process::kill_process(pid, confirm.signal);
+                                        if let Some(pid) =
+                                            rustix::process::Pid::from_raw(p_id as i32)
+                                        {
+                                            let _ =
+                                                rustix::process::kill_process(pid, confirm.signal);
                                         }
                                     }
                                     std::thread::sleep(Duration::from_millis(40));
                                     let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
                                     processes = read_processes(&mut prev_procs, &users, cur_dt);
-                                    sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                    sort_processes(
+                                        &mut processes,
+                                        current_sort_col,
+                                        sort_ascending,
+                                    );
                                     mem = read_memory(&mut io_buf);
                                     if !is_paused {
                                         last_tick = Instant::now();
@@ -990,10 +1127,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 MouseEventKind::Down(MouseButton::Left) => {
                                     let num_cores = core_usages.len();
                                     let cpu_min_rows = 1 + num_cores.div_ceil(4) as u16 + 2;
-                                    let min_height_needed =
-                                        14 + 4 + (table_area.height * 30 / 100).max(6) + cpu_min_rows;
-                                    let is_compact =
-                                        table_area.height < min_height_needed || table_area.width < 80;
+                                    let min_height_needed = 14
+                                        + 4
+                                        + (table_area.height * 30 / 100).max(6)
+                                        + cpu_min_rows;
+                                    let is_compact = table_area.height < min_height_needed
+                                        || table_area.width < 80;
                                     if is_compact && my == table_area.y + 1 {
                                         let titles = ["Overview", "Hardware", "High", "Partitions"];
                                         let mut tab_x = table_area.x + 2;
@@ -1057,7 +1196,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             let num_procs = base_procs
                                 .iter()
                                 .filter(|p| advanced_view || p.rss_kb > 0)
-                                .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                .filter(|p| {
+                                    matches_process_search(p, &search_query, Some(&proc_map))
+                                })
                                 .count();
                             match mouse_event.kind {
                                 MouseEventKind::ScrollDown => {
@@ -1084,7 +1225,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             if advanced_view {
                                                 let pid_w = if show_pid { 8 } else { 0 };
                                                 let base_w =
-                                                    pid_w + 10 + 7 + 8 + 8 + 10 + 8 + 10 + 22 + 22;
+                                                    pid_w + 10 + 7 + 8 + 5 + 10 + 4 + 10 + 21 + 21;
                                                 let name_w =
                                                     table_area.width.saturating_sub(base_w).max(10);
                                                 let mut widths = Vec::with_capacity(11);
@@ -1094,7 +1235,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                                     c_list.push(ProcessSortColumn::Pid);
                                                 }
                                                 widths.extend_from_slice(&[
-                                                    10, name_w, 7, 8, 8, 10, 8, 10, 22, 22,
+                                                    10, name_w, 7, 8, 5, 10, 5, 9, 21, 21,
                                                 ]);
                                                 c_list.extend_from_slice(&[
                                                     ProcessSortColumn::User,
@@ -1111,7 +1252,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                                 (widths, c_list)
                                             } else {
                                                 let pid_w = if show_pid { 8 } else { 0 };
-                                                let base_w = pid_w + 8 + 10 + 8 + 10 + 22 + 22;
+                                                let base_w = pid_w + 5 + 10 + 5 + 9 + 21 + 21;
                                                 let name_w =
                                                     table_area.width.saturating_sub(base_w).max(10);
                                                 let mut widths = Vec::with_capacity(8);
@@ -1121,7 +1262,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                                     c_list.push(ProcessSortColumn::Pid);
                                                 }
                                                 widths.extend_from_slice(&[
-                                                    name_w, 8, 10, 8, 10, 22, 22,
+                                                    name_w, 5, 10, 5, 9, 21, 21,
                                                 ]);
                                                 c_list.extend_from_slice(&[
                                                     ProcessSortColumn::Name,
@@ -1161,11 +1302,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                                 let displayed: Vec<&ProcessInfo> = base_procs
                                                     .iter()
                                                     .filter(|p| advanced_view || p.rss_kb > 0)
-                                                    .filter(|p| matches_process_search(p, &search_query, Some(&proc_map)))
+                                                    .filter(|p| {
+                                                        matches_process_search(
+                                                            p,
+                                                            &search_query,
+                                                            Some(&proc_map),
+                                                        )
+                                                    })
                                                     .collect();
                                                 if let Some(target) = displayed.get(proc_idx)
                                                     && let Some(grp) = &target.group_name
-                                                    && (target.is_group_header || target.is_group_child)
+                                                    && (target.is_group_header
+                                                        || target.is_group_child)
                                                 {
                                                     if expanded_groups.contains(grp) {
                                                         expanded_groups.remove(grp);
@@ -1183,11 +1331,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 4 {
-                            let num_conns = net_connections
-                                .as_ref()
-                                .map(|c| c.len())
-                                .unwrap_or(0);
-                            let visible_rows = (table_area.height * 55 / 100).saturating_sub(3) as usize;
+                            let num_conns = net_connections.as_ref().map(|c| c.len()).unwrap_or(0);
+                            let visible_rows =
+                                (table_area.height * 55 / 100).saturating_sub(3) as usize;
                             let max_scroll = num_conns.saturating_sub(visible_rows);
                             match mouse_event.kind {
                                 MouseEventKind::ScrollDown => {
@@ -1201,9 +1347,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 _ => {}
                             }
                         } else if current_tab == 5 {
-                            let bottom_y = table_area.y + table_area.height / 2;
-                            let tab_row_y = bottom_y + 1;
-                            let left_w = (table_area.width * 70) / 100;
+                            let is_tabbed = is_disks_overflow(table_area, &disk_io, &disk_mounts);
+                            let (tab_row_y, storage_w) = if is_tabbed {
+                                (table_area.y + 4, table_area.width)
+                            } else {
+                                (table_area.y + table_area.height / 2 + 1, (table_area.width * 70) / 100)
+                            };
+
                             match mouse_event.kind {
                                 MouseEventKind::ScrollDown => {
                                     disks_scroll_offset = disks_scroll_offset.saturating_add(2);
@@ -1214,24 +1364,54 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     needs_redraw = true;
                                 }
                                 MouseEventKind::Down(MouseButton::Left)
-                                    if my == tab_row_y
-                                        && mx > table_area.x
-                                        && mx < table_area.x + left_w =>
+                                    if is_tabbed && my == table_area.y + 1 && mx > table_area.x =>
                                 {
-                                    let mut cur_x = table_area.x + 1;
+                                    let click_col = mx.saturating_sub(table_area.x + 1);
+                                    if click_col < 12 {
+                                        disks_box_tab = 0;
+                                    } else if click_col < 33 {
+                                        disks_box_tab = 1;
+                                    } else if click_col < 47 {
+                                        disks_box_tab = 2;
+                                    } else {
+                                        disks_box_tab = 3;
+                                    }
+                                    needs_redraw = true;
+                                }
+                                MouseEventKind::Down(MouseButton::Left)
+                                    if (!is_tabbed || disks_box_tab == 2)
+                                        && (my == tab_row_y || my == tab_row_y + 1)
+                                        && mx > table_area.x
+                                        && mx < table_area.x + storage_w =>
+                                {
+                                    let inner_w = storage_w.saturating_sub(2);
+                                    let click_col = mx.saturating_sub(table_area.x + 1);
+                                    let mut cur_row: u16 = 0;
+                                    let mut cur_col: u16 = 0;
                                     for (i, cat) in storage_categories.iter().enumerate() {
                                         let tab_len =
                                             format!("[ ▶ {} ({}) ] ", cat.name, cat.total_str)
                                                 .chars()
                                                 .count()
                                                 as u16;
-                                        if mx >= cur_x && mx < cur_x + tab_len {
+                                        if cur_row == 0
+                                            && cur_col > 0
+                                            && (cur_col + tab_len) > inner_w
+                                        {
+                                            cur_row = 1;
+                                            cur_col = 0;
+                                        }
+                                        let target_y = tab_row_y + cur_row;
+                                        if my == target_y
+                                            && click_col >= cur_col
+                                            && click_col < cur_col + tab_len
+                                        {
                                             disks_sub_tab = i;
                                             disks_scroll_offset = 0;
                                             needs_redraw = true;
                                             break;
                                         }
-                                        cur_x += tab_len;
+                                        cur_col += tab_len;
                                     }
                                 }
                                 _ => {}

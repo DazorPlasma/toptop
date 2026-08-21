@@ -24,7 +24,10 @@ use crate::{
         NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo,
     },
     theme::{darken_color, gradient_color, io_gradient_pct, process_cpu_color},
-    utils::{format_bytes_dyn, format_freq, format_percent, format_uptime},
+    utils::{
+        format_bytes_dyn, format_freq, format_percent, format_uptime, is_lts_or_latest_kernel,
+        is_ram_under_8gb, wrap_text,
+    },
 };
 
 /// Computes the 8-bit Unicode Braille dot bitmask for a given sub-pixel cell coordinate.
@@ -70,15 +73,15 @@ pub fn braille_char(mask: u8) -> char {
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the graph widget.
 /// * `title` - Left-aligned header title text.
-/// * `center_title` - Optional centered header tag and styling.
-/// * `right_title` - Optional right-aligned header tag text.
+/// * `bottom_center_title` - Optional bottom-centered badge text and highlight color.
+/// * `right_title` - Optional right-aligned sub-header text.
 /// * `border_color` - Border line color.
 /// * `history` - Slice of optional data samples (0.0 to 100.0) where `None` indicates uncollected startup state.
 pub fn render_gradient_chart(
     frame: &mut Frame,
     area: Rect,
     title: &str,
-    center_title: Option<(&str, Color)>,
+    bottom_center_title: Option<(&str, Color)>,
     right_title: Option<&str>,
     border_color: Color,
     history: &[Option<f64>],
@@ -89,11 +92,11 @@ pub fn render_gradient_chart(
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(border_color));
 
-    if let Some((ct, color)) = center_title
-        && !ct.is_empty()
+    if let Some((bct, color)) = bottom_center_title
+        && !bct.is_empty()
     {
-        block = block.title(
-            Line::from(format!(" {} ", ct).fg(color).bold())
+        block = block.title_bottom(
+            Line::from(format!(" {} ", bct).fg(color).bold())
                 .alignment(ratatui::layout::Alignment::Center),
         );
     }
@@ -385,17 +388,17 @@ pub fn render_process_tab(
             titles.push(("Threads", ProcessSortColumn::Threads));
             cons.push(Constraint::Length(8));
             titles.push(("CPU", ProcessSortColumn::Cpu));
-            cons.push(Constraint::Length(8));
+            cons.push(Constraint::Length(5));
             titles.push(("RAM", ProcessSortColumn::Mem));
             cons.push(Constraint::Length(10));
             titles.push(("GPU", ProcessSortColumn::Gpu));
-            cons.push(Constraint::Length(8));
+            cons.push(Constraint::Length(5));
             titles.push(("VRAM", ProcessSortColumn::GpuMem));
-            cons.push(Constraint::Length(10));
+            cons.push(Constraint::Length(9));
             titles.push(("IO", ProcessSortColumn::Io));
-            cons.push(Constraint::Length(22));
+            cons.push(Constraint::Length(21));
             titles.push(("Net", ProcessSortColumn::Net));
-            cons.push(Constraint::Length(22));
+            cons.push(Constraint::Length(21));
             (titles, cons)
         } else {
             let mut titles = Vec::with_capacity(8);
@@ -407,17 +410,17 @@ pub fn render_process_tab(
             titles.push(("Name", ProcessSortColumn::Name));
             cons.push(Constraint::Fill(1));
             titles.push(("CPU", ProcessSortColumn::Cpu));
-            cons.push(Constraint::Length(8));
+            cons.push(Constraint::Length(5));
             titles.push(("RAM", ProcessSortColumn::Mem));
             cons.push(Constraint::Length(10));
             titles.push(("GPU", ProcessSortColumn::Gpu));
-            cons.push(Constraint::Length(8));
+            cons.push(Constraint::Length(5));
             titles.push(("VRAM", ProcessSortColumn::GpuMem));
-            cons.push(Constraint::Length(10));
+            cons.push(Constraint::Length(9));
             titles.push(("IO", ProcessSortColumn::Io));
-            cons.push(Constraint::Length(22));
+            cons.push(Constraint::Length(21));
             titles.push(("Net", ProcessSortColumn::Net));
-            cons.push(Constraint::Length(22));
+            cons.push(Constraint::Length(21));
             (titles, cons)
         };
 
@@ -820,48 +823,13 @@ pub fn render_cpu_ram_tab(
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
     let mem_inner = mem_block.inner(ram_layout[1]);
     frame.render_widget(mem_block, ram_layout[1]);
-
     if mem_inner.height > 0 && mem_inner.width > 0 {
-        let total_bar = mem_inner.width;
-        let filled_len =
-            ((total_bar as f64) * (mem_percent_f64.clamp(0.0, 100.0) / 100.0)).round() as u16;
-        let label = format!("{} MB / {} MB", mem.used_mem_mb, mem.total_mem_mb);
-        let label_chars: Vec<char> = label.chars().collect();
-        let label_start = (total_bar.saturating_sub(label_chars.len() as u16)) / 2;
-
-        for c in 0..total_bar {
-            let col = mem_inner.x + c;
-            let row = mem_inner.y;
-            let pct = (c as f64 + 0.5) / (total_bar as f64) * 100.0;
-            let is_filled = c < filled_len;
-            let bar_color = gradient_color(pct);
-
-            if c >= label_start && (c - label_start) < label_chars.len() as u16 {
-                let ch = label_chars[(c - label_start) as usize];
-                if is_filled {
-                    frame.buffer_mut()[(col, row)].set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Rgb(0, 0, 0))
-                            .bg(bar_color)
-                            .bold(),
-                    );
-                } else {
-                    frame.buffer_mut()[(col, row)].set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Rgb(170, 170, 170))
-                            .bg(Color::Rgb(30, 30, 30)),
-                    );
-                }
-            } else if is_filled {
-                frame.buffer_mut()[(col, row)]
-                    .set_char('█')
-                    .set_style(Style::default().fg(bar_color));
-            } else {
-                frame.buffer_mut()[(col, row)]
-                    .set_char(' ')
-                    .set_style(Style::default().bg(Color::Rgb(30, 30, 30)));
-            }
-        }
+        draw_centered_gradient_bar(
+            frame.buffer_mut(),
+            mem_inner,
+            &format!("{} MB / {} MB", mem.used_mem_mb, mem.total_mem_mb),
+            mem_percent_f64,
+        );
     }
 
     let swap_block = Block::default()
@@ -873,53 +841,71 @@ pub fn render_cpu_ram_tab(
     frame.render_widget(swap_block, swap_layout[1]);
 
     if swap_inner.height > 0 && swap_inner.width > 0 {
-        let total_bar = swap_inner.width;
-        let filled_len = ((total_bar as f64) * (swap_pct.clamp(0.0, 100.0) / 100.0)).round() as u16;
         let label = if mem.total_swap_mb > 0 {
             format!("{} MB / {} MB", mem.used_swap_mb, mem.total_swap_mb)
         } else {
             "0 MB / 0 MB (No Swap Configured)".to_string()
         };
-        let label_chars: Vec<char> = label.chars().collect();
-        let label_start = (total_bar.saturating_sub(label_chars.len() as u16)) / 2;
+        draw_centered_gradient_bar(
+            frame.buffer_mut(),
+            swap_inner,
+            &label,
+            swap_pct,
+        );
+    }
+}
 
-        for c in 0..total_bar {
-            let col = swap_inner.x + c;
-            let row = swap_inner.y;
-            let pct = (c as f64 + 0.5) / (total_bar as f64) * 100.0;
-            let is_filled = c < filled_len;
-            let bar_color = gradient_color(pct);
+/// Draws a single-line centered text label over a horizontal gradient progress bar.
+fn draw_centered_gradient_bar(
+    buf: &mut ratatui::buffer::Buffer,
+    inner: Rect,
+    label: &str,
+    pct: f64,
+) {
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let total_bar = inner.width;
+    let filled_len = ((total_bar as f64) * (pct.clamp(0.0, 100.0) / 100.0)).round() as u16;
+    let label_chars: Vec<char> = label.chars().collect();
+    let label_start = (total_bar.saturating_sub(label_chars.len() as u16)) / 2;
 
-            if c >= label_start && (c - label_start) < label_chars.len() as u16 {
-                let ch = label_chars[(c - label_start) as usize];
-                if is_filled {
-                    frame.buffer_mut()[(col, row)].set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Rgb(0, 0, 0))
-                            .bg(bar_color)
-                            .bold(),
-                    );
-                } else {
-                    frame.buffer_mut()[(col, row)].set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Rgb(170, 170, 170))
-                            .bg(Color::Rgb(30, 30, 30)),
-                    );
-                }
-            } else if is_filled {
-                frame.buffer_mut()[(col, row)]
-                    .set_char('█')
-                    .set_style(Style::default().fg(bar_color));
+    for c in 0..total_bar {
+        let col = inner.x + c;
+        let row = inner.y;
+        let p = (c as f64 + 0.5) / (total_bar as f64) * 100.0;
+        let is_filled = c < filled_len;
+        let bar_color = gradient_color(p);
+
+        if c >= label_start && (c - label_start) < label_chars.len() as u16 {
+            let ch = label_chars[(c - label_start) as usize];
+            if is_filled {
+                buf[(col, row)].set_char(ch).set_style(
+                    Style::default()
+                        .fg(Color::Rgb(0, 0, 0))
+                        .bg(bar_color)
+                        .bold(),
+                );
             } else {
-                frame.buffer_mut()[(col, row)]
-                    .set_char(' ')
-                    .set_style(Style::default().bg(Color::Rgb(30, 30, 30)));
+                buf[(col, row)].set_char(ch).set_style(
+                    Style::default()
+                        .fg(Color::Rgb(170, 170, 170))
+                        .bg(Color::Rgb(30, 30, 30)),
+                );
             }
+        } else if is_filled {
+            buf[(col, row)]
+                .set_char('█')
+                .set_style(Style::default().fg(bar_color));
+        } else {
+            buf[(col, row)]
+                .set_char(' ')
+                .set_style(Style::default().bg(Color::Rgb(30, 30, 30)));
         }
     }
 }
 
-/// Renders the GPU (Tab 4) utilization graph, VRAM graph, core/memory clocks, and temperatures.
+/// Renders the GPU (Tab 4) utilization graph, VRAM graph, core/memory clocks, power, fans, and temperatures.
 ///
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
@@ -936,13 +922,18 @@ pub fn render_gpu_tab(
 ) {
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     let top_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(9)])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(body_chunks[0]);
+
+    let graph_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(top_chunks[0]);
 
     let vram_gb = ((gpu_metrics.vram_total_mb as f64) / 1024.0).round() as u64;
     let gpu_label = if vram_gb > 0 {
@@ -963,87 +954,27 @@ pub fn render_gpu_tab(
 
     render_gradient_chart(
         frame,
-        top_chunks[0],
-        "GPU Utilization History",
+        graph_chunks[0],
+        "GPU Utilization",
         Some((&gpu_freq_label, gpu_freq_color)),
         Some(&gpu_label),
         Color::Rgb(60, 60, 60),
         gpu_history,
     );
 
-    let temp_block = Block::default()
-        .title(" Temp ".fg(Color::Rgb(170, 170, 170)))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let temp_inner = temp_block.inner(top_chunks[1]);
-    frame.render_widget(temp_block, top_chunks[1]);
-
-    if temp_inner.height > 0 && temp_inner.width > 0 {
-        let temp_pct = ((gpu_metrics.temp_c as f64 - 25.0) / 75.0 * 100.0).clamp(0.0, 100.0);
-        let temp_color = gradient_color(temp_pct);
-
-        let temp_str = format!("{}°C", gpu_metrics.temp_c);
-        let str_len = temp_str.chars().count() as u16;
-        let str_start = temp_inner.x + (temp_inner.width.saturating_sub(str_len)) / 2;
-
-        for (idx, ch) in temp_str.chars().enumerate() {
-            let col = str_start + idx as u16;
-            if col < temp_inner.right() {
-                frame.buffer_mut()[(col, temp_inner.y)]
-                    .set_char(ch)
-                    .set_style(Style::default().fg(temp_color).bold());
-            }
-        }
-
-        if temp_inner.height > 2 {
-            let bar_height = temp_inner.height - 2;
-            let filled_rows = ((bar_height as f64) * (temp_pct / 100.0)).round() as u16;
-            let bar_width = 3.min(temp_inner.width);
-            let bar_x_start = temp_inner.x + (temp_inner.width.saturating_sub(bar_width)) / 2;
-
-            for r in 0..bar_height {
-                let row_y = temp_inner.bottom() - 1 - r;
-                let row_pct = (r as f64 + 0.5) / (bar_height as f64) * 100.0;
-                let is_filled = r < filled_rows;
-                let color = gradient_color(row_pct);
-
-                for c in 0..bar_width {
-                    let col = bar_x_start + c;
-                    if col < temp_inner.right() && row_y < temp_inner.bottom() {
-                        if is_filled {
-                            frame.buffer_mut()[(col, row_y)]
-                                .set_char('█')
-                                .set_style(Style::default().fg(color));
-                        } else {
-                            frame.buffer_mut()[(col, row_y)]
-                                .set_char('░')
-                                .set_style(Style::default().fg(Color::Rgb(50, 50, 50)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let vram_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(body_chunks[1]);
-
-    let vram_pct = if gpu_metrics.vram_total_mb > 0 {
-        (gpu_metrics.vram_used_mb as f64 / gpu_metrics.vram_total_mb as f64) * 100.0
-    } else {
-        0.0
-    };
-
     let vram_label = format!(
         "{} MB / {} MB",
         gpu_metrics.vram_used_mb, gpu_metrics.vram_total_mb
     );
+    let mem_vendor_label = if !gpu_metrics.memory_vendor.is_empty() {
+        format!("{} VRAM", gpu_metrics.memory_vendor)
+    } else {
+        "VRAM".to_string()
+    };
+
     render_gradient_chart(
         frame,
-        vram_layout[0],
+        graph_chunks[1],
         "VRAM History",
         None,
         Some(&vram_label),
@@ -1051,56 +982,191 @@ pub fn render_gpu_tab(
         gpu_vram_history,
     );
 
-    let vram_block = Block::default()
-        .title(" VRAM Usage ".fg(Color::Rgb(170, 170, 170)))
+    // Top Right: Hardware & Telemetry card
+    let hw_block = Block::default()
+        .title(" Hardware & Telemetry ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let vram_inner = vram_block.inner(vram_layout[1]);
-    frame.render_widget(vram_block, vram_layout[1]);
+    let hw_inner = hw_block.inner(top_chunks[1]);
+    frame.render_widget(hw_block, top_chunks[1]);
 
-    if vram_inner.height > 0 && vram_inner.width > 0 {
-        let total_bar = vram_inner.width;
-        let filled_len = ((total_bar as f64) * (vram_pct.clamp(0.0, 100.0) / 100.0)).round() as u16;
-        let label = format!(
-            "{} MB / {} MB",
-            gpu_metrics.vram_used_mb, gpu_metrics.vram_total_mb
-        );
-        let label_chars: Vec<char> = label.chars().collect();
-        let label_start = (total_bar.saturating_sub(label_chars.len() as u16)) / 2;
+    if hw_inner.height > 0 && hw_inner.width > 0 {
+        let mut lines = Vec::new();
+        lines.push(format!("Model:    {}", gpu_metrics.name));
+        if !gpu_metrics.driver.is_empty() {
+            lines.push(format!("Driver:   {}", gpu_metrics.driver));
+        }
+        if !gpu_metrics.pcie_link.is_empty() {
+            lines.push(format!("PCIe Bus: {}", gpu_metrics.pcie_link));
+        }
+        if gpu_metrics.cur_mhz > 0.0 || gpu_metrics.mem_cur_mhz > 0.0 {
+            lines.push(format!(
+                "Clocks:   Core: {:.0} MHz | Mem: {:.0} MHz",
+                gpu_metrics.cur_mhz, gpu_metrics.mem_cur_mhz
+            ));
+        }
+        if gpu_metrics.voltage_mv > 0 {
+            lines.push(format!(
+                "Voltage:  {} mV ({:.2} V)",
+                gpu_metrics.voltage_mv,
+                gpu_metrics.voltage_mv as f64 / 1000.0
+            ));
+        }
 
-        for c in 0..total_bar {
-            let col = vram_inner.x + c;
-            let row = vram_inner.y;
-            let pct = (c as f64 + 0.5) / (total_bar as f64) * 100.0;
-            let is_filled = c < filled_len;
-            let bar_color = gradient_color(pct);
-
-            if c >= label_start && (c - label_start) < label_chars.len() as u16 {
-                let ch = label_chars[(c - label_start) as usize];
-                if is_filled {
-                    frame.buffer_mut()[(col, row)].set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Rgb(0, 0, 0))
-                            .bg(bar_color)
-                            .bold(),
-                    );
-                } else {
-                    frame.buffer_mut()[(col, row)].set_char(ch).set_style(
-                        Style::default()
-                            .fg(Color::Rgb(170, 170, 170))
-                            .bg(Color::Rgb(30, 30, 30)),
-                    );
+        for (idx, line_str) in lines.iter().enumerate() {
+            let row = hw_inner.y + idx as u16;
+            if row < hw_inner.bottom() {
+                for (c_idx, ch) in line_str.chars().enumerate() {
+                    let col = hw_inner.x + c_idx as u16;
+                    if col < hw_inner.right() {
+                        let color = if idx == 0 {
+                            Color::Rgb(220, 220, 220)
+                        } else {
+                            Color::Rgb(170, 170, 170)
+                        };
+                        frame.buffer_mut()[(col, row)]
+                            .set_char(ch)
+                            .set_style(Style::default().fg(color));
+                    }
                 }
-            } else if is_filled {
-                frame.buffer_mut()[(col, row)]
-                    .set_char('█')
-                    .set_style(Style::default().fg(bar_color));
-            } else {
-                frame.buffer_mut()[(col, row)]
-                    .set_char(' ')
-                    .set_style(Style::default().bg(Color::Rgb(30, 30, 30)));
             }
+        }
+    }
+
+    // Bottom chunks: Left (Memory Gauges), Right (Thermals & Power Gauges)
+    let bot_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(body_chunks[1]);
+
+    // Bottom Left: Dedicated VRAM + GTT System RAM
+    let mem_constraints = if gpu_metrics.gtt_total_mb > 0 {
+        vec![Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)]
+    } else {
+        vec![Constraint::Length(3), Constraint::Min(0)]
+    };
+    let mem_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(mem_constraints)
+        .split(bot_chunks[0]);
+
+    // VRAM Bar
+    let vram_pct = if gpu_metrics.vram_total_mb > 0 {
+        (gpu_metrics.vram_used_mb as f64 / gpu_metrics.vram_total_mb as f64) * 100.0
+    } else {
+        0.0
+    };
+    let vram_title = if !mem_vendor_label.is_empty() {
+        format!(" Dedicated VRAM ({}) ", mem_vendor_label)
+    } else {
+        " Dedicated VRAM ".to_string()
+    };
+    let vram_block = Block::default()
+        .title(vram_title.fg(Color::Rgb(170, 170, 170)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+    let vram_inner = vram_block.inner(mem_layout[0]);
+    frame.render_widget(vram_block, mem_layout[0]);
+    if vram_inner.height > 0 && vram_inner.width > 0 {
+        draw_centered_gradient_bar(
+            frame.buffer_mut(),
+            vram_inner,
+            &format!("{} MB / {} MB ({:.0}%)", gpu_metrics.vram_used_mb, gpu_metrics.vram_total_mb, vram_pct),
+            vram_pct,
+        );
+    }
+
+    // GTT Shared Bar
+    if gpu_metrics.gtt_total_mb > 0 && mem_layout.len() > 1 {
+        let gtt_pct = (gpu_metrics.gtt_used_mb as f64 / gpu_metrics.gtt_total_mb as f64) * 100.0;
+        let gtt_block = Block::default()
+            .title(" Shared System RAM (GTT) ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let gtt_inner = gtt_block.inner(mem_layout[1]);
+        frame.render_widget(gtt_block, mem_layout[1]);
+        if gtt_inner.height > 0 && gtt_inner.width > 0 {
+            draw_centered_gradient_bar(
+                frame.buffer_mut(),
+                gtt_inner,
+                &format!("{} MB / {} MB ({:.0}%)", gpu_metrics.gtt_used_mb, gpu_metrics.gtt_total_mb, gtt_pct),
+                gtt_pct,
+            );
+        }
+    }
+
+    // Bottom Right: Thermal Sensors & Power / Fan Bars
+    let thermal_block = Block::default()
+        .title(" Thermal & Power Sensors ".fg(Color::Rgb(170, 170, 170)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+    let thermal_inner = thermal_block.inner(bot_chunks[1]);
+    frame.render_widget(thermal_block, bot_chunks[1]);
+
+    if thermal_inner.height > 0 && thermal_inner.width > 0 {
+        let mut row_idx = 0;
+        if gpu_metrics.temp_edge_c > 0 {
+            let pct = ((gpu_metrics.temp_edge_c as f64 - 25.0) / 75.0 * 100.0).clamp(0.0, 100.0);
+            draw_labeled_bar(
+                frame.buffer_mut(),
+                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                "Edge Temp:    ",
+                &format!("{}°C", gpu_metrics.temp_edge_c),
+                pct,
+            );
+            row_idx += 1;
+        }
+        if gpu_metrics.temp_junction_c > 0 && thermal_inner.y + row_idx < thermal_inner.bottom() {
+            let pct = ((gpu_metrics.temp_junction_c as f64 - 25.0) / 85.0 * 100.0).clamp(0.0, 100.0);
+            draw_labeled_bar(
+                frame.buffer_mut(),
+                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                "Hotspot Temp: ",
+                &format!("{}°C", gpu_metrics.temp_junction_c),
+                pct,
+            );
+            row_idx += 1;
+        }
+        if gpu_metrics.temp_mem_c > 0 && thermal_inner.y + row_idx < thermal_inner.bottom() {
+            let pct = ((gpu_metrics.temp_mem_c as f64 - 25.0) / 80.0 * 100.0).clamp(0.0, 100.0);
+            draw_labeled_bar(
+                frame.buffer_mut(),
+                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                "Memory Temp:  ",
+                &format!("{}°C", gpu_metrics.temp_mem_c),
+                pct,
+            );
+            row_idx += 1;
+        }
+        if (gpu_metrics.power_w > 0.0 || gpu_metrics.power_cap_w > 0.0) && thermal_inner.y + row_idx < thermal_inner.bottom() {
+            let cap = if gpu_metrics.power_cap_w > 0.0 { gpu_metrics.power_cap_w } else { 200.0 };
+            let pct = (gpu_metrics.power_w / cap * 100.0).clamp(0.0, 100.0);
+            draw_labeled_bar(
+                frame.buffer_mut(),
+                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                "Power Draw:   ",
+                &format!("{:.1} W / {:.1} W", gpu_metrics.power_w, gpu_metrics.power_cap_w),
+                pct,
+            );
+            row_idx += 1;
+        }
+        if thermal_inner.y + row_idx < thermal_inner.bottom() {
+            let fan_label = if gpu_metrics.fan_rpm > 0 {
+                format!("{} RPM ({:.0}%)", gpu_metrics.fan_rpm, gpu_metrics.fan_pct)
+            } else {
+                "0 RPM (0%)".to_string()
+            };
+            draw_labeled_bar(
+                frame.buffer_mut(),
+                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                "Fan Speed:    ",
+                &fan_label,
+                gpu_metrics.fan_pct as f64,
+            );
         }
     }
 }
@@ -1432,6 +1498,66 @@ pub fn render_network_tab(
     }
 }
 
+/// Returns true if either the physical disks box or mounted filesystems box overflows in standard 2x2 grid mode.
+///
+/// # Arguments
+/// * `area` - Target bounding box for the tab.
+/// * `disk_io` - Aggregate and per-disk I/O metrics.
+/// * `disk_mounts` - List of mounted partition usage statistics.
+pub fn is_disks_overflow(area: Rect, disk_io: &DiskIoInfo, disk_mounts: &[MountInfo]) -> bool {
+    let top_right_h = (area.height / 2).saturating_sub(2) as usize;
+    let top_right_w = ((area.width * 30) / 100).saturating_sub(2) as usize;
+    let bot_right_h = (area.height.saturating_sub(area.height / 2)).saturating_sub(2) as usize;
+    let bot_right_w = top_right_w;
+
+    let physical_disks_lines = 6 + disk_io.disks.len() * 2;
+    let mut physical_disks_overflow = physical_disks_lines > top_right_h || top_right_w < 10;
+    if !physical_disks_overflow {
+        let r_line = format!("Read:     {} ↑/s", format_bytes_dyn(disk_io.read_speed));
+        let w_line = format!("Write:    {} ↓/s", format_bytes_dyn(disk_io.write_speed));
+        let tr_line = format!(
+            "Total R:  {}",
+            format_bytes_dyn(disk_io.total_read_bytes as f64)
+        );
+        let tw_line = format!(
+            "Total W:  {}",
+            format_bytes_dyn(disk_io.total_write_bytes as f64)
+        );
+        if r_line.chars().count() > top_right_w
+            || w_line.chars().count() > top_right_w
+            || tr_line.chars().count() > top_right_w
+            || tw_line.chars().count() > top_right_w
+        {
+            physical_disks_overflow = true;
+        } else {
+            for d in &disk_io.disks {
+                let drive_line = format!("• {}: {}", d.name, d.model);
+                let speed_line = format!(
+                    "  {} ↑ / {} ↓",
+                    format_bytes_dyn(d.read_speed),
+                    format_bytes_dyn(d.write_speed)
+                );
+                if drive_line.chars().count() > top_right_w
+                    || speed_line.chars().count() > top_right_w
+                {
+                    physical_disks_overflow = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut mount_rows_needed = 0;
+    for m in disk_mounts {
+        let header = format!("{} [{}] ({})", m.mount_point, m.device, m.fs_type);
+        let h_lines = wrap_text(&header, bot_right_w.max(1));
+        mount_rows_needed += h_lines.len() + 2;
+    }
+    let mounts_overflow = mount_rows_needed > bot_right_h || bot_right_w < 10;
+
+    physical_disks_overflow || mounts_overflow
+}
+
 /// Renders the Disks & Storage (Tab 6) read/write throughput graphs, physical drives, package storage categories, and partition usage bars.
 ///
 /// # Arguments
@@ -1444,6 +1570,7 @@ pub fn render_network_tab(
 /// * `storage_categories` - Detected package and runtime storage categories.
 /// * `active_cat_idx` - Selected sub-tab category index.
 /// * `scroll_offset` - Vertical scroll offset within the active category's item list.
+/// * `box_tab` - Selected box index when in tabbed view (0: Graphs, 1: Physical Disks, 2: Storage, 3: Mounted Filesystems).
 #[allow(clippy::too_many_arguments)]
 pub fn render_disks_tab(
     frame: &mut Frame,
@@ -1455,58 +1582,175 @@ pub fn render_disks_tab(
     storage_categories: &[PackageStorageCategory],
     active_cat_idx: usize,
     scroll_offset: usize,
+    box_tab: usize,
 ) {
-    let body_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
 
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(body_chunks[0]);
+    let is_tabbed = is_disks_overflow(area, disk_io, disk_mounts);
 
-    // Fit both graphs in the space of the top-left area
-    let graph_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(top_chunks[0]);
+    if is_tabbed {
+        let sub_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
 
-    let bottom_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-        .split(body_chunks[1]);
+        let titles = vec![
+            "Graphs (a)",
+            "Physical Disks (s)",
+            "Storage (d)",
+            "Mounted Filesystems (f)",
+        ];
+        let tabs = Tabs::new(titles)
+            .style(Style::default().fg(Color::Rgb(170, 170, 170)))
+            .select(box_tab % 4)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Plain)
+                    .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                    .title(" Disk View (a/s/d/f switch box) ".fg(Color::Rgb(170, 170, 170))),
+            )
+            .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold())
+            .divider("|");
 
-    let disk_read_label = format!("{} ↑/s", format_bytes_dyn(disk_io.read_speed));
-    let disk_write_label = format!("{} ↓/s", format_bytes_dyn(disk_io.write_speed));
+        frame.render_widget(tabs, sub_chunks[0]);
 
-    render_gradient_chart(
-        frame,
-        graph_chunks[0],
-        "Disk Read (↑) History",
-        None,
-        Some(&disk_read_label),
-        Color::Rgb(60, 60, 60),
-        disk_read_history,
-    );
+        let body = sub_chunks[1];
+        match box_tab % 4 {
+            0 => {
+                let disk_read_label = format!("{} ↑/s", format_bytes_dyn(disk_io.read_speed));
+                let disk_write_label = format!("{} ↓/s", format_bytes_dyn(disk_io.write_speed));
+                if body.width >= 70 {
+                    let graph_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(body);
+                    render_gradient_chart(
+                        frame,
+                        graph_chunks[0],
+                        "Disk Read (↑) History",
+                        None,
+                        Some(&disk_read_label),
+                        Color::Rgb(60, 60, 60),
+                        disk_read_history,
+                    );
+                    render_gradient_chart(
+                        frame,
+                        graph_chunks[1],
+                        "Disk Write (↓) History",
+                        None,
+                        Some(&disk_write_label),
+                        Color::Rgb(60, 60, 60),
+                        disk_write_history,
+                    );
+                } else {
+                    let graph_chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                        .split(body);
+                    render_gradient_chart(
+                        frame,
+                        graph_chunks[0],
+                        "Disk Read (↑) History",
+                        None,
+                        Some(&disk_read_label),
+                        Color::Rgb(60, 60, 60),
+                        disk_read_history,
+                    );
+                    render_gradient_chart(
+                        frame,
+                        graph_chunks[1],
+                        "Disk Write (↓) History",
+                        None,
+                        Some(&disk_write_label),
+                        Color::Rgb(60, 60, 60),
+                        disk_write_history,
+                    );
+                }
+            }
+            1 => {
+                render_physical_disks_card(frame, body, disk_io);
+            }
+            2 => {
+                render_package_storage_card(
+                    frame,
+                    body,
+                    storage_categories,
+                    active_cat_idx,
+                    scroll_offset,
+                );
+            }
+            _ => {
+                render_mounted_filesystems_card(frame, body, disk_mounts);
+            }
+        }
+    } else {
+        let body_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
 
-    render_gradient_chart(
-        frame,
-        graph_chunks[1],
-        "Disk Write (↓) History",
-        None,
-        Some(&disk_write_label),
-        Color::Rgb(60, 60, 60),
-        disk_write_history,
-    );
+        let top_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(body_chunks[0]);
 
+        let graph_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(top_chunks[0]);
+
+        let bottom_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(body_chunks[1]);
+
+        let disk_read_label = format!("{} ↑/s", format_bytes_dyn(disk_io.read_speed));
+        let disk_write_label = format!("{} ↓/s", format_bytes_dyn(disk_io.write_speed));
+
+        render_gradient_chart(
+            frame,
+            graph_chunks[0],
+            "Disk Read (↑) History",
+            None,
+            Some(&disk_read_label),
+            Color::Rgb(60, 60, 60),
+            disk_read_history,
+        );
+
+        render_gradient_chart(
+            frame,
+            graph_chunks[1],
+            "Disk Write (↓) History",
+            None,
+            Some(&disk_write_label),
+            Color::Rgb(60, 60, 60),
+            disk_write_history,
+        );
+
+        render_physical_disks_card(frame, top_chunks[1], disk_io);
+        render_package_storage_card(
+            frame,
+            bottom_chunks[0],
+            storage_categories,
+            active_cat_idx,
+            scroll_offset,
+        );
+        render_mounted_filesystems_card(frame, bottom_chunks[1], disk_mounts);
+    }
+}
+
+/// Renders the Physical Disks block displaying read/write speeds, totals, and per-drive metrics.
+fn render_physical_disks_card(frame: &mut Frame, area: Rect, disk_io: &DiskIoInfo) {
     let disks_block = Block::default()
         .title(" Physical Disks ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let disks_inner = disks_block.inner(top_chunks[1]);
-    frame.render_widget(disks_block, top_chunks[1]);
+    let disks_inner = disks_block.inner(area);
+    frame.render_widget(disks_block, area);
 
     if disks_inner.height > 0 && disks_inner.width > 0 {
         let mut lines = vec![
@@ -1576,8 +1820,16 @@ pub fn render_disks_tab(
             }
         }
     }
+}
 
-    // Bottom-Left: Package & Application Storage Sub-Tabs
+/// Renders the Package & Application Storage block displaying detected storage categories.
+fn render_package_storage_card(
+    frame: &mut Frame,
+    area: Rect,
+    storage_categories: &[PackageStorageCategory],
+    active_cat_idx: usize,
+    scroll_offset: usize,
+) {
     let card_title = if storage_categories.is_empty() {
         " Storage ".to_string()
     } else {
@@ -1589,8 +1841,8 @@ pub fn render_disks_tab(
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let pkg_inner = pkg_block.inner(bottom_chunks[0]);
-    frame.render_widget(pkg_block, bottom_chunks[0]);
+    let pkg_inner = pkg_block.inner(area);
+    frame.render_widget(pkg_block, area);
 
     if pkg_inner.height > 0 && pkg_inner.width > 0 {
         if storage_categories.is_empty() {
@@ -1620,8 +1872,10 @@ pub fn render_disks_tab(
             let total_items = active_cat.items.len();
             let start_idx = scroll_offset.min(total_items.saturating_sub(1));
 
-            // 1. Render Sub-Tabs Header Line
-            let mut tab_col = pkg_inner.x;
+            // 1. Render Sub-Tabs Header Line (wrapping to 2 rows if overflowing)
+            let mut subtab_rows = 1;
+            let mut cur_row: u16 = 0;
+            let mut cur_col = pkg_inner.x;
             for (i, cat) in storage_categories.iter().enumerate() {
                 let is_active = i == cat_idx;
                 let tab_label = if is_active {
@@ -1629,6 +1883,14 @@ pub fn render_disks_tab(
                 } else {
                     format!("[ {} ({}) ] ", cat.name, cat.total_str)
                 };
+                let tab_len = tab_label.chars().count() as u16;
+
+                // Wrap to next row if overflowing first row
+                if cur_row == 0 && cur_col > pkg_inner.x && (cur_col + tab_len) > pkg_inner.right() {
+                    cur_row = 1;
+                    cur_col = pkg_inner.x;
+                    subtab_rows = 2;
+                }
 
                 let style = if is_active {
                     Style::default()
@@ -1639,18 +1901,22 @@ pub fn render_disks_tab(
                     Style::default().fg(Color::Rgb(130, 130, 130))
                 };
 
-                for ch in tab_label.chars() {
-                    if tab_col < pkg_inner.right() {
-                        frame.buffer_mut()[(tab_col, pkg_inner.y)]
-                            .set_char(ch)
-                            .set_style(style);
-                        tab_col += 1;
+                let target_y = pkg_inner.y + cur_row;
+                if target_y < pkg_inner.bottom() {
+                    for ch in tab_label.chars() {
+                        if cur_col < pkg_inner.right() {
+                            frame.buffer_mut()[(cur_col, target_y)]
+                                .set_char(ch)
+                                .set_style(style);
+                            cur_col += 1;
+                        }
                     }
                 }
             }
 
             // 2. Items list with scroll offset (clean 1-line text with size)
-            for (row_offset, item) in (2..).zip(active_cat.items.iter().skip(start_idx)) {
+            let start_row_offset = subtab_rows + 1;
+            for (row_offset, item) in (start_row_offset..).zip(active_cat.items.iter().skip(start_idx)) {
                 if row_offset >= pkg_inner.height {
                     break;
                 }
@@ -1703,41 +1969,49 @@ pub fn render_disks_tab(
             }
         }
     }
+}
 
-    // Bottom-Right: Mounted Filesystems
+/// Renders the Mounted Filesystems block displaying mounted partition progress bars and statistics.
+fn render_mounted_filesystems_card(frame: &mut Frame, area: Rect, disk_mounts: &[MountInfo]) {
     let mounts_block = Block::default()
         .title(" Mounted Filesystems ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let mounts_inner = mounts_block.inner(bottom_chunks[1]);
-    frame.render_widget(mounts_block, bottom_chunks[1]);
+    let mounts_inner = mounts_block.inner(area);
+    frame.render_widget(mounts_block, area);
 
     if mounts_inner.height > 0 && mounts_inner.width > 0 {
         let mut row_offset = 0;
+        let width = mounts_inner.width as usize;
         for m in disk_mounts {
-            if row_offset + 2 > mounts_inner.height {
+            let header = format!("{} [{}] ({})", m.mount_point, m.device, m.fs_type);
+            let header_lines = wrap_text(&header, width);
+
+            if row_offset + header_lines.len() as u16 + 1 > mounts_inner.height {
                 break;
             }
-            let header = format!("{} [{}] ({})", m.mount_point, m.device, m.fs_type);
             let sub = format!(
                 "{} / {} (Free: {})",
                 format_bytes_dyn(m.used_bytes as f64),
                 format_bytes_dyn(m.total_bytes as f64),
                 format_bytes_dyn(m.free_bytes as f64)
             );
-            let row1 = mounts_inner.y + row_offset;
-            let row2 = row1 + 1;
 
-            for (c_idx, ch) in header.chars().enumerate() {
-                let col = mounts_inner.x + c_idx as u16;
-                if col < mounts_inner.right() {
-                    frame.buffer_mut()[(col, row1)]
-                        .set_char(ch)
-                        .set_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold());
+            for h_line in &header_lines {
+                let row = mounts_inner.y + row_offset;
+                for (c_idx, ch) in h_line.chars().enumerate() {
+                    let col = mounts_inner.x + c_idx as u16;
+                    if col < mounts_inner.right() {
+                        frame.buffer_mut()[(col, row)]
+                            .set_char(ch)
+                            .set_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold());
+                    }
                 }
+                row_offset += 1;
             }
 
+            let row_bar = mounts_inner.y + row_offset;
             let total_bar = mounts_inner.width;
             let filled_len =
                 ((total_bar as f64) * (m.used_pct.clamp(0.0, 100.0) / 100.0)).round() as u16;
@@ -1749,23 +2023,23 @@ pub fn render_disks_tab(
                 let pct = (c as f64 + 0.5) / (total_bar as f64) * 100.0;
                 if c < filled_len {
                     let color = gradient_color(pct);
-                    frame.buffer_mut()[(col, row2)]
+                    frame.buffer_mut()[(col, row_bar)]
                         .set_char('━')
                         .set_style(Style::default().fg(color));
                 } else {
-                    frame.buffer_mut()[(col, row2)]
+                    frame.buffer_mut()[(col, row_bar)]
                         .set_char('─')
                         .set_style(Style::default().fg(Color::Rgb(50, 50, 50)));
                 }
             }
+            row_offset += 1;
 
-            row_offset += 2;
             if row_offset < mounts_inner.height {
-                let row3 = mounts_inner.y + row_offset;
+                let row_sub = mounts_inner.y + row_offset;
                 for (c_idx, ch) in sub.chars().enumerate() {
                     let col = mounts_inner.x + c_idx as u16;
                     if col < mounts_inner.right() {
-                        frame.buffer_mut()[(col, row3)]
+                        frame.buffer_mut()[(col, row_sub)]
                             .set_char(ch)
                             .set_style(Style::default().fg(Color::Rgb(140, 140, 140)));
                     }
@@ -1985,14 +2259,17 @@ pub fn format_system_overview_copy_text(
 /// * `area` - Target bounding box for the overview card.
 /// * `sys_info` - Host system overview metadata.
 /// * `cpu_model` - Marketing CPU model identifier string.
+/// * `num_cores` - Count of logical CPU cores.
 /// * `ram_info` - DMI memory capacity, speed, and DDR generation string.
 /// * `gpu` - GPU metrics.
 /// * `copied` - Whether the overview copy button feedback is currently active.
+#[allow(clippy::too_many_arguments)]
 fn render_general_overview_card(
     frame: &mut Frame,
     area: Rect,
     sys_info: &SystemGeneralInfo,
     cpu_model: &str,
+    num_cores: usize,
     ram_info: &str,
     gpu: &GpuMetrics,
     copied: bool,
@@ -2097,15 +2374,27 @@ fn render_general_overview_card(
             }
         }
 
+        let is_kernel_outdated = !is_lts_or_latest_kernel(&sys_info.kernel);
+        let is_ram_low = is_ram_under_8gb(ram_info);
+        let is_cpu_low = num_cores < 4;
+
         for (idx, line) in lines.iter().enumerate() {
             let row = sys_inner.y + idx as u16;
             if row < sys_inner.bottom() {
                 let label_end = line.find(':').map(|p| p + 1).unwrap_or(0);
+                let is_kernel_line = line.starts_with("Kernel:");
+                let is_ram_line = line.starts_with("RAM:");
+                let is_cpu_line = line.starts_with("CPU:");
                 for (c_idx, ch) in line.chars().enumerate() {
                     let col = sys_inner.x + c_idx as u16;
                     if col < sys_inner.right() {
                         let color = if c_idx < label_end {
                             Color::Rgb(220, 220, 220)
+                        } else if (is_kernel_line && is_kernel_outdated)
+                            || (is_ram_line && is_ram_low)
+                            || (is_cpu_line && is_cpu_low)
+                        {
+                            Color::Rgb(255, 220, 0)
                         } else {
                             Color::Rgb(180, 180, 180)
                         };
@@ -3021,14 +3310,14 @@ pub fn render_general_tab(
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .split(body);
-                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, ram_info, gpu, copied);
+                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied);
                     render_general_battery_card(frame, chunks[1], battery);
                 } else {
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([Constraint::Min(0), Constraint::Length(6)])
                         .split(body);
-                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, ram_info, gpu, copied);
+                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied);
                     render_general_battery_card(frame, chunks[1], battery);
                 }
             }
@@ -3116,7 +3405,7 @@ pub fn render_general_tab(
             ])
             .split(columns[0]);
 
-        render_general_overview_card(frame, left_chunks[0], sys_info, cpu_model, ram_info, gpu, copied);
+        render_general_overview_card(frame, left_chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied);
         render_general_cpu_card(
             frame,
             left_chunks[1],
@@ -3248,4 +3537,56 @@ pub fn render_kill_confirmation_modal(
     );
 
     (yes_rect, no_rect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::system::DiskDeviceInfo;
+
+    #[test]
+    fn test_is_disks_overflow() {
+        let area_small = Rect::new(0, 0, 80, 20);
+        let area_large = Rect::new(0, 0, 160, 50);
+
+        let disk_io = DiskIoInfo {
+            read_speed: 1024.0,
+            write_speed: 2048.0,
+            total_read_bytes: 100000,
+            total_write_bytes: 200000,
+            disks: vec![DiskDeviceInfo {
+                name: "nvme0n1".to_string(),
+                model: "Samsung SSD 980 PRO 1TB".to_string(),
+                read_speed: 1024.0,
+                write_speed: 2048.0,
+            }],
+        };
+
+        let mounts = vec![
+            MountInfo {
+                mount_point: "/".to_string(),
+                device: "/dev/nvme0n1p2".to_string(),
+                fs_type: "ext4".to_string(),
+                total_bytes: 500_000_000_000,
+                used_bytes: 200_000_000_000,
+                free_bytes: 300_000_000_000,
+                used_pct: 40.0,
+            },
+            MountInfo {
+                mount_point: "/home".to_string(),
+                device: "/dev/nvme0n1p3".to_string(),
+                fs_type: "ext4".to_string(),
+                total_bytes: 500_000_000_000,
+                used_bytes: 200_000_000_000,
+                free_bytes: 300_000_000_000,
+                used_pct: 40.0,
+            },
+        ];
+
+        // On small area (width 80 -> top_right_w is 22 cols, disk model is 34 chars), it should overflow
+        assert!(is_disks_overflow(area_small, &disk_io, &mounts));
+
+        // On large area (width 160, height 50), it fits comfortably without overflow
+        assert!(!is_disks_overflow(area_large, &disk_io, &mounts));
+    }
 }
