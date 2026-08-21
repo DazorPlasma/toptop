@@ -20,11 +20,11 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     wrapProgram $out/bin/toptop \
-      --prefix PATH : ${lib.makeBinPath [ dust ]}
+      --prefix PATH : ${lib.makeBinPath [dust]}
   '';
 
   meta = with lib; {
-    description = "A fast, lightweight, and modern terminal system monitor";
+    description = "modern CLI system monitor";
     homepage = "https://github.com/DazorPlasma/toptop";
     license = licenses.gpl3Plus;
     maintainers = [];

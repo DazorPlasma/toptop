@@ -130,13 +130,15 @@ pub struct MemoryMetrics {
     pub total_mem_mb: u64,
     /// Used physical RAM in megabytes.
     pub used_mem_mb: u64,
+    /// Cached memory and buffers in megabytes.
+    pub cached_mem_mb: u64,
     /// Total swap space in megabytes.
     pub total_swap_mb: u64,
     /// Used swap space in megabytes.
     pub used_swap_mb: u64,
 }
 
-/// Reads `/proc/meminfo` to calculate used/total physical memory and swap metrics.
+/// Reads `/proc/meminfo` to calculate used/total physical memory, cached memory, and swap metrics.
 ///
 /// # Arguments
 /// * `buf` - Scratch buffer used to read `/proc/meminfo`.
@@ -146,6 +148,9 @@ pub struct MemoryMetrics {
 pub fn read_memory(buf: &mut String) -> MemoryMetrics {
     let mut total = 0;
     let mut available = 0;
+    let mut cached = 0;
+    let mut buffers = 0;
+    let mut sreclaimable = 0;
     let mut swap_total = 0;
     let mut swap_free = 0;
     buf.clear();
@@ -162,6 +167,27 @@ pub fn read_memory(buf: &mut String) -> MemoryMetrics {
                     .unwrap_or(0);
             } else if line.starts_with("MemAvailable:") {
                 available = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+            } else if line.starts_with("Cached:") {
+                cached = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+            } else if line.starts_with("Buffers:") {
+                buffers = line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+            } else if line.starts_with("SReclaimable:") {
+                sreclaimable = line
                     .split_whitespace()
                     .nth(1)
                     .unwrap_or("0")
@@ -187,6 +213,7 @@ pub fn read_memory(buf: &mut String) -> MemoryMetrics {
     MemoryMetrics {
         total_mem_mb: total / 1024,
         used_mem_mb: total.saturating_sub(available) / 1024,
+        cached_mem_mb: (cached + buffers + sreclaimable) / 1024,
         total_swap_mb: swap_total / 1024,
         used_swap_mb: swap_total.saturating_sub(swap_free) / 1024,
     }
@@ -209,6 +236,89 @@ pub struct BatteryInfo {
     pub power_w: Option<f64>,
     /// Reported battery health state (e.g. `Good`).
     pub health: String,
+    /// Current power plan / profile (e.g. `Performance`, `Balanced`, `Power Saver`).
+    pub power_plan: Option<String>,
+}
+
+/// Formats a raw Linux power profile or governor name into human-readable title case.
+pub fn format_power_plan(raw: &str) -> String {
+    let s = raw.trim().to_lowercase().replace('_', "-");
+    match s.as_str() {
+        "performance" => "Performance".to_string(),
+        "balanced" => "Balanced".to_string(),
+        "balanced-performance" | "balance-performance" => "Balanced Performance".to_string(),
+        "balanced-power" | "balance-power" => "Balanced Power".to_string(),
+        "power-saver" | "powersave" | "power" | "low-power" => "Power Saver".to_string(),
+        "quiet" => "Quiet".to_string(),
+        "cool" => "Cool".to_string(),
+        "schedutil" => "Schedutil".to_string(),
+        "ondemand" => "Ondemand".to_string(),
+        "conservative" => "Conservative".to_string(),
+        "userspace" => "Userspace".to_string(),
+        _ if !s.is_empty() => s
+            .split('-')
+            .filter(|w| !w.is_empty())
+            .map(|word| {
+                let mut c = word.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    }
+}
+
+/// Reads the current system power plan or platform profile.
+///
+/// Checks `/sys/firmware/acpi/platform_profile`, cpufreq energy performance preference,
+/// and CPU scaling governor.
+///
+/// # Returns
+/// `Some(String)` describing the active power plan, or `None` if undetectable.
+pub fn read_power_plan() -> Option<String> {
+    if let Ok(profile) = fs::read_to_string("/sys/firmware/acpi/platform_profile") {
+        let trimmed = profile.trim();
+        if !trimmed.is_empty() {
+            let formatted = format_power_plan(trimmed);
+            if !formatted.is_empty() {
+                return Some(formatted);
+            }
+        }
+    }
+
+    if let Ok(epp) =
+        fs::read_to_string("/sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference")
+            .or_else(|_| {
+                fs::read_to_string(
+                    "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference",
+                )
+            })
+    {
+        let trimmed = epp.trim();
+        if !trimmed.is_empty() && trimmed != "default" {
+            let formatted = format_power_plan(trimmed);
+            if !formatted.is_empty() {
+                return Some(formatted);
+            }
+        }
+    }
+
+    if let Ok(gov) = fs::read_to_string("/sys/devices/system/cpu/cpufreq/policy0/scaling_governor")
+        .or_else(|_| fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"))
+    {
+        let trimmed = gov.trim();
+        if !trimmed.is_empty() {
+            let formatted = format_power_plan(trimmed);
+            if !formatted.is_empty() {
+                return Some(formatted);
+            }
+        }
+    }
+
+    None
 }
 
 /// Reads `/sys/class/power_supply` to query laptop battery state, capacity, energy, and wattage.
@@ -280,6 +390,8 @@ pub fn read_battery() -> Option<BatteryInfo> {
                         Some(((current * v) / 1_000_000_000_000.0).abs())
                     });
 
+                let power_plan = read_power_plan();
+
                 return Some(BatteryInfo {
                     name,
                     status,
@@ -288,6 +400,7 @@ pub fn read_battery() -> Option<BatteryInfo> {
                     energy_full_wh,
                     power_w,
                     health,
+                    power_plan,
                 });
             }
         }
@@ -1015,6 +1128,112 @@ pub fn read_cpu_temp() -> u32 {
     0
 }
 
+/// Reads the system RAM / DIMM temperature in degrees Celsius from `/sys/class/hwmon` or `/sys/class/thermal`.
+/// Returns `None` if no hardware DIMM/RAM thermal sensor is detected.
+pub fn read_ram_temp() -> Option<u32> {
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = fs::read_to_string(path.join("name"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+
+            // Direct RAM temperature drivers
+            let is_ram_driver = name.contains("jc42")
+                || name.contains("spd5118")
+                || name.contains("i5500")
+                || name.contains("i5k_amb")
+                || name.contains("sbrmi")
+                || (name.contains("dram") && !name.contains("gpu"))
+                || (name.contains("dimm") && !name.contains("gpu"));
+
+            if is_ram_driver
+                && let Ok(h_entries) = fs::read_dir(&path)
+            {
+                for h_entry in h_entries.filter_map(Result::ok) {
+                    let fname = h_entry.file_name().to_string_lossy().to_string();
+                    if fname.starts_with("temp")
+                        && fname.ends_with("_input")
+                        && let Ok(temp_str) = fs::read_to_string(h_entry.path())
+                        && let Ok(milli) = temp_str.trim().parse::<u32>()
+                        && milli > 0
+                        && milli < 130_000
+                    {
+                        return Some(milli / 1000);
+                    }
+                }
+            }
+
+            // Exclude GPU / NVMe drivers from generic labeling check
+            let is_non_gpu = !name.contains("amdgpu")
+                && !name.contains("nouveau")
+                && !name.contains("nvidia")
+                && !name.contains("i915")
+                && !name.contains("xe")
+                && !name.contains("nvme");
+
+            if is_non_gpu
+                && let Ok(h_entries) = fs::read_dir(&path)
+            {
+                for h_entry in h_entries.filter_map(Result::ok) {
+                    let fname = h_entry.file_name().to_string_lossy().to_string();
+                    if fname.starts_with("temp") && fname.ends_with("_label") {
+                        let label = fs::read_to_string(h_entry.path())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_lowercase();
+                        if (label.contains("dimm")
+                            || label.contains("dram")
+                            || label.contains("sodimm")
+                            || label.contains("ddr")
+                            || label.contains("tmem")
+                            || label.contains("tdimm")
+                            || label == "memory")
+                            && let input_name = fname.replace("_label", "_input")
+                            && let Ok(temp_str) = fs::read_to_string(path.join(input_name))
+                            && let Ok(milli) = temp_str.trim().parse::<u32>()
+                            && milli > 0
+                            && milli < 130_000
+                        {
+                            return Some(milli / 1000);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let t_type = fs::read_to_string(path.join("type"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if !t_type.contains("gpu")
+                && !t_type.contains("amdgpu")
+                && !t_type.contains("nvme")
+                && (t_type.contains("dimm")
+                    || t_type.contains("dram")
+                    || t_type.contains("sodimm")
+                    || t_type.contains("ddr")
+                    || t_type.contains("tmem")
+                    || t_type.contains("memory")
+                    || t_type.contains("ram"))
+                && let Ok(temp_str) = fs::read_to_string(path.join("temp"))
+                && let Ok(milli) = temp_str.trim().parse::<u32>()
+                && milli > 0
+                && milli < 130_000
+            {
+                return Some(milli / 1000);
+            }
+        }
+    }
+
+    None
+}
+
 /// Reads `/proc/cpuinfo` to extract the official marketing model name of the CPU.
 ///
 /// # Returns
@@ -1041,11 +1260,434 @@ pub fn get_cpu_model() -> String {
 ///
 /// # Returns
 /// Formatted string like `"16GB DDR4@3200MHz"` or `"32GB DDR5@5600MHz"`.
+/// Reads SMBIOS Type 17 memory device information directly from sysfs if accessible.
+fn read_dmi_sysfs() -> Option<(String, String)> {
+    if let Ok(entries) = fs::read_dir("/sys/firmware/dmi/entries") {
+        for entry in entries.filter_map(Result::ok) {
+            let fname = entry.file_name();
+            let name = fname.to_string_lossy();
+            if name.starts_with("17-") {
+                let raw_path = entry.path().join("raw");
+                if let Ok(data) = fs::read(raw_path)
+                    && data.len() >= 0x16
+                {
+                    let mem_type_byte = data[0x12];
+                    let speed = if data.len() >= 0x22 {
+                        let configured_speed = u16::from_le_bytes([data[0x20], data[0x21]]);
+                        if configured_speed > 0 && configured_speed != 0xFFFF {
+                            configured_speed
+                        } else {
+                            u16::from_le_bytes([data[0x15], data[0x16]])
+                        }
+                    } else {
+                        u16::from_le_bytes([data[0x15], data[0x16]])
+                    };
+
+                    let ram_type = match mem_type_byte {
+                        0x12 => "DDR",
+                        0x13 => "DDR2",
+                        0x18 => "DDR3",
+                        0x1A => "DDR4",
+                        0x1B => "LPDDR",
+                        0x1C => "LPDDR2",
+                        0x1D => "LPDDR3",
+                        0x1E => "LPDDR4",
+                        0x22 => "DDR5",
+                        0x23 => "LPDDR5",
+                        _ => "",
+                    };
+
+                    if !ram_type.is_empty() {
+                        let speed_str = if speed > 0 && speed != 0xFFFF {
+                            format!("{}MHz", speed)
+                        } else {
+                            String::new()
+                        };
+                        return Some((ram_type.to_string(), speed_str));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Heuristically determines the RAM type and standard clock frequency from processor architecture and SKU.
+/// Returns `None` if no confident architectural inference can be made without hardware DMI privileges.
+pub fn detect_ram_by_cpu(cpu_model: &str) -> Option<(&'static str, &'static str)> {
+    let cpu = cpu_model.to_lowercase();
+
+    // Apple Silicon
+    if cpu.contains("apple") {
+        if cpu.contains("m1 pro")
+            || cpu.contains("m1 max")
+            || cpu.contains("m1 ultra")
+            || cpu.contains("m2")
+            || cpu.contains("m3")
+            || cpu.contains("m4")
+        {
+            return Some(("LPDDR5", "6400MHz"));
+        }
+        if cpu.contains("m1") {
+            return Some(("LPDDR4X", "4266MHz"));
+        }
+    }
+
+    // AMD Processors
+    if cpu.contains("ryzen") || cpu.contains("epyc") || cpu.contains("threadripper") {
+        // Ryzen AI 300 (Strix Point / Zen 5 Mobile)
+        if cpu.contains("ryzen ai")
+            || cpu.contains("ai 9")
+            || cpu.contains("ai 7")
+            || cpu.contains("ai 5")
+        {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // Zen 5 (9000 series Desktop)
+        if cpu.contains("9000")
+            || cpu.contains("9950")
+            || cpu.contains("9900")
+            || cpu.contains("9800")
+            || cpu.contains("9700")
+            || cpu.contains("9600")
+        {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // Zen 4 / Hawk Point / Phoenix (8000 series Mobile & Desktop)
+        if cpu.contains("8000")
+            || cpu.contains("8945")
+            || cpu.contains("8845")
+            || cpu.contains("8645")
+            || cpu.contains("8545")
+            || cpu.contains("8840")
+            || cpu.contains("8640")
+            || cpu.contains("8540")
+            || cpu.contains("8440")
+            || cpu.contains("8700")
+            || cpu.contains("8600")
+            || cpu.contains("8500")
+            || cpu.contains("8400")
+            || cpu.contains("8300")
+        {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // Zen 4 / Dragon Range / Phoenix / Rembrandt-R (7000 series)
+        // 7030 series (Barcelo-R, Zen 3, DDR4-3200)
+        if cpu.contains("7730") || cpu.contains("7530") || cpu.contains("7330") {
+            return Some(("DDR4", "3200MHz"));
+        }
+        // 7035 series (Rembrandt-R, Zen 3+, DDR5-4800)
+        if cpu.contains("7735")
+            || cpu.contains("7535")
+            || cpu.contains("7435")
+            || cpu.contains("7335")
+        {
+            return Some(("DDR5", "4800MHz"));
+        }
+        // 7020 series (Mendocino, LPDDR5-5500)
+        if cpu.contains("7520") || cpu.contains("7320") || cpu.contains("7220") {
+            return Some(("LPDDR5", "5500MHz"));
+        }
+        // 7040 / 7045 series (Phoenix / Dragon Range Zen 4) and 7000 series AM5 desktop
+        if cpu.contains("7000")
+            || cpu.contains("7950")
+            || cpu.contains("7945")
+            || cpu.contains("7940")
+            || cpu.contains("7900")
+            || cpu.contains("7845")
+            || cpu.contains("7840")
+            || cpu.contains("7800")
+            || cpu.contains("7745")
+            || cpu.contains("7700")
+            || cpu.contains("7645")
+            || cpu.contains("7640")
+            || cpu.contains("7600")
+            || cpu.contains("7540")
+            || cpu.contains("7500")
+            || cpu.contains("7440")
+            || cpu.contains("79")
+            || cpu.contains("78")
+            || cpu.contains("77")
+            || cpu.contains("76")
+        {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // Zen 3+ (6000 series Mobile: 6980, 6900, 6850, 6800, 6600, 6500) - DDR5 only platform
+        if cpu.contains("6000")
+            || cpu.contains("6980")
+            || cpu.contains("6900")
+            || cpu.contains("6850")
+            || cpu.contains("6800")
+            || cpu.contains("6600")
+            || cpu.contains("6500")
+        {
+            return Some(("DDR5", "4800MHz"));
+        }
+
+        // Threadripper 7000 / EPYC 9004/9005
+        if (cpu.contains("threadripper") || cpu.contains("epyc"))
+            && (cpu.contains("7") || cpu.contains("9"))
+        {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // Zen 1 / Zen+ / Zen 2 / Zen 3 (1000..5000 series)
+        if cpu.contains("5000")
+            || cpu.contains("4000")
+            || cpu.contains("3000")
+            || cpu.contains("2000")
+            || cpu.contains("1000")
+            || cpu.contains("5950")
+            || cpu.contains("5900")
+            || cpu.contains("5800")
+            || cpu.contains("5700")
+            || cpu.contains("5600")
+            || cpu.contains("5500")
+            || cpu.contains("4800")
+            || cpu.contains("4700")
+            || cpu.contains("4600")
+            || cpu.contains("4500")
+            || cpu.contains("3950")
+            || cpu.contains("3900")
+            || cpu.contains("3800")
+            || cpu.contains("3700")
+            || cpu.contains("3600")
+            || cpu.contains("3500")
+            || cpu.contains("3400")
+            || cpu.contains("3300")
+            || cpu.contains("3200")
+            || cpu.contains("3100")
+            || cpu.contains("2700")
+            || cpu.contains("2600")
+            || cpu.contains("2500")
+            || cpu.contains("2400")
+            || cpu.contains("2200")
+            || cpu.contains("1800")
+            || cpu.contains("1700")
+            || cpu.contains("1600")
+            || cpu.contains("1500")
+            || cpu.contains("1400")
+            || cpu.contains("1200")
+            || cpu.contains("ryzen")
+        {
+            return Some(("DDR4", "3200MHz"));
+        }
+    }
+
+    if cpu.contains("fx-") || cpu.contains("phenom") || cpu.contains("athlon ii") {
+        return Some(("DDR3", "1600MHz"));
+    }
+
+    // Intel Processors
+    if cpu.contains("intel")
+        || cpu.contains("core")
+        || cpu.contains("xeon")
+        || cpu.contains("celeron")
+        || cpu.contains("pentium")
+    {
+        // Core Ultra Series 1 & 2 (Meteor Lake, Lunar Lake, Arrow Lake)
+        if cpu.contains("ultra") {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // Core 100/200 series (e.g. Core 7 150U, Core 5 120U)
+        if cpu.contains("150u") || cpu.contains("120u") || cpu.contains("100u") {
+            return Some(("DDR5", "5200MHz"));
+        }
+
+        // 14th Gen (Raptor Lake Refresh)
+        if cpu.contains("14th")
+            || cpu.contains("i9-14")
+            || cpu.contains("i7-14")
+            || cpu.contains("i5-14")
+            || cpu.contains("i3-14")
+            || cpu.contains("14900")
+            || cpu.contains("14700")
+            || cpu.contains("14650")
+            || cpu.contains("14600")
+            || cpu.contains("14500")
+            || cpu.contains("14450")
+            || cpu.contains("14400")
+            || cpu.contains("14100")
+        {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // 13th Gen (Raptor Lake)
+        if cpu.contains("13th")
+            || cpu.contains("i9-13")
+            || cpu.contains("i7-13")
+            || cpu.contains("i5-13")
+            || cpu.contains("i3-13")
+            || cpu.contains("13980")
+            || cpu.contains("13950")
+            || cpu.contains("13900")
+            || cpu.contains("13850")
+            || cpu.contains("13700")
+            || cpu.contains("13650")
+            || cpu.contains("13620")
+            || cpu.contains("13600")
+            || cpu.contains("13500")
+            || cpu.contains("13450")
+            || cpu.contains("13420")
+            || cpu.contains("13400")
+            || cpu.contains("13100")
+        {
+            return Some(("DDR5", "5600MHz"));
+        }
+
+        // 12th Gen (Alder Lake)
+        if cpu.contains("12th")
+            || cpu.contains("i9-12")
+            || cpu.contains("i7-12")
+            || cpu.contains("i5-12")
+            || cpu.contains("i3-12")
+            || cpu.contains("12950")
+            || cpu.contains("12900")
+            || cpu.contains("12850")
+            || cpu.contains("12800")
+            || cpu.contains("12700")
+            || cpu.contains("12650")
+            || cpu.contains("12600")
+            || cpu.contains("12500")
+            || cpu.contains("12450")
+            || cpu.contains("12400")
+            || cpu.contains("12100")
+        {
+            if cpu.contains("h") || cpu.contains("hx") || cpu.contains("hk") {
+                return Some(("DDR5", "4800MHz"));
+            }
+            return Some(("DDR4", "3200MHz"));
+        }
+
+        // 6th through 11th Gen
+        if cpu.contains("11th")
+            || cpu.contains("10th")
+            || cpu.contains("9th")
+            || cpu.contains("8th")
+            || cpu.contains("7th")
+            || cpu.contains("6th")
+            || cpu.contains("i9-11")
+            || cpu.contains("i9-10")
+            || cpu.contains("i9-9")
+            || cpu.contains("i7-11")
+            || cpu.contains("i7-10")
+            || cpu.contains("i7-9")
+            || cpu.contains("i7-8")
+            || cpu.contains("i7-7")
+            || cpu.contains("i7-6")
+            || cpu.contains("i5-11")
+            || cpu.contains("i5-10")
+            || cpu.contains("i5-9")
+            || cpu.contains("i5-8")
+            || cpu.contains("i5-7")
+            || cpu.contains("i5-6")
+            || cpu.contains("i3-11")
+            || cpu.contains("i3-10")
+            || cpu.contains("i3-9")
+            || cpu.contains("i3-8")
+            || cpu.contains("i3-7")
+            || cpu.contains("i3-6")
+            || cpu.contains("11800")
+            || cpu.contains("11700")
+            || cpu.contains("11600")
+            || cpu.contains("11400")
+            || cpu.contains("10750")
+            || cpu.contains("10700")
+            || cpu.contains("10600")
+            || cpu.contains("10400")
+            || cpu.contains("9750")
+            || cpu.contains("9700")
+            || cpu.contains("9400")
+            || cpu.contains("8750")
+            || cpu.contains("8700")
+            || cpu.contains("8400")
+            || cpu.contains("7700")
+            || cpu.contains("7500")
+            || cpu.contains("6700")
+            || cpu.contains("6500")
+        {
+            return Some(("DDR4", "3200MHz"));
+        }
+
+        // 2nd through 5th Gen (Sandy Bridge, Ivy Bridge, Haswell, Broadwell)
+        if cpu.contains("2nd")
+            || cpu.contains("3rd")
+            || cpu.contains("4th")
+            || cpu.contains("5th")
+            || cpu.contains("i7-2")
+            || cpu.contains("i7-3")
+            || cpu.contains("i7-4")
+            || cpu.contains("i7-5")
+            || cpu.contains("i5-2")
+            || cpu.contains("i5-3")
+            || cpu.contains("i5-4")
+            || cpu.contains("i5-5")
+            || cpu.contains("i3-2")
+            || cpu.contains("i3-3")
+            || cpu.contains("i3-4")
+            || cpu.contains("i3-5")
+            || cpu.contains("4770")
+            || cpu.contains("3770")
+            || cpu.contains("2600")
+            || cpu.contains("2500")
+        {
+            return Some(("DDR3", "1600MHz"));
+        }
+
+        if cpu.contains("core 2")
+            || cpu.contains("core2")
+            || cpu.contains("q6600")
+            || cpu.contains("e8400")
+        {
+            return Some(("DDR2", "800MHz"));
+        }
+
+        if cpu.contains("pentium") || cpu.contains("celeron") {
+            return Some(("DDR3", "1333MHz"));
+        }
+    }
+
+    None
+}
+
+/// Queries hardware DMI table 17 via `dmidecode` or uses CPU architecture heuristics
+/// to determine RAM generation (DDR4/DDR5) and rated clock speed in MHz.
+///
+/// # Arguments
+/// * `total_mb` - Total RAM in megabytes.
+/// * `cpu_model` - Processor model string used for heuristic fallback.
+///
+/// # Returns
+/// Formatted string like `"16GB DDR4@3200MHz"` or `"32GB DDR5@5600MHz"`, or `"16GB [root permissions required]"`.
 pub fn get_ram_info(total_mb: u64, cpu_model: &str) -> String {
     let total_gb = ((total_mb as f64) / 1024.0).round() as u64;
 
+    // 1. Try reading sysfs DMI raw entries if accessible
+    if let Some((ram_type, speed)) = read_dmi_sysfs() {
+        if !speed.is_empty() {
+            return format!("{}GB {}@{}", total_gb, ram_type.to_uppercase(), speed);
+        } else {
+            return format!("{}GB {}", total_gb, ram_type.to_uppercase());
+        }
+    }
+
+    // 2. Try dmidecode (direct or passwordless sudo)
     for bin in &["dmidecode", "/usr/sbin/dmidecode", "/sbin/dmidecode"] {
-        if let Ok(output) = std::process::Command::new(bin).args(["-t", "17"]).output()
+        let output = std::process::Command::new(bin)
+            .args(["-t", "17"])
+            .output()
+            .or_else(|_| {
+                std::process::Command::new("sudo")
+                    .args(["-n", bin, "-t", "17"])
+                    .output()
+            });
+
+        if let Ok(output) = output
             && output.status.success()
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1091,46 +1733,12 @@ pub fn get_ram_info(total_mb: u64, cpu_model: &str) -> String {
         }
     }
 
-    let cpu_lower = cpu_model.to_lowercase();
-    let (ram_type, speed) = if cpu_lower.contains("ryzen") {
-        if cpu_lower.contains("7000")
-            || cpu_lower.contains("8000")
-            || cpu_lower.contains("9000")
-            || cpu_lower.contains("79")
-            || cpu_lower.contains("78")
-            || cpu_lower.contains("77")
-            || cpu_lower.contains("76")
-        {
-            ("DDR5", "5600MHz")
-        } else {
-            ("DDR4", "3200MHz")
-        }
-    } else if cpu_lower.contains("intel") || cpu_lower.contains("core") {
-        if cpu_lower.contains("13th")
-            || cpu_lower.contains("14th")
-            || cpu_lower.contains("ultra")
-            || cpu_lower.contains("15th")
-        {
-            ("DDR5", "5600MHz")
-        } else if cpu_lower.contains("2nd")
-            || cpu_lower.contains("3rd")
-            || cpu_lower.contains("4th")
-            || cpu_lower.contains("i7-2")
-            || cpu_lower.contains("i7-3")
-            || cpu_lower.contains("i7-4")
-            || cpu_lower.contains("i5-2")
-            || cpu_lower.contains("i5-3")
-            || cpu_lower.contains("i5-4")
-        {
-            ("DDR3", "1600MHz")
-        } else {
-            ("DDR4", "3200MHz")
-        }
+    // 3. Fallback to CPU architecture heuristic if a reasonable match exists
+    if let Some((ram_type, speed)) = detect_ram_by_cpu(cpu_model) {
+        format!("{}GB {}@{}", total_gb, ram_type, speed)
     } else {
-        ("DDR4", "3200MHz")
-    };
-
-    format!("{}GB {}@{}", total_gb, ram_type, speed)
+        format!("{}GB [root permissions required]", total_gb)
+    }
 }
 
 /// Real-time throughput metrics and hardware metadata for a network interface.
@@ -3474,5 +4082,222 @@ mod tests {
         assert!(is_item_visible(&small_item, true));
         assert!(is_item_visible(&root_dot_item, true));
         assert!(is_item_visible(&hidden_large_item, true));
+    }
+
+    #[test]
+    fn test_format_power_plan() {
+        assert_eq!(format_power_plan("performance"), "Performance");
+        assert_eq!(format_power_plan("balanced"), "Balanced");
+        assert_eq!(
+            format_power_plan("balance_performance"),
+            "Balanced Performance"
+        );
+        assert_eq!(
+            format_power_plan("balanced-performance"),
+            "Balanced Performance"
+        );
+        assert_eq!(format_power_plan("balance_power"), "Balanced Power");
+        assert_eq!(format_power_plan("powersave"), "Power Saver");
+        assert_eq!(format_power_plan("power-saver"), "Power Saver");
+        assert_eq!(format_power_plan("low-power"), "Power Saver");
+        assert_eq!(format_power_plan("quiet"), "Quiet");
+        assert_eq!(format_power_plan("cool"), "Cool");
+        assert_eq!(format_power_plan("schedutil"), "Schedutil");
+        assert_eq!(format_power_plan("ondemand"), "Ondemand");
+        assert_eq!(format_power_plan("conservative"), "Conservative");
+        assert_eq!(format_power_plan("userspace"), "Userspace");
+        assert_eq!(
+            format_power_plan("extreme_performance"),
+            "Extreme Performance"
+        );
+        assert_eq!(format_power_plan(""), "");
+    }
+
+    #[test]
+    fn test_read_power_plan() {
+        let plan = read_power_plan();
+        println!("Detected power plan: {:?}", plan);
+    }
+
+    #[test]
+    fn test_detect_ram_by_cpu() {
+        // AMD Ryzen 7000 / 8000 / 9000 / AI 300 (DDR5 5600MHz)
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 7 7840HS with Radeon 780M Graphics"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 5 7640HS w/ Radeon 760M Graphics"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 7 8845HS w/ Radeon 780M Graphics"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 5 8645HS"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 9 8945HS"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen AI 9 HX 370"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 7 7800X3D 8-Core Processor"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 5 7600X 6-Core Processor"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 5 7500F 6-Core Processor"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 7 9700X 8-Core Processor"),
+            Some(("DDR5", "5600MHz"))
+        );
+
+        // AMD Ryzen 6000 & 7035 series (DDR5 4800MHz)
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 7 6800H with Radeon Graphics"),
+            Some(("DDR5", "4800MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 5 6600H"),
+            Some(("DDR5", "4800MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 7 7735HS with Radeon Graphics"),
+            Some(("DDR5", "4800MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 5 7535HS with Radeon Graphics"),
+            Some(("DDR5", "4800MHz"))
+        );
+
+        // AMD Ryzen 5000 / 3000 (DDR4 3200MHz)
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 7 5800X 8-Core Processor"),
+            Some(("DDR4", "3200MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("AMD Ryzen 5 3600X 6-Core Processor"),
+            Some(("DDR4", "3200MHz"))
+        );
+
+        // Intel 13th & 14th Gen without "13th"/"14th" in string (DDR5 5600MHz)
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-13700H"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-13700HX"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-13620H"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i5-13500H"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i9-13900HX"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("13th Gen Intel(R) Core(TM) i7-13700H"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-14700HX"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i9-14900HX"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i5-14500HX"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("14th Gen Intel(R) Core(TM) i7-14700HX"),
+            Some(("DDR5", "5600MHz"))
+        );
+
+        // Intel Core Ultra (DDR5 5600MHz)
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) Ultra 7 155H"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) Ultra 5 125H"),
+            Some(("DDR5", "5600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) Ultra 7 258V"),
+            Some(("DDR5", "5600MHz"))
+        );
+
+        // Intel 12th Gen (DDR5 4800MHz for H/HX)
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-12700H"),
+            Some(("DDR5", "4800MHz"))
+        );
+
+        // Legacy Intel (DDR4 / DDR3)
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-11800H"),
+            Some(("DDR4", "3200MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-10750H"),
+            Some(("DDR4", "3200MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i7-4770K"),
+            Some(("DDR3", "1600MHz"))
+        );
+        assert_eq!(
+            detect_ram_by_cpu("Intel(R) Core(TM) i5-2500K"),
+            Some(("DDR3", "1600MHz"))
+        );
+
+        // Apple Silicon
+        assert_eq!(detect_ram_by_cpu("Apple M1"), Some(("LPDDR4X", "4266MHz")));
+        assert_eq!(
+            detect_ram_by_cpu("Apple M2 Max"),
+            Some(("LPDDR5", "6400MHz"))
+        );
+
+        // Unknown / Virtual CPU without match
+        assert_eq!(detect_ram_by_cpu("CPU"), None);
+        assert_eq!(detect_ram_by_cpu("Common KVM processor"), None);
+        assert_eq!(detect_ram_by_cpu("QEMU Virtual CPU"), None);
+    }
+
+    #[test]
+    fn test_get_ram_info() {
+        let ram_str = get_ram_info(32768, "AMD Ryzen 7 7840HS with Radeon 780M Graphics");
+        assert!(ram_str.contains("32GB"));
+        assert!(ram_str.contains("DDR5"));
+        assert!(ram_str.contains("5600MHz"));
+
+        let unknown_ram = get_ram_info(16384, "Common KVM processor");
+        assert_eq!(unknown_ram, "16GB [root permissions required]");
+    }
+
+    #[test]
+    fn test_read_ram_temp() {
+        let temp = read_ram_temp();
+        println!("Detected RAM temperature: {:?}", temp);
     }
 }

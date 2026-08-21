@@ -22,6 +22,7 @@ use crate::{
     system::{
         BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo,
         NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo, is_item_visible,
+        read_power_plan,
     },
     theme::{darken_color, gradient_color, io_gradient_pct, process_cpu_color},
     utils::{
@@ -929,6 +930,7 @@ pub fn render_process_detail(
 /// * `cpu_min_mhz` - Minimum CPU clock frequency in MHz.
 /// * `cpu_max_mhz` - Maximum CPU clock frequency in MHz.
 /// * `cpu_temp` - CPU temperature in degrees Celsius.
+/// * `ram_temp` - Optional RAM/DIMM temperature in degrees Celsius.
 /// * `cpu_model` - Marketing CPU model identifier string.
 /// * `mem` - Memory utilization metrics (RAM and swap).
 /// * `mem_history` - Historical RAM usage samples for Braille graphing.
@@ -944,6 +946,7 @@ pub fn render_cpu_ram_tab(
     cpu_min_mhz: f64,
     cpu_max_mhz: f64,
     cpu_temp: u32,
+    ram_temp: Option<u32>,
     cpu_model: &str,
     mem: &MemoryMetrics,
     mem_history: &[Option<f64>],
@@ -1098,23 +1101,14 @@ pub fn render_cpu_ram_tab(
         }
     }
 
-    let ram_swap_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(body_chunks[1]);
-
-    let ram_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(ram_swap_cols[0]);
-
-    let swap_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(3)])
-        .split(ram_swap_cols[1]);
-
     let mem_percent_f64 = if mem.total_mem_mb > 0 {
         (mem.used_mem_mb as f64 / mem.total_mem_mb as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let cache_percent_f64 = if mem.total_mem_mb > 0 {
+        (mem.cached_mem_mb as f64 / mem.total_mem_mb as f64) * 100.0
     } else {
         0.0
     };
@@ -1131,57 +1125,243 @@ pub fn render_cpu_ram_tab(
         "None".to_string()
     };
 
-    render_gradient_chart(
-        frame,
-        ram_layout[0],
-        "Memory History",
-        None,
-        Some(ram_info),
-        Color::Rgb(60, 60, 60),
-        mem_history,
-    );
+    let not_enough_room_for_graphs = body_chunks[1].height < 16;
 
-    render_gradient_chart(
-        frame,
-        swap_layout[0],
-        "Swap History",
-        None,
-        Some(&swap_label),
-        Color::Rgb(60, 60, 60),
-        swap_history,
-    );
+    if not_enough_room_for_graphs {
+        // Vertical layout: Top is charts (Min(0)), Bottom is single row of merged bars (Length(3))
+        let lower_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(3)])
+            .split(body_chunks[1]);
 
-    let mem_block = Block::default()
-        .title(" Memory Usage ".fg(Color::Rgb(170, 170, 170)))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let mem_inner = mem_block.inner(ram_layout[1]);
-    frame.render_widget(mem_block, ram_layout[1]);
-    if mem_inner.height > 0 && mem_inner.width > 0 {
-        draw_centered_gradient_bar(
-            frame.buffer_mut(),
-            mem_inner,
-            &format!("{} MB / {} MB", mem.used_mem_mb, mem.total_mem_mb),
-            mem_percent_f64,
+        let chart_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(lower_layout[0]);
+
+        render_gradient_chart(
+            frame,
+            chart_cols[0],
+            "Memory History",
+            None,
+            Some(ram_info),
+            Color::Rgb(60, 60, 60),
+            mem_history,
         );
-    }
 
-    let swap_block = Block::default()
-        .title(" Swap Usage ".fg(Color::Rgb(170, 170, 170)))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
-    let swap_inner = swap_block.inner(swap_layout[1]);
-    frame.render_widget(swap_block, swap_layout[1]);
+        render_gradient_chart(
+            frame,
+            chart_cols[1],
+            "Swap History",
+            None,
+            Some(&swap_label),
+            Color::Rgb(60, 60, 60),
+            swap_history,
+        );
 
-    if swap_inner.height > 0 && swap_inner.width > 0 {
-        let label = if mem.total_swap_mb > 0 {
-            format!("{} MB / {} MB", mem.used_swap_mb, mem.total_swap_mb)
+        // When merged, if ram temp is N/A (None), don't render it; distribute width evenly among 3 bars
+        let bar_constraints = if ram_temp.is_some() {
+            vec![
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+            ]
         } else {
-            "0 MB / 0 MB (No Swap Configured)".to_string()
+            vec![
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ]
         };
-        draw_centered_gradient_bar(frame.buffer_mut(), swap_inner, &label, swap_pct);
+
+        let bar_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(bar_constraints)
+            .split(lower_layout[1]);
+
+        let mem_block = Block::default()
+            .title(" Memory Usage ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let mem_inner = mem_block.inner(bar_cols[0]);
+        frame.render_widget(mem_block, bar_cols[0]);
+        if mem_inner.height > 0 && mem_inner.width > 0 {
+            draw_centered_gradient_bar(
+                frame.buffer_mut(),
+                mem_inner,
+                &format!("{} MB / {} MB", mem.used_mem_mb, mem.total_mem_mb),
+                mem_percent_f64,
+            );
+        }
+
+        let cache_block = Block::default()
+            .title(" Cache Usage ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let cache_inner = cache_block.inner(bar_cols[1]);
+        frame.render_widget(cache_block, bar_cols[1]);
+        if cache_inner.height > 0 && cache_inner.width > 0 {
+            draw_centered_gradient_bar(
+                frame.buffer_mut(),
+                cache_inner,
+                &format!("{} MB / {} MB", mem.cached_mem_mb, mem.total_mem_mb),
+                cache_percent_f64,
+            );
+        }
+
+        let swap_block = Block::default()
+            .title(" Swap Usage ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let swap_inner = swap_block.inner(bar_cols[2]);
+        frame.render_widget(swap_block, bar_cols[2]);
+        if swap_inner.height > 0 && swap_inner.width > 0 {
+            let label = if mem.total_swap_mb > 0 {
+                format!("{} MB / {} MB", mem.used_swap_mb, mem.total_swap_mb)
+            } else if swap_inner.width < 25 {
+                "No Swap".to_string()
+            } else {
+                "0 MB / 0 MB (No Swap Configured)".to_string()
+            };
+            draw_centered_gradient_bar(frame.buffer_mut(), swap_inner, &label, swap_pct);
+        }
+
+        if let Some(temp) = ram_temp {
+            let ram_temp_block = Block::default()
+                .title(" RAM Temp ".fg(Color::Rgb(170, 170, 170)))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+            let ram_temp_inner = ram_temp_block.inner(bar_cols[3]);
+            frame.render_widget(ram_temp_block, bar_cols[3]);
+            if ram_temp_inner.height > 0 && ram_temp_inner.width > 0 {
+                let temp_pct = ((temp as f64 - 25.0) / 60.0 * 100.0).clamp(0.0, 100.0);
+                draw_centered_gradient_bar(
+                    frame.buffer_mut(),
+                    ram_temp_inner,
+                    &format!("{}°C", temp),
+                    temp_pct,
+                );
+            }
+        }
+    } else {
+        let ram_swap_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(body_chunks[1]);
+
+        let ram_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ])
+            .split(ram_swap_cols[0]);
+
+        let swap_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ])
+            .split(ram_swap_cols[1]);
+
+        render_gradient_chart(
+            frame,
+            ram_layout[0],
+            "Memory History",
+            None,
+            Some(ram_info),
+            Color::Rgb(60, 60, 60),
+            mem_history,
+        );
+
+        render_gradient_chart(
+            frame,
+            swap_layout[0],
+            "Swap History",
+            None,
+            Some(&swap_label),
+            Color::Rgb(60, 60, 60),
+            swap_history,
+        );
+
+        let mem_block = Block::default()
+            .title(" Memory Usage ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let mem_inner = mem_block.inner(ram_layout[1]);
+        frame.render_widget(mem_block, ram_layout[1]);
+        if mem_inner.height > 0 && mem_inner.width > 0 {
+            draw_centered_gradient_bar(
+                frame.buffer_mut(),
+                mem_inner,
+                &format!("{} MB / {} MB", mem.used_mem_mb, mem.total_mem_mb),
+                mem_percent_f64,
+            );
+        }
+
+        let cache_block = Block::default()
+            .title(" Cache Usage ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let cache_inner = cache_block.inner(ram_layout[2]);
+        frame.render_widget(cache_block, ram_layout[2]);
+        if cache_inner.height > 0 && cache_inner.width > 0 {
+            draw_centered_gradient_bar(
+                frame.buffer_mut(),
+                cache_inner,
+                &format!("{} MB / {} MB", mem.cached_mem_mb, mem.total_mem_mb),
+                cache_percent_f64,
+            );
+        }
+
+        let swap_block = Block::default()
+            .title(" Swap Usage ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let swap_inner = swap_block.inner(swap_layout[1]);
+        frame.render_widget(swap_block, swap_layout[1]);
+
+        if swap_inner.height > 0 && swap_inner.width > 0 {
+            let label = if mem.total_swap_mb > 0 {
+                format!("{} MB / {} MB", mem.used_swap_mb, mem.total_swap_mb)
+            } else {
+                "0 MB / 0 MB (No Swap Configured)".to_string()
+            };
+            draw_centered_gradient_bar(frame.buffer_mut(), swap_inner, &label, swap_pct);
+        }
+
+        let ram_temp_block = Block::default()
+            .title(" RAM Temperature ".fg(Color::Rgb(170, 170, 170)))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+        let ram_temp_inner = ram_temp_block.inner(swap_layout[2]);
+        frame.render_widget(ram_temp_block, swap_layout[2]);
+
+        if ram_temp_inner.height > 0 && ram_temp_inner.width > 0 {
+            if let Some(temp) = ram_temp {
+                let temp_pct = ((temp as f64 - 25.0) / 60.0 * 100.0).clamp(0.0, 100.0);
+                draw_centered_gradient_bar(
+                    frame.buffer_mut(),
+                    ram_temp_inner,
+                    &format!("{}°C", temp),
+                    temp_pct,
+                );
+            } else {
+                draw_centered_gradient_bar(frame.buffer_mut(), ram_temp_inner, "N/A", 0.0);
+            }
+        }
     }
 }
 
@@ -3124,6 +3304,9 @@ fn render_general_battery_card(frame: &mut Frame, area: Rect, battery: Option<&B
                     pwr_lines.push(format!("Rate:     {:.1} W", w));
                 }
             }
+            if let Some(ref plan) = bat.power_plan {
+                pwr_lines.push(format!("Plan:     {}", plan));
+            }
             pwr_lines.push(format!("Health:   {}", bat.health));
             pwr_lines.push(format!(
                 "Energy:   {:.1} / {:.1} Wh",
@@ -3131,8 +3314,14 @@ fn render_general_battery_card(frame: &mut Frame, area: Rect, battery: Option<&B
                 bat.energy_full_wh.unwrap_or(0.0)
             ));
 
+            let start_y = if pwr_inner.height > pwr_lines.len() as u16 + 1 {
+                pwr_inner.y + 2
+            } else {
+                pwr_inner.y + 1
+            };
+
             for (idx, line) in pwr_lines.iter().enumerate() {
-                let row = pwr_inner.y + 2 + idx as u16;
+                let row = start_y + idx as u16;
                 if row < pwr_inner.bottom() {
                     let label_end = line.find(':').map(|p| p + 1).unwrap_or(0);
                     for (c_idx, ch) in line.chars().enumerate() {
@@ -3160,16 +3349,29 @@ fn render_general_battery_card(frame: &mut Frame, area: Rect, battery: Option<&B
                         .set_style(Style::default().fg(Color::Rgb(0, 255, 128)));
                 }
             }
-            let pwr_sub_lines = ["Hardware sensors indicate direct wall power."];
+            let plan = read_power_plan();
+            let mut pwr_sub_lines =
+                vec!["Hardware sensors indicate direct wall power.".to_string()];
+            if let Some(p) = plan {
+                pwr_sub_lines.push(format!("Plan:         {}", p));
+            }
             for (idx, line) in pwr_sub_lines.iter().enumerate() {
                 let row = pwr_inner.y + 2 + idx as u16;
                 if row < pwr_inner.bottom() {
+                    let label_end = line.find(':').map(|p| p + 1).unwrap_or(0);
                     for (c_idx, ch) in line.chars().enumerate() {
                         let col = pwr_inner.x + c_idx as u16;
                         if col < pwr_inner.right() {
+                            let color = if label_end > 0 && c_idx < label_end {
+                                Color::Rgb(220, 220, 220)
+                            } else if label_end > 0 {
+                                Color::Rgb(180, 180, 180)
+                            } else {
+                                Color::Rgb(140, 140, 140)
+                            };
                             frame.buffer_mut()[(col, row)]
                                 .set_char(ch)
-                                .set_style(Style::default().fg(Color::Rgb(140, 140, 140)));
+                                .set_style(Style::default().fg(color));
                         }
                     }
                 }
@@ -3315,7 +3517,7 @@ fn render_general_cpu_card(
     }
 }
 
-/// Renders the Memory and Swap utilization card.
+/// Renders the Memory, Cache, and Swap utilization card.
 fn render_general_memory_card(frame: &mut Frame, area: Rect, mem: &MemoryMetrics, ram_info: &str) {
     let mut mem_block = Block::default()
         .title(" Memory ".fg(Color::Rgb(170, 170, 170)))
@@ -3356,7 +3558,32 @@ fn render_general_memory_card(frame: &mut Frame, area: Rect, mem: &MemoryMetrics
             ram_pct,
         );
 
-        if mem_inner.height > 1 {
+        let mut curr_y = mem_inner.y + 1;
+
+        if mem_inner.height > 2 {
+            let cache_pct = if mem.total_mem_mb > 0 {
+                (mem.cached_mem_mb as f64 / mem.total_mem_mb as f64) * 100.0
+            } else {
+                0.0
+            };
+            let cache_gb = mem.cached_mem_mb as f64 / 1024.0;
+
+            draw_labeled_bar(
+                frame.buffer_mut(),
+                Rect {
+                    x: mem_inner.x,
+                    y: curr_y,
+                    width: mem_inner.width,
+                    height: 1,
+                },
+                "Cache:",
+                &format!("{:.1}% ({:.1}/{:.1} GB)", cache_pct, cache_gb, ram_total_gb),
+                cache_pct,
+            );
+            curr_y += 1;
+        }
+
+        if curr_y < mem_inner.bottom() {
             let swap_pct = if mem.total_swap_mb > 0 {
                 (mem.used_swap_mb as f64 / mem.total_swap_mb as f64) * 100.0
             } else {
@@ -3365,17 +3592,11 @@ fn render_general_memory_card(frame: &mut Frame, area: Rect, mem: &MemoryMetrics
             let swap_used_gb = mem.used_swap_mb as f64 / 1024.0;
             let swap_total_gb = mem.total_swap_mb as f64 / 1024.0;
 
-            let row_y = if mem_inner.height > 2 {
-                mem_inner.y + 2
-            } else {
-                mem_inner.y + 1
-            };
-
             draw_labeled_bar(
                 frame.buffer_mut(),
                 Rect {
                     x: mem_inner.x,
-                    y: row_y,
+                    y: curr_y,
                     width: mem_inner.width,
                     height: 1,
                 },
@@ -3937,7 +4158,10 @@ pub fn render_general_tab(
                 } else {
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
-                        .constraints([Constraint::Min(0), Constraint::Length(6)])
+                        .constraints([
+                            Constraint::Min(0),
+                            Constraint::Length(if battery.is_some() { 8 } else { 6 }),
+                        ])
                         .split(body);
                     render_general_overview_card(
                         frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied,
@@ -3969,7 +4193,7 @@ pub fn render_general_tab(
                     let right = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
-                            Constraint::Length(4),
+                            Constraint::Length(5),
                             Constraint::Length(4),
                             Constraint::Length(4),
                             Constraint::Length(4),
@@ -3984,7 +4208,7 @@ pub fn render_general_tab(
                         .direction(Direction::Vertical)
                         .constraints([
                             Constraint::Min(0),
-                            Constraint::Length(4),
+                            Constraint::Length(5),
                             Constraint::Length(4),
                             Constraint::Length(4),
                             Constraint::Length(4),
@@ -4052,12 +4276,12 @@ pub fn render_general_tab(
         );
         render_general_processes_card(frame, left_chunks[2], processes, mem, gpu, num_cores);
 
-        let battery_height = if battery.is_some() { 7 } else { 5 };
+        let battery_height = if battery.is_some() { 8 } else { 6 };
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(battery_height),
-                Constraint::Length(4),
+                Constraint::Length(5),
                 Constraint::Length(4),
                 Constraint::Length(4),
                 Constraint::Length(4),

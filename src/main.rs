@@ -60,7 +60,7 @@ use crate::{
         is_item_visible, read_battery, read_cpu_freq_info, read_cpu_temp, read_cpu_ticks,
         read_disk_io, read_disk_mounts, read_dust_path, read_dust_storage, read_gpu_metrics,
         read_memory, read_network_connections, read_network_interfaces,
-        read_package_storage_categories, read_system_general_info,
+        read_package_storage_categories, read_ram_temp, read_system_general_info,
     },
     theme::io_gradient_pct,
     ui::{
@@ -103,6 +103,8 @@ struct Snapshot {
     cpu_max_mhz: f64,
     /// Package CPU temperature in degrees Celsius.
     cpu_temp: u32,
+    /// System RAM / DIMM temperature in degrees Celsius if sensor is available.
+    ram_temp: Option<u32>,
     /// Memory metrics.
     mem: MemoryMetrics,
     /// Formatted RAM capacity and speed info string.
@@ -150,6 +152,7 @@ fn create_snapshot(
     cpu_min_mhz: f64,
     cpu_max_mhz: f64,
     cpu_temp: u32,
+    ram_temp: Option<u32>,
     mem: &MemoryMetrics,
     ram_info: &str,
     gpu_metrics: &GpuMetrics,
@@ -177,6 +180,7 @@ fn create_snapshot(
         cpu_min_mhz,
         cpu_max_mhz,
         cpu_temp,
+        ram_temp,
         mem: *mem,
         ram_info: ram_info.to_string(),
         gpu_metrics: gpu_metrics.clone(),
@@ -370,6 +374,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut copy_feedback_until: Option<Instant> = None;
     let (mut cpu_cur_mhz, mut cpu_min_mhz, mut cpu_max_mhz) = read_cpu_freq_info();
     let mut cpu_temp = read_cpu_temp();
+    let mut ram_temp = read_ram_temp();
     let mut ram_info = get_ram_info(mem.total_mem_mb, &cpu_model);
     let dns_resolver = DnsResolver::new();
     let mut net_connections = read_network_connections(&dns_resolver);
@@ -391,6 +396,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         cpu_min_mhz,
         cpu_max_mhz,
         cpu_temp,
+        ram_temp,
         &mem,
         &ram_info,
         &gpu_metrics,
@@ -590,6 +596,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     cpu_min_mhz,
                     cpu_max_mhz,
                     cpu_temp,
+                    ram_temp,
                     &mem,
                     &ram_info,
                     &gpu_metrics,
@@ -688,6 +695,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             snap.cpu_min_mhz,
                             snap.cpu_max_mhz,
                             snap.cpu_temp,
+                            snap.ram_temp,
                             &cpu_model,
                             &snap.mem,
                             &snap.mem_history,
@@ -2613,6 +2621,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             cpu_min_mhz = freq_info.1;
             cpu_max_mhz = freq_info.2;
             cpu_temp = read_cpu_temp();
+            ram_temp = read_ram_temp();
             ram_info = get_ram_info(mem.total_mem_mb, &cpu_model);
 
             gpu_metrics = read_gpu_metrics();
@@ -2668,6 +2677,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 cpu_min_mhz,
                 cpu_max_mhz,
                 cpu_temp,
+                ram_temp,
                 &mem,
                 &ram_info,
                 &gpu_metrics,
@@ -2727,6 +2737,7 @@ mod tests {
                 1000.0,
                 3000.0,
                 45,
+                None,
                 &mem,
                 "16 GB",
                 &gpu,
@@ -2794,6 +2805,7 @@ mod tests {
                 1000.0,
                 3000.0,
                 45,
+                None,
                 &mem,
                 "16 GB",
                 &gpu,

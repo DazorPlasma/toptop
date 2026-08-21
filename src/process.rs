@@ -236,6 +236,154 @@ pub fn sort_processes(processes: &mut [ProcessInfo], sort_col: ProcessSortColumn
     });
 }
 
+/// Parses a DRM memory size string with units (e.g. "6279292 KiB", "2 MiB", "6.8 GiB", "0") into KiB.
+pub fn parse_drm_memory_kb(line: &str) -> u64 {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return 0;
+    }
+    let val = match parts[1].parse::<f64>() {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    let unit = parts.get(2).map(|s| s.to_lowercase()).unwrap_or_default();
+    if unit.starts_with("gib") || unit.starts_with("gb") {
+        (val * 1024.0 * 1024.0).round() as u64
+    } else if unit.starts_with("mib") || unit.starts_with("mb") {
+        (val * 1024.0).round() as u64
+    } else if unit.starts_with("kib") || unit.starts_with("kb") {
+        val.round() as u64
+    } else if unit.starts_with('b') || unit.is_empty() {
+        (val / 1024.0).round() as u64
+    } else {
+        val.round() as u64
+    }
+}
+
+/// Reads the total active GPU memory (VRAM / GTT) in KiB allocated by a process from `/proc/[pid]/fdinfo`.
+pub fn read_process_gpu_mem_kb(pid: u32) -> u64 {
+    let mut client_map: HashMap<u64, (u64, u64)> = HashMap::new();
+    let mut anon_client_idx = 1_000_000u64;
+
+    if let Ok(fd_entries) = fs::read_dir(format!("/proc/{}/fdinfo", pid)) {
+        for fd_entry in fd_entries.filter_map(Result::ok) {
+            if let Ok(fd_content) = fs::read_to_string(fd_entry.path()) {
+                let mut is_drm = false;
+                let mut client_id = None;
+                let mut vram_kb = 0u64;
+                let mut gtt_kb = 0u64;
+
+                for line in fd_content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("drm-driver:") {
+                        is_drm = true;
+                    } else if trimmed.starts_with("drm-client-id:") {
+                        is_drm = true;
+                        if let Some(id_str) = trimmed.split_whitespace().nth(1)
+                            && let Ok(id) = id_str.parse::<u64>()
+                        {
+                            client_id = Some(id);
+                        }
+                    } else if trimmed.starts_with("drm-resident-vram:")
+                        || trimmed.starts_with("drm-resident-local:")
+                        || trimmed.starts_with("drm-memory-vram:")
+                        || trimmed.starts_with("drm-memory-local:")
+                        || trimmed.starts_with("amd-requested-vram:")
+                    {
+                        is_drm = true;
+                        let parsed = parse_drm_memory_kb(trimmed);
+                        vram_kb = vram_kb.max(parsed);
+                    } else if trimmed.starts_with("drm-total-vram:")
+                        || trimmed.starts_with("drm-total-local:")
+                    {
+                        is_drm = true;
+                        let parsed = parse_drm_memory_kb(trimmed);
+                        if vram_kb == 0 {
+                            vram_kb = parsed;
+                        }
+                    } else if trimmed.starts_with("drm-resident-gtt:")
+                        || trimmed.starts_with("drm-memory-gtt:")
+                        || trimmed.starts_with("amd-requested-gtt:")
+                    {
+                        is_drm = true;
+                        let parsed = parse_drm_memory_kb(trimmed);
+                        gtt_kb = gtt_kb.max(parsed);
+                    } else if trimmed.starts_with("drm-total-gtt:") {
+                        is_drm = true;
+                        let parsed = parse_drm_memory_kb(trimmed);
+                        if gtt_kb == 0 {
+                            gtt_kb = parsed;
+                        }
+                    }
+                }
+
+                if is_drm {
+                    let id = client_id.unwrap_or_else(|| {
+                        anon_client_idx += 1;
+                        anon_client_idx
+                    });
+                    let entry = client_map.entry(id).or_insert((0, 0));
+                    entry.0 = entry.0.max(vram_kb);
+                    entry.1 = entry.1.max(gtt_kb);
+                }
+            }
+        }
+    }
+
+    let total_vram: u64 = client_map.values().map(|(v, _)| *v).sum();
+    let total_gtt: u64 = client_map.values().map(|(_, g)| *g).sum();
+
+    if total_vram > 0 {
+        total_vram
+    } else {
+        total_gtt
+    }
+}
+
+/// Queries NVIDIA proprietary driver GPU memory allocations per PID using nvidia-smi if available.
+pub fn read_nvidia_gpu_mem() -> HashMap<u32, u64> {
+    let mut map = HashMap::new();
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2
+                && let Ok(pid) = parts[0].trim().parse::<u32>()
+                && let Ok(mib) = parts[1].trim().parse::<u64>()
+            {
+                *map.entry(pid).or_insert(0) += mib * 1024;
+            }
+        }
+    }
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-graphics-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2
+                && let Ok(pid) = parts[0].trim().parse::<u32>()
+                && let Ok(mib) = parts[1].trim().parse::<u64>()
+            {
+                map.entry(pid).or_insert(mib * 1024);
+            }
+        }
+    }
+    map
+}
+
 /// Reads and parses all running processes from the `/proc` virtual filesystem.
 ///
 /// Computes delta rates for CPU percentage, disk read/write throughput, and network speeds
@@ -255,6 +403,7 @@ pub fn read_processes(
 ) -> Vec<ProcessInfo> {
     let mut procs = Vec::new();
     let mut new_prev_procs = HashMap::new();
+    let nvidia_gpu_mem = read_nvidia_gpu_mem();
 
     if let Ok(entries) = fs::read_dir("/proc") {
         for entry in entries.filter_map(Result::ok) {
@@ -267,21 +416,37 @@ pub fn read_processes(
                 };
 
                 if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
+                    let mut rss_anon = 0u64;
+                    let mut rss_shmem = 0u64;
+                    let mut vm_rss = 0u64;
                     for line in status.lines() {
                         if line.starts_with("Name:") {
                             p.comm = line.trim_start_matches("Name:").trim().to_string();
                             p.name = p.comm.clone();
                         } else if line.starts_with("State:") {
                             p.state = line.trim_start_matches("State:").trim().to_string();
+                        } else if line.starts_with("RssAnon:") {
+                            let mut parts = line.split_whitespace();
+                            parts.next();
+                            rss_anon = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                        } else if line.starts_with("RssShmem:") {
+                            let mut parts = line.split_whitespace();
+                            parts.next();
+                            rss_shmem = parts.next().unwrap_or("0").parse().unwrap_or(0);
                         } else if line.starts_with("VmRSS:") {
                             let mut parts = line.split_whitespace();
                             parts.next();
-                            p.rss_kb = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                            vm_rss = parts.next().unwrap_or("0").parse().unwrap_or(0);
                         } else if line.starts_with("Uid:") {
                             let mut parts = line.split_whitespace();
                             parts.next();
                             p.uid = parts.next().unwrap_or("0").parse().unwrap_or(0);
                         }
+                    }
+                    if rss_anon + rss_shmem > 0 {
+                        p.rss_kb = rss_anon + rss_shmem;
+                    } else {
+                        p.rss_kb = vm_rss;
                     }
                 }
 
@@ -334,38 +499,41 @@ pub fn read_processes(
                 }
 
                 if let Ok(smaps) = fs::read_to_string(format!("/proc/{}/smaps_rollup", pid)) {
+                    let mut pss_anon = 0u64;
+                    let mut pss_shmem = 0u64;
+                    let mut pss_total = 0u64;
                     for line in smaps.lines() {
-                        if line.starts_with("Pss:") {
+                        if line.starts_with("Pss_Anon:") {
                             let mut parts = line.split_whitespace();
                             parts.next();
-                            p.pss_kb = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                            break;
+                            pss_anon = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                        } else if line.starts_with("Pss_Shmem:") {
+                            let mut parts = line.split_whitespace();
+                            parts.next();
+                            pss_shmem = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                        } else if line.starts_with("Pss:") {
+                            let mut parts = line.split_whitespace();
+                            parts.next();
+                            pss_total = parts.next().unwrap_or("0").parse().unwrap_or(0);
                         }
+                    }
+                    if pss_anon + pss_shmem > 0 {
+                        p.pss_kb = pss_anon + pss_shmem;
+                    } else if pss_total > 0 {
+                        p.pss_kb = pss_total;
                     }
                 }
                 if p.pss_kb == 0 {
                     p.pss_kb = p.rss_kb;
                 }
 
-                if let Ok(fd_entries) = fs::read_dir(format!("/proc/{}/fdinfo", pid)) {
-                    for fd_entry in fd_entries.filter_map(Result::ok) {
-                        if let Ok(fd_content) = fs::read_to_string(fd_entry.path()) {
-                            for line in fd_content.lines() {
-                                if (line.starts_with("drm-resident-memory:")
-                                    || line.starts_with("drm-total-memory:"))
-                                    && let Some(val_str) = line.split_whitespace().nth(1)
-                                    && let Ok(val) = val_str.parse::<u64>()
-                                {
-                                    if line.contains("KiB") || line.contains("kB") {
-                                        p.gpu_mem_kb += val;
-                                    } else {
-                                        p.gpu_mem_kb += val / 1024;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let drm_gpu_kb = read_process_gpu_mem_kb(pid);
+                let nv_gpu_kb = nvidia_gpu_mem.get(&pid).copied().unwrap_or(0);
+                p.gpu_mem_kb = if drm_gpu_kb > 0 {
+                    drm_gpu_kb
+                } else {
+                    nv_gpu_kb
+                };
 
                 if let Some(prev) = prev_procs.get(&pid)
                     && dt > 0.0
@@ -718,23 +886,36 @@ pub fn identify_process_group(name: &str) -> Option<&'static str> {
     {
         return Some("VS Code");
     }
-    if lower.contains("rust-analyzer") || lower.contains("rust_analyzer") {
+    if bin == "rust-analyzer" || bin == "rust_analyzer" {
         return Some("Rust Analyzer");
     }
-    if lower.contains("gvfs") || bin.contains("gvfs") {
+    if bin == "gvfsd" || bin.starts_with("gvfsd-") || bin.starts_with("gvfs-") {
         return Some("Gnome Virtual FileSystem");
     }
-    if lower.contains("dockerd")
-        || lower.contains("containerd")
-        || lower.contains("docker-proxy")
+    if bin == "dockerd"
+        || bin == "containerd"
+        || bin.starts_with("containerd-shim")
+        || bin == "docker-proxy"
         || bin == "docker"
     {
         return Some("Docker");
     }
-    if lower.contains("syncthing") || bin.contains("syncthing") {
+    if bin == "syncthing" || bin.starts_with("syncthing-") {
         return Some("Syncthing");
     }
-    if lower.contains("dbus") || bin.contains("dbus") {
+    if bin == "dbus-daemon"
+        || bin == "dbus-broker"
+        || bin == "dbus-broker-launch"
+        || bin == "xdg-dbus-proxy"
+        || bin == "dbus-launch"
+        || bin == "at-spi-bus-launcher"
+        || bin == "at-spi2-registryd"
+        || bin == "dbus-run-session"
+        || bin == "dbus-monitor"
+        || bin == "dbus-send"
+        || bin == "gdbus"
+        || (bin.starts_with("dbus-") && !bin.contains("dbus-python") && !bin.contains("dbus-test"))
+    {
         return Some("Dbus");
     }
     if bin == "wl-paste"
@@ -759,23 +940,10 @@ pub fn identify_process_group(name: &str) -> Option<&'static str> {
         || bin == "klipper"
         || bin == "autocutsel"
         || bin == "clipboard-sync"
-        || lower.contains("wl-paste")
-        || lower.contains("wl-copy")
-        || lower.contains("wl-clip-persist")
-        || lower.contains("cliphist")
-        || lower.contains("copyq")
-        || lower.contains("clipman")
-        || lower.contains("gpaste")
-        || lower.contains("greenclip")
-        || lower.contains("clipcatd")
-        || lower.contains("clipboard-sync")
     {
         return Some("Clipboard");
     }
-    if lower.contains("pipewire")
-        || lower.contains("wireplumber")
-        || lower.contains("pulseaudio")
-        || bin == "pipewire"
+    if bin == "pipewire"
         || bin == "pipewire-pulse"
         || bin == "wireplumber"
         || bin == "pipewire-media-session"
@@ -784,7 +952,6 @@ pub fn identify_process_group(name: &str) -> Option<&'static str> {
         || bin == "jackdbus"
         || bin == "sndiod"
         || bin == "alsactl"
-        || lower.contains("jackdbus")
         || (bin.starts_with("jackd") && !bin.contains("jackdock"))
     {
         return Some("Audio Server");
@@ -813,10 +980,30 @@ fn resolve_process_group(
         }
         if p.ppid != 0
             && p.ppid != pid
-            && let Some(g) = resolve_process_group(p.ppid, proc_map, group_map, visited)
+            && let Some(parent_group) = resolve_process_group(p.ppid, proc_map, group_map, visited)
         {
-            group_map.insert(pid, g);
-            return Some(g);
+            // Only propagate group to child if the parent group is an application suite that owns worker/tab sub-processes.
+            // Infrastructure, launchers (like D-Bus), terminal emulators, audio servers, and clipboard managers must never absorb launched children.
+            let propagates = matches!(
+                parent_group,
+                "LibreWolf"
+                    | "Firefox"
+                    | "Chrome"
+                    | "Brave"
+                    | "Edge"
+                    | "Vesktop"
+                    | "Discord"
+                    | "Spotify"
+                    | "Slack"
+                    | "Obsidian"
+                    | "Steam"
+                    | "VS Code"
+            );
+
+            if propagates {
+                group_map.insert(pid, parent_group);
+                return Some(parent_group);
+            }
         }
     }
     None
@@ -1535,6 +1722,77 @@ mod tests {
             Some("Audio Server")
         );
         assert_eq!(identify_process_group("sndiod"), Some("Audio Server"));
+
+        // Processes that must NEVER be grouped under Dbus
+        assert_eq!(
+            identify_process_group("llama-server -m /models/llama-3.2-3b.gguf --port 8080"),
+            None
+        );
+        assert_eq!(identify_process_group("llama-server --dbus-service"), None);
+        assert_eq!(
+            identify_process_group("lm-studio --enable-features=UseDBus"),
+            None
+        );
+        assert_eq!(identify_process_group("lmstudio"), None);
+        assert_eq!(
+            identify_process_group("node /home/user/app/dbus/server.js"),
+            None
+        );
+        assert_eq!(identify_process_group("python3 -m dbus_next.service"), None);
+    }
+
+    #[test]
+    fn test_dbus_does_not_absorb_unrelated_processes() {
+        let dbus_proc = ProcessInfo {
+            pid: 500,
+            ppid: 1,
+            comm: "dbus-daemon".to_string(),
+            name: "dbus-daemon --system".to_string(),
+            state: "S".to_string(),
+            rss_kb: 4096,
+            cpu_percent: 0.1,
+            ..Default::default()
+        };
+        let llama_proc = ProcessInfo {
+            pid: 1200,
+            ppid: 500, // Spawned via D-Bus activation or child of dbus-daemon
+            comm: "llama-server".to_string(),
+            name: "llama-server -m /models/test.gguf".to_string(),
+            state: "R".to_string(),
+            rss_kb: 8192000,
+            cpu_percent: 25.0,
+            ..Default::default()
+        };
+        let node_proc = ProcessInfo {
+            pid: 1201,
+            ppid: 500,
+            comm: "node".to_string(),
+            name: "node /app/server.js".to_string(),
+            state: "S".to_string(),
+            rss_kb: 65536,
+            cpu_percent: 1.0,
+            ..Default::default()
+        };
+
+        let procs = vec![dbus_proc, llama_proc, node_proc];
+        let expanded = HashSet::new();
+        let grouped =
+            group_processes_for_simple_view(&procs, &expanded, ProcessSortColumn::Cpu, false, "");
+
+        // llama-server and node must be top-level standalone entries, NOT grouped inside Dbus
+        let llama_entry = grouped
+            .iter()
+            .find(|p| p.pid == 1200)
+            .expect("llama-server should exist");
+        assert!(!llama_entry.is_group_child);
+        assert_eq!(llama_entry.group_name, None);
+
+        let node_entry = grouped
+            .iter()
+            .find(|p| p.pid == 1201)
+            .expect("node should exist");
+        assert!(!node_entry.is_group_child);
+        assert_eq!(node_entry.group_name, None);
     }
 
     #[test]
@@ -1559,5 +1817,19 @@ mod tests {
         assert!(!detail.cmdline.is_empty());
         assert!(!detail.cwd_path.is_empty());
         assert!(detail.open_fds > 0);
+    }
+
+    #[test]
+    fn test_parse_drm_memory_kb() {
+        assert_eq!(
+            parse_drm_memory_kb("drm-resident-vram:\t6279292 KiB"),
+            6279292
+        );
+        assert_eq!(parse_drm_memory_kb("drm-resident-gtt:\t2 MiB"), 2048);
+        assert_eq!(parse_drm_memory_kb("drm-resident-vram:\t6.8 GiB"), 7130317);
+        assert_eq!(parse_drm_memory_kb("drm-total-cpu:\t0"), 0);
+        assert_eq!(parse_drm_memory_kb("drm-resident-vram: 12 KiB"), 12);
+        assert_eq!(parse_drm_memory_kb("drm-memory-local:\t512 MiB"), 524288);
+        assert_eq!(parse_drm_memory_kb("drm-total-vram:\t1024 B"), 1);
     }
 }
