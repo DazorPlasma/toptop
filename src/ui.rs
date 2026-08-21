@@ -21,7 +21,7 @@ use crate::{
     },
     system::{
         BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo,
-        NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo,
+        NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo, is_item_visible,
     },
     theme::{darken_color, gradient_color, io_gradient_pct, process_cpu_color},
     utils::{
@@ -652,14 +652,23 @@ pub fn render_process_detail(
     let mut exec_lines = Vec::new();
     exec_lines.push(format!("PID:            {}", detail.info.pid));
     exec_lines.push(if !detail.parent_comm.is_empty() {
-        format!("Parent PID:     {} ({})", detail.info.ppid, detail.parent_comm)
+        format!(
+            "Parent PID:     {} ({})",
+            detail.info.ppid, detail.parent_comm
+        )
     } else {
         format!("Parent PID:     {}", detail.info.ppid)
     });
-    exec_lines.push(format!("User:           {} (UID {})", detail.info.user, detail.info.uid));
+    exec_lines.push(format!(
+        "User:           {} (UID {})",
+        detail.info.user, detail.info.uid
+    ));
     exec_lines.push(format!("State:          {}", detail.info.state));
     exec_lines.push(format!("Threads:        {}", detail.info.threads));
-    exec_lines.push(format!("Priority:       {} (Nice: {})", detail.priority, detail.nice));
+    exec_lines.push(format!(
+        "Priority:       {} (Nice: {})",
+        detail.priority, detail.nice
+    ));
     if detail.voluntary_ctxt_switches > 0 || detail.nonvoluntary_ctxt_switches > 0 {
         exec_lines.push(format!(
             "Context Sw:     {} vol / {} non-vol",
@@ -678,7 +687,10 @@ pub fn render_process_detail(
     for (r, line) in exec_lines.iter().enumerate() {
         let row_y = exec_inner.y + r as u16;
         if row_y < exec_inner.bottom() {
-            let spans = vec![Span::styled(line, Style::default().fg(Color::Rgb(220, 220, 220)))];
+            let spans = vec![Span::styled(
+                line,
+                Style::default().fg(Color::Rgb(220, 220, 220)),
+            )];
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(Line::from(spans)),
                 Rect {
@@ -816,7 +828,9 @@ pub fn render_process_detail(
         io_lines.push((
             "GPU VRAM:       ".to_string(),
             format_bytes_dyn((detail.info.gpu_mem_kb * 1024) as f64),
-            gradient_color((detail.info.gpu_mem_kb as f64 / (8.0 * 1024.0 * 1024.0) * 100.0).clamp(0.0, 100.0)),
+            gradient_color(
+                (detail.info.gpu_mem_kb as f64 / (8.0 * 1024.0 * 1024.0) * 100.0).clamp(0.0, 100.0),
+            ),
         ));
     }
 
@@ -870,11 +884,17 @@ pub fn render_process_detail(
 
         let p_lines = vec![
             Line::from(vec![
-                Span::styled("Binary (exe): ", Style::default().fg(Color::Rgb(160, 160, 160))),
+                Span::styled(
+                    "Binary (exe): ",
+                    Style::default().fg(Color::Rgb(160, 160, 160)),
+                ),
                 Span::styled(exe_str, Style::default().fg(Color::Rgb(0, 255, 255)).bold()),
             ]),
             Line::from(vec![
-                Span::styled("Working Dir:  ", Style::default().fg(Color::Rgb(160, 160, 160))),
+                Span::styled(
+                    "Working Dir:  ",
+                    Style::default().fg(Color::Rgb(160, 160, 160)),
+                ),
                 Span::styled(cwd_str, Style::default().fg(Color::Rgb(220, 220, 220))),
             ]),
         ];
@@ -892,8 +912,8 @@ pub fn render_process_detail(
 
     if cmd_inner.height > 0 && cmd_inner.width > 0 {
         let spans = format_command_spans(&detail.cmdline, true);
-        let para = ratatui::widgets::Paragraph::new(spans)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+        let para =
+            ratatui::widgets::Paragraph::new(spans).wrap(ratatui::widgets::Wrap { trim: false });
         frame.render_widget(para, cmd_inner);
     }
 }
@@ -2023,6 +2043,7 @@ pub fn is_disks_overflow(area: Rect, disk_io: &DiskIoInfo, disk_mounts: &[MountI
 /// * `disk_write_history` - Historical write speed samples for Braille graphing.
 /// * `storage_categories` - Detected package and runtime storage categories.
 /// * `active_cat_idx` - Selected sub-tab category index.
+/// * `selected_item_idx` - Selected item row index in the active category for interactive tree expansion.
 /// * `scroll_offset` - Vertical scroll offset within the active category's item list.
 /// * `box_tab` - Selected box index when in tabbed view (0: Graphs, 1: Physical Disks, 2: Storage, 3: Mounted Filesystems).
 /// * `is_snapshot` - Whether historical snapshot telemetry is currently being inspected.
@@ -2037,9 +2058,11 @@ pub fn render_disks_tab(
     disk_write_history: &[Option<f64>],
     storage_categories: &[PackageStorageCategory],
     active_cat_idx: usize,
+    selected_item_idx: usize,
     scroll_offset: usize,
     box_tab: usize,
     is_snapshot: bool,
+    show_hidden: bool,
     is_dust_scanning: bool,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -2137,8 +2160,10 @@ pub fn render_disks_tab(
                     body,
                     storage_categories,
                     active_cat_idx,
+                    selected_item_idx,
                     scroll_offset,
                     is_snapshot,
+                    show_hidden,
                     is_dust_scanning,
                 );
             }
@@ -2196,8 +2221,10 @@ pub fn render_disks_tab(
             bottom_chunks[0],
             storage_categories,
             active_cat_idx,
+            selected_item_idx,
             scroll_offset,
             is_snapshot,
+            show_hidden,
             is_dust_scanning,
         );
         render_mounted_filesystems_card(frame, bottom_chunks[1], disk_mounts);
@@ -2283,26 +2310,45 @@ fn render_physical_disks_card(frame: &mut Frame, area: Rect, disk_io: &DiskIoInf
 }
 
 /// Renders the Package & Application Storage block displaying detected storage categories.
+#[allow(clippy::too_many_arguments)]
 fn render_package_storage_card(
     frame: &mut Frame,
     area: Rect,
     storage_categories: &[PackageStorageCategory],
     active_cat_idx: usize,
+    selected_item_idx: usize,
     scroll_offset: usize,
     is_snapshot: bool,
+    show_hidden: bool,
     is_dust_scanning: bool,
 ) {
-    let card_title = if is_snapshot || storage_categories.is_empty() {
-        " Store ".to_string()
+    let (card_title, is_all_cat) = if is_snapshot || storage_categories.is_empty() {
+        (" Store ".to_string(), false)
     } else {
         let cat_idx = active_cat_idx.min(storage_categories.len().saturating_sub(1));
-        format!(" {} ", storage_categories[cat_idx].name)
+        (
+            format!(" {} ", storage_categories[cat_idx].name),
+            storage_categories[cat_idx].name == "All",
+        )
     };
-    let pkg_block = Block::default()
+
+    let mut pkg_block = Block::default()
         .title(card_title.fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
+
+    if is_all_cat {
+        let bottom_label = if show_hidden {
+            " '.' - show less "
+        } else {
+            " '.' - show more "
+        };
+        pkg_block = pkg_block.title_bottom(
+            Line::from(bottom_label.fg(Color::Rgb(140, 140, 140)))
+                .alignment(ratatui::layout::Alignment::Left),
+        );
+    }
     let pkg_inner = pkg_block.inner(area);
     frame.render_widget(pkg_block, area);
 
@@ -2322,7 +2368,7 @@ fn render_package_storage_card(
             }
         } else if storage_categories.is_empty() {
             let msg = "Scanning package and runtime storage in background...";
-            let sub = "(Supported: All (dust), Docker, Podman, Cargo, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm • 20s refresh)";
+            let sub = "(Supported: All, Docker, Podman, Cargo, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm • 20s refresh)";
             let row = pkg_inner.y + 1;
             for (c_idx, ch) in msg.chars().enumerate() {
                 let col = pkg_inner.x + 2 + c_idx as u16;
@@ -2344,7 +2390,19 @@ fn render_package_storage_card(
         } else {
             let cat_idx = active_cat_idx.min(storage_categories.len().saturating_sub(1));
             let active_cat = &storage_categories[cat_idx];
-            let total_items = active_cat.items.len();
+            let is_all_cat = active_cat.name == "All";
+            let visible_indices: Vec<usize> = if is_all_cat {
+                active_cat
+                    .items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| is_item_visible(item, show_hidden))
+                    .map(|(idx, _)| idx)
+                    .collect()
+            } else {
+                (0..active_cat.items.len()).collect()
+            };
+            let total_items = visible_indices.len();
 
             // 1. Render Sub-Tabs Header Line (wrapping to 2 rows if overflowing)
             let mut subtab_rows = 1;
@@ -2397,7 +2455,7 @@ fn render_package_storage_card(
 
             if active_cat.items.is_empty() {
                 let msg = if is_dust_scanning && active_cat.name == "All" {
-                    "Scanning disk with dust in background..."
+                    "Scanning disk..."
                 } else if active_cat.name == "All" {
                     "Press Enter to scan disk scan."
                 } else {
@@ -2417,6 +2475,17 @@ fn render_package_storage_card(
                             .set_style(Style::default().fg(color));
                     }
                 }
+            } else if visible_indices.is_empty() {
+                let msg = "All items filtered (<4.0 KB or hidden). Press '.' to show all.";
+                let row = pkg_inner.y + subtab_rows + 1;
+                for (c_idx, ch) in msg.chars().enumerate() {
+                    let col = pkg_inner.x + 2 + c_idx as u16;
+                    if col < pkg_inner.right() && row < pkg_inner.bottom() {
+                        frame.buffer_mut()[(col, row)]
+                            .set_char(ch)
+                            .set_style(Style::default().fg(Color::Rgb(140, 140, 140)));
+                    }
+                }
             } else {
                 // 2. Items list with scroll offset (clean 1-line text with size)
                 let start_row_offset = subtab_rows + 1;
@@ -2425,30 +2494,71 @@ fn render_package_storage_card(
                 let max_scroll = total_items.saturating_sub(visible_rows);
                 let start_idx = scroll_offset.min(max_scroll);
 
-                for (row_offset, item) in
-                    (start_row_offset..).zip(active_cat.items.iter().skip(start_idx))
+                for (row_offset, (v_idx, &actual_item_idx)) in
+                    (start_row_offset..).zip(visible_indices.iter().enumerate().skip(start_idx))
                 {
                     if row_offset >= pkg_inner.height {
                         break;
                     }
+                    let item = &active_cat.items[actual_item_idx];
                     let row_y = pkg_inner.y + row_offset;
+                    let is_selected = v_idx == selected_item_idx;
                     let right_label = &item.size_str;
                     let right_len = right_label.chars().count() as u16;
 
+                    // If selected, highlight entire row background
+                    if is_selected {
+                        for col in (pkg_inner.x + 1)..pkg_inner.right() {
+                            frame.buffer_mut()[(col, row_y)]
+                                .set_style(Style::default().bg(Color::Rgb(45, 45, 45)));
+                        }
+                    }
+
                     // Right aligned size text
                     let r_col = pkg_inner.right().saturating_sub(right_len + 1);
+                    let size_style = if is_selected {
+                        Style::default()
+                            .fg(Color::Rgb(255, 255, 255))
+                            .bg(Color::Rgb(45, 45, 45))
+                            .bold()
+                    } else {
+                        Style::default().fg(Color::Rgb(255, 255, 255)).bold()
+                    };
                     for (c_idx, ch) in right_label.chars().enumerate() {
                         let col = r_col + c_idx as u16;
                         if col < pkg_inner.right() {
                             frame.buffer_mut()[(col, row_y)]
                                 .set_char(ch)
-                                .set_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold());
+                                .set_style(size_style);
                         }
                     }
 
-                    // Left aligned name and detail
+                    // Left aligned name and detail with tree glyphs
                     let max_left_w = (r_col.saturating_sub(pkg_inner.x + 2)) as usize;
-                    let full_left = if item.detail.is_empty() {
+                    let full_left = if is_all_cat {
+                        let indent = "  ".repeat(item.depth);
+                        let arrow = if item.is_dir {
+                            if item.is_expanded { "▼ " } else { "▶ " }
+                        } else {
+                            "• "
+                        };
+                        let branch = if item.depth > 0 { "├─ " } else { "" };
+                        let display_name = if item.depth == 0 {
+                            &item.path
+                        } else {
+                            &item.name
+                        };
+                        let detail_str = if item.is_scanning {
+                            "scanning...".to_string()
+                        } else {
+                            item.detail.clone()
+                        };
+                        if detail_str.is_empty() {
+                            format!("{indent}{branch}{arrow}{display_name}")
+                        } else {
+                            format!("{indent}{branch}{arrow}{display_name} [{detail_str}]")
+                        }
+                    } else if item.detail.is_empty() {
                         format!("• {}", item.name)
                     } else {
                         format!("• {} [{}]", item.name, item.detail)
@@ -2463,18 +2573,42 @@ fn render_package_storage_card(
                         full_left
                     };
 
+                    let bracket_pos = truncated_left
+                        .chars()
+                        .position(|c| c == '[')
+                        .unwrap_or(usize::MAX);
+
                     for (c_idx, ch) in truncated_left.chars().enumerate() {
-                        let col = pkg_inner.x + c_idx as u16;
+                        let col = pkg_inner.x + 2 + c_idx as u16;
                         if col < r_col {
-                            let is_detail = ch == '[' || ch == ']' || (c_idx > item.name.len() + 2);
-                            let color = if is_detail {
-                                Color::Rgb(140, 140, 140)
+                            let is_detail = c_idx >= bracket_pos;
+                            let color = if is_selected {
+                                if is_detail {
+                                    if item.is_scanning {
+                                        Color::Rgb(255, 204, 0)
+                                    } else {
+                                        Color::Rgb(200, 200, 200)
+                                    }
+                                } else {
+                                    Color::Rgb(255, 255, 255)
+                                }
+                            } else if is_detail {
+                                if item.is_scanning {
+                                    Color::Rgb(255, 204, 0)
+                                } else {
+                                    Color::Rgb(140, 140, 140)
+                                }
                             } else {
                                 Color::Rgb(230, 230, 230)
                             };
+                            let style = if is_selected {
+                                Style::default().fg(color).bg(Color::Rgb(45, 45, 45)).bold()
+                            } else {
+                                Style::default().fg(color)
+                            };
                             frame.buffer_mut()[(col, row_y)]
                                 .set_char(ch)
-                                .set_style(Style::default().fg(color));
+                                .set_style(style);
                         }
                     }
                 }
@@ -4075,7 +4209,9 @@ pub fn render_process_error_popup(
 ) -> Rect {
     let popup_width = 62.min(area.width.saturating_sub(4));
     let content_lines = popup.message_lines.len() as u16;
-    let popup_height = (5 + content_lines).min(area.height.saturating_sub(2)).max(6);
+    let popup_height = (5 + content_lines)
+        .min(area.height.saturating_sub(2))
+        .max(6);
     let popup_x = area.x + (area.width.saturating_sub(popup_width)) / 2;
     let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_rect = Rect::new(popup_x, popup_y, popup_width, popup_height);
@@ -4096,11 +4232,19 @@ pub fn render_process_error_popup(
     for msg in &popup.message_lines {
         lines.push(Line::from(vec![
             Span::raw(" "),
-            Span::styled(msg.clone(), Style::default().fg(Color::Rgb(255, 230, 230)).bold()),
+            Span::styled(
+                msg.clone(),
+                Style::default().fg(Color::Rgb(255, 230, 230)).bold(),
+            ),
         ]));
     }
 
-    let text_area = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1));
+    let text_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
     frame.render_widget(ratatui::widgets::Paragraph::new(lines), text_area);
 
     let btn_w = 18;
@@ -4200,4 +4344,3 @@ mod tests {
         assert!(!is_gpu_overflow(area_large, &gpu_long));
     }
 }
-

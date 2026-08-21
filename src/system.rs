@@ -10,8 +10,8 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
-        mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
+        mpsc::{Receiver, Sender, channel},
     },
 };
 
@@ -736,12 +736,15 @@ pub fn read_gpu_metrics() -> GpuMetrics {
                         metrics.gtt_used_mb = u_bytes / (1024 * 1024);
                     }
 
-                    if let Ok(vendor_str) = fs::read_to_string(dev_path.join("mem_info_vram_vendor")) {
+                    if let Ok(vendor_str) =
+                        fs::read_to_string(dev_path.join("mem_info_vram_vendor"))
+                    {
                         let v = vendor_str.trim();
                         if !v.is_empty() {
                             let mut chars = v.chars();
                             if let Some(first) = chars.next() {
-                                metrics.memory_vendor = format!("{}{}", first.to_uppercase(), chars.as_str());
+                                metrics.memory_vendor =
+                                    format!("{}{}", first.to_uppercase(), chars.as_str());
                             }
                         }
                     }
@@ -790,21 +793,29 @@ pub fn read_gpu_metrics() -> GpuMetrics {
                     if let Ok(hwmon_entries) = fs::read_dir(dev_path.join("hwmon")) {
                         for h_entry in hwmon_entries.filter_map(Result::ok) {
                             let h_path = h_entry.path();
-                            
+
                             // Temperatures
                             for i in 1..=4 {
-                                if let Ok(input_str) = fs::read_to_string(h_path.join(format!("temp{}_input", i)))
+                                if let Ok(input_str) =
+                                    fs::read_to_string(h_path.join(format!("temp{}_input", i)))
                                     && let Ok(temp_milli) = input_str.trim().parse::<u32>()
                                 {
                                     let temp_val = temp_milli / 1000;
-                                    let label = fs::read_to_string(h_path.join(format!("temp{}_label", i)))
-                                        .map(|s| s.trim().to_lowercase())
-                                        .unwrap_or_default();
+                                    let label =
+                                        fs::read_to_string(h_path.join(format!("temp{}_label", i)))
+                                            .map(|s| s.trim().to_lowercase())
+                                            .unwrap_or_default();
                                     if label == "edge" || (i == 1 && metrics.temp_edge_c == 0) {
                                         metrics.temp_edge_c = temp_val;
-                                    } else if label == "junction" || label == "hotspot" || (i == 2 && metrics.temp_junction_c == 0) {
+                                    } else if label == "junction"
+                                        || label == "hotspot"
+                                        || (i == 2 && metrics.temp_junction_c == 0)
+                                    {
                                         metrics.temp_junction_c = temp_val;
-                                    } else if label == "mem" || label == "vram" || (i == 3 && metrics.temp_mem_c == 0) {
+                                    } else if label == "mem"
+                                        || label == "vram"
+                                        || (i == 3 && metrics.temp_mem_c == 0)
+                                    {
                                         metrics.temp_mem_c = temp_val;
                                     }
                                 }
@@ -855,8 +866,7 @@ pub fn read_gpu_metrics() -> GpuMetrics {
 
                             // Frequencies
                             if metrics.cur_mhz <= 0.0
-                                && let Ok(freq_str) =
-                                    fs::read_to_string(h_path.join("freq1_input"))
+                                && let Ok(freq_str) = fs::read_to_string(h_path.join("freq1_input"))
                                 && let Ok(freq_hz) = freq_str.trim().parse::<f64>()
                             {
                                 metrics.cur_mhz = freq_hz / 1_000_000.0;
@@ -1541,7 +1551,7 @@ pub fn get_dir_size<P: AsRef<std::path::Path>>(path: P) -> u64 {
     total
 }
 
-/// An individual package, prefix, cache, or volume item within a package manager / runtime storage category.
+/// An individual package, prefix, cache, volume, or directory item within a storage category.
 #[derive(Clone, Default)]
 pub struct PackageStorageItem {
     /// Name or identifier of the item.
@@ -1552,21 +1562,52 @@ pub struct PackageStorageItem {
     pub size_bytes: u64,
     /// Formatted human-readable size string.
     pub size_str: String,
+    /// Absolute filesystem path (used for expandable tree navigation).
+    pub path: String,
+    /// Whether this item is a directory that can be expanded.
+    pub is_dir: bool,
+    /// Whether this directory item is currently expanded in the tree view.
+    pub is_expanded: bool,
+    /// Whether this directory is currently being scanned in the background.
+    pub is_scanning: bool,
+    /// Indentation depth level in the file tree (0 for root items).
+    pub depth: usize,
+}
+
+impl PackageStorageItem {
+    /// Creates a new storage item with default tree properties.
+    #[allow(dead_code)]
+    pub fn new(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        size_bytes: u64,
+        size_str: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            detail: detail.into(),
+            size_bytes,
+            size_str: size_str.into(),
+            path: String::new(),
+            is_dir: false,
+            is_expanded: false,
+            is_scanning: false,
+            depth: 0,
+        }
+    }
 }
 
 /// Disk space metrics for a detected package manager, container engine, or runtime environment.
 #[derive(Clone, Default)]
 pub struct PackageStorageCategory {
-    /// Category display title (e.g. "Docker", "Wine", "Flatpak", "Snap", "Nix Store", "APT", "DNF", "Pacman", "npm").
+    /// Category display title (e.g. "All", "Docker", "Wine", "Flatpak", "Snap", "Nix Store", "APT", "DNF", "Pacman", "Cargo", "npm").
     pub name: String,
     /// Formatted total storage size string.
     pub total_str: String,
-    /// List of individual volume, package, prefix, or cache components.
+    /// List of individual volume, package, prefix, cache, or directory components.
     pub items: Vec<PackageStorageItem>,
 }
 
-/// Queries all 9 supported storage systems (Docker, Wine, Flatpak, Snap, Nix, APT, DNF, Pacman, npm)
-/// and returns only those categories that are detected on the host system.
 /// Parses the stdout from `dust` into a `PackageStorageCategory`.
 ///
 /// # Arguments
@@ -1597,13 +1638,7 @@ pub fn parse_dust_output(stdout: &str) -> Option<PackageStorageCategory> {
 
         let without_tree = rest
             .trim_start_matches(|c| {
-                c == '┌'
-                    || c == '├'
-                    || c == '└'
-                    || c == '─'
-                    || c == '┴'
-                    || c == '│'
-                    || c == ' '
+                c == '┌' || c == '├' || c == '└' || c == '─' || c == '┴' || c == '│' || c == ' '
             })
             .trim();
 
@@ -1637,17 +1672,18 @@ pub fn parse_dust_output(stdout: &str) -> Option<PackageStorageCategory> {
             total_bytes = size_bytes;
             total_str = format_bytes_dyn(size_bytes as f64);
         } else {
-            let detail = if !pct_str.is_empty() {
-                format!("{} of root filesystem ({})", pct_str, full_path)
-            } else {
-                full_path.clone()
-            };
+            let detail = pct_str;
 
             items.push(PackageStorageItem {
-                name: full_path,
+                name: full_path.clone(),
                 detail,
                 size_bytes,
                 size_str: format_bytes_dyn(size_bytes as f64),
+                path: full_path,
+                is_dir: true,
+                is_expanded: false,
+                is_scanning: false,
+                depth: 0,
             });
         }
     }
@@ -1670,6 +1706,169 @@ pub fn parse_dust_output(stdout: &str) -> Option<PackageStorageCategory> {
     } else {
         None
     }
+}
+
+/// Parses child directory items from `dust -d 1 -c <parent_path>` stdout.
+///
+/// # Arguments
+/// * `parent_path` - The parent directory path being expanded.
+/// * `parent_depth` - The indentation depth of the parent directory.
+/// * `stdout` - Raw output from `dust`.
+///
+/// # Returns
+/// A vector of child `PackageStorageItem`s.
+pub fn parse_dust_children(
+    parent_path: &str,
+    parent_depth: usize,
+    stdout: &str,
+) -> Vec<PackageStorageItem> {
+    let mut items = Vec::new();
+    let norm_parent = parent_path.trim_end_matches('/');
+    let parent_base = std::path::Path::new(norm_parent)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| norm_parent.to_string());
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        let size_tok = parts.next().unwrap_or("");
+        let size_bytes = parse_size_to_bytes(size_tok);
+
+        let rest = if let Some(idx) = trimmed.find(char::is_whitespace) {
+            trimmed[idx..].trim_start()
+        } else {
+            ""
+        };
+
+        let without_tree = rest
+            .trim_start_matches(|c| {
+                c == '┌' || c == '├' || c == '└' || c == '─' || c == '┴' || c == '│' || c == ' '
+            })
+            .trim();
+
+        let dir_name = if let Some(pipe_idx) = without_tree.find('│') {
+            without_tree[..pipe_idx].trim()
+        } else if let Some(bar_idx) = without_tree.find('|') {
+            without_tree[..bar_idx].trim()
+        } else {
+            without_tree.split_whitespace().next().unwrap_or("")
+        };
+
+        if dir_name.is_empty() {
+            continue;
+        }
+
+        // If this line is the parent summary (e.g. ┌─┴ home or matches parent base), skip it
+        if trimmed.contains("┌─┴") || dir_name == parent_base || dir_name == norm_parent {
+            continue;
+        }
+
+        let pct_str = if let Some(last_pipe) = trimmed.rfind('│') {
+            trimmed[last_pipe + '│'.len_utf8()..].trim().to_string()
+        } else if let Some(last_bar) = trimmed.rfind('|') {
+            trimmed[last_bar + 1..].trim().to_string()
+        } else {
+            String::new()
+        };
+
+        let child_path = if norm_parent.is_empty() {
+            format!("/{}", dir_name)
+        } else {
+            format!("{}/{}", norm_parent, dir_name)
+        };
+        let is_dir = std::path::Path::new(&child_path).is_dir();
+
+        let detail = pct_str;
+
+        items.push(PackageStorageItem {
+            name: dir_name.to_string(),
+            detail,
+            size_bytes,
+            size_str: format_bytes_dyn(size_bytes as f64),
+            path: child_path,
+            is_dir,
+            is_expanded: false,
+            is_scanning: false,
+            depth: parent_depth + 1,
+        });
+    }
+
+    items.sort_by(|a, b| {
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    items
+}
+
+/// Determines if a file/directory item in the storage tree view should be displayed
+/// based on the hidden files and minimum size (4.0 KB) filter.
+///
+/// Edge case: if a folder/file is hidden (starts with `.`) but has at least 1 GB
+/// (`size_bytes >= 1024 * 1024 * 1024`), it is displayed even when hidden files are toggled off.
+///
+/// # Arguments
+/// * `item` - The item to evaluate.
+/// * `show_hidden` - If true, displays all items including hidden and < 4.0 KB files.
+///
+/// # Returns
+/// `true` if the item is visible under the current filter settings.
+pub fn is_item_visible(item: &PackageStorageItem, show_hidden: bool) -> bool {
+    if show_hidden {
+        return true;
+    }
+    // Files/folders of 4.0 KB or smaller (e.g. empty directories like /root) are hidden by default
+    if item.size_bytes <= 4096 {
+        return false;
+    }
+    let is_hidden = if item.depth == 0 {
+        item.name.trim_start_matches('/').starts_with('.')
+    } else {
+        item.name.starts_with('.')
+    };
+    // Edge case: if hidden (starts with .) but has at least 1 GB (1 GiB = 1024^3 bytes), show it
+    if is_hidden && item.size_bytes < 1024 * 1024 * 1024 {
+        return false;
+    }
+    true
+}
+
+/// Scans an individual directory path using `dust` and returns its child items.
+///
+/// # Arguments
+/// * `parent_path` - Directory to scan (e.g. `"/home"`, `"/var"`).
+/// * `parent_depth` - Indentation depth of the parent item in the tree.
+///
+/// # Returns
+/// A sorted vector of child `PackageStorageItem`s with `depth = parent_depth + 1`.
+pub fn read_dust_path(parent_path: &str, parent_depth: usize) -> Vec<PackageStorageItem> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let dust_bins = [
+        "dust",
+        "/run/current-system/sw/bin/dust",
+        "/usr/bin/dust",
+        &format!("{}/.nix-profile/bin/dust", home),
+        &format!("{}/.cargo/bin/dust", home),
+    ];
+
+    for bin in dust_bins {
+        if let Ok(output) = std::process::Command::new(bin)
+            .args(["-d", "1", "-c", parent_path])
+            .output()
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return parse_dust_children(parent_path, parent_depth, &stdout);
+        }
+    }
+
+    Vec::new()
 }
 
 /// Scans the entire filesystem root breakdown using the `dust` CLI.
@@ -1727,6 +1926,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 },
                 size_bytes: vol.size_bytes,
                 size_str: vol.size_str,
+                ..Default::default()
             });
         }
         items.sort_by(|a, b| {
@@ -1814,6 +2014,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: path_str,
                 size_bytes: size,
                 size_str: format_bytes_dyn(size as f64),
+                ..Default::default()
             });
         }
     }
@@ -1868,6 +2069,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                             detail,
                             size_bytes: size,
                             size_str: format_bytes_dyn(size as f64),
+                            ..Default::default()
                         });
                     }
                 }
@@ -1885,6 +2087,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "Per-application storage & config".to_string(),
                 size_bytes: app_data_size,
                 size_str: format_bytes_dyn(app_data_size as f64),
+                ..Default::default()
             });
         }
     }
@@ -1898,6 +2101,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                     detail: "/var/lib/flatpak".to_string(),
                     size_bytes: sys_flatpak,
                     size_str: format_bytes_dyn(sys_flatpak as f64),
+                    ..Default::default()
                 });
             }
         }
@@ -1934,6 +2138,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                         detail: format!("Publisher: {}", publisher),
                         size_bytes: 0,
                         size_str: "Installed".to_string(),
+                        ..Default::default()
                     });
                 }
             }
@@ -1950,6 +2155,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                     detail: snap_dir.to_string(),
                     size_bytes: size,
                     size_str: format_bytes_dyn(size as f64),
+                    ..Default::default()
                 });
             }
         }
@@ -2028,6 +2234,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                                     detail: pkg_root,
                                     size_bytes: size,
                                     size_str: format_bytes_dyn(size as f64),
+                                    ..Default::default()
                                 });
                             }
                         }
@@ -2051,6 +2258,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                         detail: target_str,
                         size_bytes: size,
                         size_str: format_bytes_dyn(size as f64),
+                        ..Default::default()
                     });
                 }
             }
@@ -2062,6 +2270,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
             detail: format!("{} total store paths indexed", path_count),
             size_bytes: nix_size,
             size_str: format_bytes_dyn(nix_size as f64),
+            ..Default::default()
         });
 
         items.sort_by(|a, b| {
@@ -2091,6 +2300,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "/var/cache/apt/archives".to_string(),
                 size_bytes: archives_size,
                 size_str: format_bytes_dyn(archives_size as f64),
+                ..Default::default()
             });
         }
         let dpkg_size = get_dir_size("/var/lib/dpkg");
@@ -2101,6 +2311,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "/var/lib/dpkg".to_string(),
                 size_bytes: dpkg_size,
                 size_str: format_bytes_dyn(dpkg_size as f64),
+                ..Default::default()
             });
         }
         if apt_total > 0 || !items.is_empty() {
@@ -2134,6 +2345,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                         detail: path.to_string(),
                         size_bytes: size,
                         size_str: format_bytes_dyn(size as f64),
+                        ..Default::default()
                     });
                 }
             }
@@ -2166,6 +2378,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "/var/cache/pacman/pkg".to_string(),
                 size_bytes: pkg_size,
                 size_str: format_bytes_dyn(pkg_size as f64),
+                ..Default::default()
             });
         }
         let db_size = get_dir_size("/var/lib/pacman");
@@ -2176,6 +2389,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "/var/lib/pacman".to_string(),
                 size_bytes: db_size,
                 size_str: format_bytes_dyn(db_size as f64),
+                ..Default::default()
             });
         }
         if pac_total > 0 || !items.is_empty() {
@@ -2198,7 +2412,10 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
     let podman_rootless = format!("{}/.local/share/containers/storage", home);
     for (root, kind) in &[
         (podman_rootless.as_str(), "User (~/.local/share/containers)"),
-        ("/var/lib/containers/storage", "System (/var/lib/containers)"),
+        (
+            "/var/lib/containers/storage",
+            "System (/var/lib/containers)",
+        ),
     ] {
         if std::path::Path::new(root).exists() {
             let subdirs = [
@@ -2215,10 +2432,19 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                     if size > 0 {
                         podman_total += size;
                         podman_items.push(PackageStorageItem {
-                            name: format!("{}: {}", if root.starts_with("/var") { "sys" } else { "user" }, subdir),
+                            name: format!(
+                                "{}: {}",
+                                if root.starts_with("/var") {
+                                    "sys"
+                                } else {
+                                    "user"
+                                },
+                                subdir
+                            ),
                             detail: format!("{} ({})", desc, kind),
                             size_bytes: size,
                             size_str: format_bytes_dyn(size as f64),
+                            ..Default::default()
                         });
                     }
                 }
@@ -2261,6 +2487,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                         detail: format!("Installed CLI Binary ({})", p.to_string_lossy()),
                         size_bytes: size,
                         size_str: format_bytes_dyn(size as f64),
+                        ..Default::default()
                     });
                 }
             }
@@ -2288,6 +2515,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                         detail: format!("{} downloaded .crate packages", count),
                         size_bytes: cache_dir_size,
                         size_str: format_bytes_dyn(cache_dir_size as f64),
+                        ..Default::default()
                     });
                 }
             }
@@ -2305,6 +2533,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: registry_src,
                 size_bytes: src_size,
                 size_str: format_bytes_dyn(src_size as f64),
+                ..Default::default()
             });
         }
     }
@@ -2320,6 +2549,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: cargo_git,
                 size_bytes: git_size,
                 size_str: format_bytes_dyn(git_size as f64),
+                ..Default::default()
             });
         }
     }
@@ -2336,9 +2566,13 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                     let tc_name = entry.file_name().to_string_lossy().to_string();
                     cargo_items.push(PackageStorageItem {
                         name: format!("toolchain: {}", tc_name),
-                        detail: format!("Rust compiler & standard library ({})", p.to_string_lossy()),
+                        detail: format!(
+                            "Rust compiler & standard library ({})",
+                            p.to_string_lossy()
+                        ),
                         size_bytes: size,
                         size_str: format_bytes_dyn(size as f64),
+                        ..Default::default()
                     });
                 }
             }
@@ -2356,6 +2590,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: sccache_dir,
                 size_bytes: sc_size,
                 size_str: format_bytes_dyn(sc_size as f64),
+                ..Default::default()
             });
         }
     }
@@ -2389,6 +2624,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "HTTP responses, tarballs & metadata index".to_string(),
                 size_bytes: cacache_size,
                 size_str: format_bytes_dyn(cacache_size as f64),
+                ..Default::default()
             });
         }
 
@@ -2410,9 +2646,13 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                                 npm_total += size;
                                 npm_items.push(PackageStorageItem {
                                     name: format!("npx: {}", name),
-                                    detail: format!("Cached npx runner package ({})", p.to_string_lossy()),
+                                    detail: format!(
+                                        "Cached npx runner package ({})",
+                                        p.to_string_lossy()
+                                    ),
                                     size_bytes: size,
                                     size_str: format_bytes_dyn(size as f64),
+                                    ..Default::default()
                                 });
                             }
                         }
@@ -2430,6 +2670,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "CLI run logs".to_string(),
                 size_bytes: logs_size,
                 size_str: format_bytes_dyn(logs_size as f64),
+                ..Default::default()
             });
         }
     }
@@ -2472,6 +2713,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                             detail: p.to_string_lossy().to_string(),
                             size_bytes: size,
                             size_str: format_bytes_dyn(size as f64),
+                            ..Default::default()
                         });
                     }
                 }
@@ -2494,6 +2736,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                         detail: p.to_string_lossy().to_string(),
                         size_bytes: size,
                         size_str: format_bytes_dyn(size as f64),
+                        ..Default::default()
                     });
                 }
             }
@@ -2511,6 +2754,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: "Content-addressable package store".to_string(),
                 size_bytes: pnpm_size,
                 size_str: format_bytes_dyn(pnpm_size as f64),
+                ..Default::default()
             });
         }
     }
@@ -2529,6 +2773,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                     detail: y_path.to_string(),
                     size_bytes: y_size,
                     size_str: format_bytes_dyn(y_size as f64),
+                    ..Default::default()
                 });
             }
         }
@@ -2545,6 +2790,7 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
                 detail: bun_cache,
                 size_bytes: bun_size,
                 size_str: format_bytes_dyn(bun_size as f64),
+                ..Default::default()
             });
         }
     }
@@ -2860,9 +3106,7 @@ fn parse_tcp_state(st_hex: &str) -> &'static str {
 ///
 /// # Returns
 /// `Ok(Vec<NetConnectionInfo>)` or `Err("Root permissions required.")` if restricted.
-pub fn read_network_connections(
-    dns: &DnsResolver,
-) -> Result<Vec<NetConnectionInfo>, &'static str> {
+pub fn read_network_connections(dns: &DnsResolver) -> Result<Vec<NetConnectionInfo>, &'static str> {
     let mut conns = Vec::new();
     let socket_map = build_socket_inode_map();
 
@@ -3001,7 +3245,10 @@ mod tests {
         let metrics = read_gpu_metrics();
         println!("GPU Name: {}", metrics.name);
         println!("Driver: {}", metrics.driver);
-        println!("VRAM: {} MB / {} MB", metrics.vram_used_mb, metrics.vram_total_mb);
+        println!(
+            "VRAM: {} MB / {} MB",
+            metrics.vram_used_mb, metrics.vram_total_mb
+        );
         println!("Utilization: {}%", metrics.utilization_pct);
         assert!(!metrics.name.is_empty());
     }
@@ -3014,21 +3261,36 @@ mod tests {
 
         let baseline = read_gpu_metrics();
         println!("\n--- [GPU Test] Baseline ---");
-        println!("GPU: {} | VRAM: {}/{} MB | Utilization: {}% | Clock: {} MHz",
-            baseline.name, baseline.vram_used_mb, baseline.vram_total_mb, baseline.utilization_pct, baseline.cur_mhz);
+        println!(
+            "GPU: {} | VRAM: {}/{} MB | Utilization: {}% | Clock: {} MHz",
+            baseline.name,
+            baseline.vram_used_mb,
+            baseline.vram_total_mb,
+            baseline.utilization_pct,
+            baseline.cur_mhz
+        );
 
         // Run VAAPI hardware encode if ffmpeg is available
         if let Ok(mut child) = Command::new("ffmpeg")
             .args([
-                "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
-                "-filter_hw_device", "va",
-                "-f", "lavfi",
-                "-i", "testsrc=size=3840x2160:rate=60",
-                "-vf", "format=nv12,hwupload",
-                "-c:v", "h264_vaapi",
-                "-b:v", "50M",
-                "-t", "3",
-                "-f", "null",
+                "-init_hw_device",
+                "vaapi=va:/dev/dri/renderD128",
+                "-filter_hw_device",
+                "va",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=3840x2160:rate=60",
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "h264_vaapi",
+                "-b:v",
+                "50M",
+                "-t",
+                "3",
+                "-f",
+                "null",
                 "-",
             ])
             .stdout(Stdio::null())
@@ -3047,10 +3309,20 @@ mod tests {
             }
             let _ = child.wait();
 
-            println!("--- [GPU Test] Workload Samples ({} samples collected) ---", samples.len());
+            println!(
+                "--- [GPU Test] Workload Samples ({} samples collected) ---",
+                samples.len()
+            );
             for (idx, s) in samples.iter().enumerate() {
-                println!("  Sample {}: Util: {:>3.0}%, VRAM: {:>4} MB, Clock: {:>4.0} MHz, Power: {:>4.1} W, Temp: {:>2}°C",
-                    idx + 1, s.utilization_pct, s.vram_used_mb, s.cur_mhz, s.power_w, s.temp_edge_c);
+                println!(
+                    "  Sample {}: Util: {:>3.0}%, VRAM: {:>4} MB, Clock: {:>4.0} MHz, Power: {:>4.1} W, Temp: {:>2}°C",
+                    idx + 1,
+                    s.utilization_pct,
+                    s.vram_used_mb,
+                    s.cur_mhz,
+                    s.power_w,
+                    s.temp_edge_c
+                );
             }
             assert!(!samples.is_empty());
         }
@@ -3084,22 +3356,123 @@ mod tests {
         assert_eq!(cat.items.len(), 6);
         assert_eq!(cat.items[0].name, "/home");
         assert_eq!(cat.items[0].size_str, "169.0 GB");
+        assert_eq!(cat.items[0].detail, "54%");
         assert_eq!(cat.items[1].name, "/nix");
         assert_eq!(cat.items[1].size_str, "120.0 GB");
+        assert_eq!(cat.items[1].detail, "38%");
         assert_eq!(cat.items[2].name, "/var");
         assert_eq!(cat.items[2].size_str, "23.0 GB");
+        assert_eq!(cat.items[2].detail, "7%");
     }
 
     #[test]
-    fn test_read_dust_storage() {
-        if let Some(dust_cat) = read_dust_storage() {
-            assert_eq!(dust_cat.name, "All");
-            assert!(!dust_cat.total_str.is_empty());
-            for item in &dust_cat.items {
-                assert!(item.name.starts_with('/'));
-            }
-        }
+    fn test_parse_dust_children() {
+        let sample = r#"
+4.0K   ┌── slop │█                                                        │   0%
+4.0K   ├── work │█                                                        │   0%
+169G   ├── dazor│████████████████████████████████████████████████████████ │ 100%
+169G ┌─┴ home   │████████████████████████████████████████████████████████ │ 100%
+"#;
+        let children = parse_dust_children("/home", 0, sample);
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].name, "dazor");
+        assert_eq!(children[0].path, "/home/dazor");
+        assert_eq!(children[0].depth, 1);
+        assert_eq!(children[0].size_str, "169.0 GB");
+        assert_eq!(children[0].detail, "100%");
+        assert_eq!(children[1].name, "slop");
+        assert_eq!(children[1].path, "/home/slop");
+        assert_eq!(children[1].detail, "0%");
+        assert_eq!(children[2].name, "work");
+        assert_eq!(children[2].path, "/home/work");
+        assert_eq!(children[2].detail, "0%");
+    }
+
+    #[test]
+    fn test_is_item_visible() {
+        let visible_item = PackageStorageItem {
+            name: "Documents".to_string(),
+            detail: String::new(),
+            size_bytes: 50_000,
+            size_str: "50.0 KB".to_string(),
+            path: "/home/user/Documents".to_string(),
+            is_dir: true,
+            is_expanded: false,
+            is_scanning: false,
+            depth: 1,
+        };
+        let four_kb_folder = PackageStorageItem {
+            name: "/root".to_string(),
+            detail: String::new(),
+            size_bytes: 4096,
+            size_str: "4.0 KB".to_string(),
+            path: "/root".to_string(),
+            is_dir: true,
+            is_expanded: false,
+            is_scanning: false,
+            depth: 0,
+        };
+        let hidden_item = PackageStorageItem {
+            name: ".cache".to_string(),
+            detail: String::new(),
+            size_bytes: 10_000_000,
+            size_str: "10 MB".to_string(),
+            path: "/home/user/.cache".to_string(),
+            is_dir: true,
+            is_expanded: false,
+            is_scanning: false,
+            depth: 1,
+        };
+        let small_item = PackageStorageItem {
+            name: "tiny.txt".to_string(),
+            detail: String::new(),
+            size_bytes: 1024,
+            size_str: "1.0 KB".to_string(),
+            path: "/home/user/tiny.txt".to_string(),
+            is_dir: false,
+            is_expanded: false,
+            is_scanning: false,
+            depth: 1,
+        };
+        let root_dot_item = PackageStorageItem {
+            name: "/.snapshots".to_string(),
+            detail: String::new(),
+            size_bytes: 50_000,
+            size_str: "50 KB".to_string(),
+            path: "/.snapshots".to_string(),
+            is_dir: true,
+            is_expanded: false,
+            is_scanning: false,
+            depth: 0,
+        };
+
+        let hidden_large_item = PackageStorageItem {
+            name: ".local".to_string(),
+            detail: String::new(),
+            size_bytes: 5 * 1024 * 1024 * 1024,
+            size_str: "5.0 GB".to_string(),
+            path: "/home/user/.local".to_string(),
+            is_dir: true,
+            is_expanded: false,
+            is_scanning: false,
+            depth: 1,
+        };
+
+        // When show_hidden = false (default)
+        assert!(is_item_visible(&visible_item, false));
+        assert!(!is_item_visible(&four_kb_folder, false));
+        assert!(!is_item_visible(&hidden_item, false));
+        assert!(!is_item_visible(&small_item, false));
+        assert!(!is_item_visible(&root_dot_item, false));
+        // Edge case: hidden but >= 1GB is visible by default
+        assert!(is_item_visible(&hidden_large_item, false));
+
+        // When show_hidden = true
+        assert!(is_item_visible(&visible_item, true));
+        assert!(is_item_visible(&four_kb_folder, true));
+        assert!(is_item_visible(&hidden_item, true));
+        assert!(is_item_visible(&small_item, true));
+        assert!(is_item_visible(&root_dot_item, true));
+        assert!(is_item_visible(&hidden_large_item, true));
     }
 }
-
-

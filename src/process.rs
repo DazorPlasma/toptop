@@ -968,7 +968,9 @@ pub fn group_processes_for_simple_view(
 
     for p in procs {
         let mut visited = HashSet::new();
-        if let Some(group_name) = resolve_process_group(p.pid, &proc_map, &mut group_map, &mut visited) {
+        if let Some(group_name) =
+            resolve_process_group(p.pid, &proc_map, &mut group_map, &mut visited)
+        {
             groups.entry(group_name).or_default().push(p);
         } else {
             ungrouped.push(p);
@@ -1025,7 +1027,9 @@ pub fn group_processes_for_simple_view(
             "LibreWolf" => {
                 let tab_count = list
                     .iter()
-                    .filter(|p| p.comm == "Isolated Web Co" || p.name.starts_with("Isolated Web Co"))
+                    .filter(|p| {
+                        p.comm == "Isolated Web Co" || p.name.starts_with("Isolated Web Co")
+                    })
                     .count();
                 if tab_count > 1 {
                     format!("LibreWolf [{} Tabs]", tab_count)
@@ -1038,7 +1042,9 @@ pub fn group_processes_for_simple_view(
             "Firefox" => {
                 let tab_count = list
                     .iter()
-                    .filter(|p| p.comm == "Isolated Web Co" || p.name.starts_with("Isolated Web Co"))
+                    .filter(|p| {
+                        p.comm == "Isolated Web Co" || p.name.starts_with("Isolated Web Co")
+                    })
                     .count();
                 if tab_count > 1 {
                     format!("Firefox [{} Tabs]", tab_count)
@@ -1052,8 +1058,7 @@ pub fn group_processes_for_simple_view(
                 let container_count = list
                     .iter()
                     .filter(|p| {
-                        p.comm.contains("containerd-shim")
-                            || p.name.contains("containerd-shim")
+                        p.comm.contains("containerd-shim") || p.name.contains("containerd-shim")
                     })
                     .count();
                 let count = if container_count > 0 {
@@ -1171,7 +1176,11 @@ pub fn group_processes_for_simple_view(
 
                 let mut child_info = child;
                 child_info.name = child_display;
-                child_info.rss_kb = if child_info.pss_kb > 0 { child_info.pss_kb } else { child_info.rss_kb };
+                child_info.rss_kb = if child_info.pss_kb > 0 {
+                    child_info.pss_kb
+                } else {
+                    child_info.rss_kb
+                };
                 child_info.grouped_pids = vec![child_info.pid];
                 child_info.is_group_header = false;
                 child_info.is_group_child = true;
@@ -1353,7 +1362,8 @@ mod tests {
             ProcessInfo {
                 pid: 105,
                 comm: "Isolated Web Co".to_string(),
-                name: "/nix/store/123-librewolf/lib/librewolf/librewolf -contentproc 1 tab".to_string(),
+                name: "/nix/store/123-librewolf/lib/librewolf/librewolf -contentproc 1 tab"
+                    .to_string(),
                 cpu_percent: 10.0,
                 rss_kb: 300_000,
                 pss_kb: 150_000,
@@ -1371,7 +1381,8 @@ mod tests {
             },
             ProcessInfo {
                 pid: 300,
-                name: "/nix/store/123-electron/electron /nix/store/456-vesktop/resources/app.asar".to_string(),
+                name: "/nix/store/123-electron/electron /nix/store/456-vesktop/resources/app.asar"
+                    .to_string(),
                 cpu_percent: 2.0,
                 rss_kb: 150_000,
                 pss_kb: 100_000,
@@ -1391,10 +1402,19 @@ mod tests {
         ];
 
         let collapsed_set = HashSet::new();
-        let grouped = group_processes_for_simple_view(&procs, &collapsed_set, ProcessSortColumn::Cpu, false, "");
+        let grouped = group_processes_for_simple_view(
+            &procs,
+            &collapsed_set,
+            ProcessSortColumn::Cpu,
+            false,
+            "",
+        );
         assert_eq!(grouped.len(), 3);
 
-        let librewolf = grouped.iter().find(|p| p.name.contains("LibreWolf")).unwrap();
+        let librewolf = grouped
+            .iter()
+            .find(|p| p.name.contains("LibreWolf"))
+            .unwrap();
         assert_eq!(librewolf.pid, 100);
         assert_eq!(librewolf.name, "▶ LibreWolf [2 Tabs]");
         assert_eq!(librewolf.cpu_percent, 15.0);
@@ -1419,7 +1439,13 @@ mod tests {
         // Test expanded state
         let mut expanded_set = HashSet::new();
         expanded_set.insert("LibreWolf".to_string());
-        let expanded = group_processes_for_simple_view(&procs, &expanded_set, ProcessSortColumn::Cpu, false, "");
+        let expanded = group_processes_for_simple_view(
+            &procs,
+            &expanded_set,
+            ProcessSortColumn::Cpu,
+            false,
+            "",
+        );
         assert_eq!(expanded.len(), 5); // 1 header + 2 children for LibreWolf + 1 Vesktop + 1 git
         let lw_idx = expanded
             .iter()
@@ -1429,7 +1455,13 @@ mod tests {
         assert!(expanded[lw_idx + 2].name.starts_with("  └─"));
 
         // Test search auto-expansion on child match
-        let searched = group_processes_for_simple_view(&procs, &collapsed_set, ProcessSortColumn::Cpu, false, "Isolated");
+        let searched = group_processes_for_simple_view(
+            &procs,
+            &collapsed_set,
+            ProcessSortColumn::Cpu,
+            false,
+            "Isolated",
+        );
         assert_eq!(searched.len(), 5); // LibreWolf auto-expands because child matched "Isolated"
         let searched_lw = searched
             .iter()
@@ -1441,25 +1473,67 @@ mod tests {
     #[test]
     fn test_identify_process_group() {
         assert_eq!(identify_process_group("syncthing"), Some("Syncthing"));
-        assert_eq!(identify_process_group("/usr/bin/syncthing --no-browser"), Some("Syncthing"));
-        assert_eq!(identify_process_group("/nix/store/abc-syncthing-1.27.0/bin/syncthing"), Some("Syncthing"));
-        assert_eq!(identify_process_group("syncthing-inotify"), Some("Syncthing"));
+        assert_eq!(
+            identify_process_group("/usr/bin/syncthing --no-browser"),
+            Some("Syncthing")
+        );
+        assert_eq!(
+            identify_process_group("/nix/store/abc-syncthing-1.27.0/bin/syncthing"),
+            Some("Syncthing")
+        );
+        assert_eq!(
+            identify_process_group("syncthing-inotify"),
+            Some("Syncthing")
+        );
         assert_eq!(identify_process_group("dbus-daemon --system"), Some("Dbus"));
-        assert_eq!(identify_process_group("dbus-broker-launch --scope user"), Some("Dbus"));
-        assert_eq!(identify_process_group("/nix/store/123-dbus-broker/bin/dbus-broker"), Some("Dbus"));
-        assert_eq!(identify_process_group("xdg-dbus-proxy --args"), Some("Dbus"));
-        assert_eq!(identify_process_group("wl-paste --type text --watch cliphist store"), Some("Clipboard"));
+        assert_eq!(
+            identify_process_group("dbus-broker-launch --scope user"),
+            Some("Dbus")
+        );
+        assert_eq!(
+            identify_process_group("/nix/store/123-dbus-broker/bin/dbus-broker"),
+            Some("Dbus")
+        );
+        assert_eq!(
+            identify_process_group("xdg-dbus-proxy --args"),
+            Some("Dbus")
+        );
+        assert_eq!(
+            identify_process_group("wl-paste --type text --watch cliphist store"),
+            Some("Clipboard")
+        );
         assert_eq!(identify_process_group("wl-copy"), Some("Clipboard"));
-        assert_eq!(identify_process_group("/usr/bin/copyq --start-server"), Some("Clipboard"));
-        assert_eq!(identify_process_group("xclip -selection clipboard"), Some("Clipboard"));
+        assert_eq!(
+            identify_process_group("/usr/bin/copyq --start-server"),
+            Some("Clipboard")
+        );
+        assert_eq!(
+            identify_process_group("xclip -selection clipboard"),
+            Some("Clipboard")
+        );
         assert_eq!(identify_process_group("gpaste-daemon"), Some("Clipboard"));
         assert_eq!(identify_process_group("clipman"), Some("Clipboard"));
-        assert_eq!(identify_process_group("greenclip daemon"), Some("Clipboard"));
-        assert_eq!(identify_process_group("/nix/store/123-pipewire/bin/pipewire"), Some("Audio Server"));
-        assert_eq!(identify_process_group("pipewire-pulse"), Some("Audio Server"));
+        assert_eq!(
+            identify_process_group("greenclip daemon"),
+            Some("Clipboard")
+        );
+        assert_eq!(
+            identify_process_group("/nix/store/123-pipewire/bin/pipewire"),
+            Some("Audio Server")
+        );
+        assert_eq!(
+            identify_process_group("pipewire-pulse"),
+            Some("Audio Server")
+        );
         assert_eq!(identify_process_group("wireplumber"), Some("Audio Server"));
-        assert_eq!(identify_process_group("/usr/bin/pulseaudio --daemonize=no"), Some("Audio Server"));
-        assert_eq!(identify_process_group("jackd -d alsa"), Some("Audio Server"));
+        assert_eq!(
+            identify_process_group("/usr/bin/pulseaudio --daemonize=no"),
+            Some("Audio Server")
+        );
+        assert_eq!(
+            identify_process_group("jackd -d alsa"),
+            Some("Audio Server")
+        );
         assert_eq!(identify_process_group("sndiod"), Some("Audio Server"));
     }
 
@@ -1487,4 +1561,3 @@ mod tests {
         assert!(detail.open_fds > 0);
     }
 }
-

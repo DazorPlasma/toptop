@@ -604,7 +604,9 @@ mod tests {
             .divider("|")
             .padding(" ", " ");
         tabs.render(area, &mut buf);
-        let row: String = (0..area.width).map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' ')).collect();
+        let row: String = (0..area.width)
+            .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .collect();
         println!("ROW: '{}'", row);
 
         let row_chars: Vec<char> = (0..area.width)
@@ -622,11 +624,22 @@ mod tests {
         let mut tab_x = area.x + 1;
         for (idx, title) in titles_raw.iter().enumerate() {
             let tab_w = 1 + title.chars().count() as u16 + 1;
-            let slice: String = row_chars[tab_x as usize..(tab_x + tab_w) as usize].iter().collect();
-            println!("Tab {}: idx={} range=[{}, {}) text='{}'", idx, title, tab_x, tab_x + tab_w, slice);
+            let slice: String = row_chars[tab_x as usize..(tab_x + tab_w) as usize]
+                .iter()
+                .collect();
+            println!(
+                "Tab {}: idx={} range=[{}, {}) text='{}'",
+                idx,
+                title,
+                tab_x,
+                tab_x + tab_w,
+                slice
+            );
             assert_eq!(slice, format!(" {} ", title));
             if idx < titles_raw.len() - 1 {
-                let div: String = row_chars[(tab_x + tab_w) as usize..(tab_x + tab_w + 1) as usize].iter().collect();
+                let div: String = row_chars[(tab_x + tab_w) as usize..(tab_x + tab_w + 1) as usize]
+                    .iter()
+                    .collect();
                 assert_eq!(div, "|");
             }
             tab_x += tab_w + 1;

@@ -55,11 +55,12 @@ use crate::{
     },
     system::{
         BatteryInfo, DiskIoInfo, DnsResolver, GpuMetrics, MemoryMetrics, MountInfo,
-        NetConnectionInfo, NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo,
-        calculate_usage, get_cpu_model, get_ram_info, get_users, read_battery, read_cpu_freq_info,
-        read_cpu_temp, read_cpu_ticks, read_disk_io, read_disk_mounts, read_gpu_metrics,
+        NetConnectionInfo, NetInterfaceInfo, PackageStorageCategory, PackageStorageItem,
+        SystemGeneralInfo, calculate_usage, get_cpu_model, get_ram_info, get_users,
+        is_item_visible, read_battery, read_cpu_freq_info, read_cpu_temp, read_cpu_ticks,
+        read_disk_io, read_disk_mounts, read_dust_path, read_dust_storage, read_gpu_metrics,
         read_memory, read_network_connections, read_network_interfaces,
-        read_package_storage_categories, read_dust_storage, read_system_general_info,
+        read_package_storage_categories, read_system_general_info,
     },
     theme::io_gradient_pct,
     ui::{
@@ -280,6 +281,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     ) = channel();
     let mut is_dust_scanning = false;
 
+    type DustTreeMessage = (String, usize, Vec<PackageStorageItem>);
+    let (dust_tree_tx, dust_tree_rx): (Sender<DustTreeMessage>, Receiver<DustTreeMessage>) =
+        channel();
+    let mut dust_dir_cache: std::collections::HashMap<String, Vec<PackageStorageItem>> =
+        std::collections::HashMap::new();
+    let mut dust_scanning_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     // Spawn background worker for async 20-second package storage scans
     std::thread::Builder::new()
         .name("storage-scanner".to_string())
@@ -304,6 +313,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut disks_sub_tab = 0;
     let mut disks_box_tab = 0;
     let mut disks_scroll_offset = 0;
+    let mut disks_selected_item = 0;
+    let mut disks_show_hidden = false;
 
     let cpu_model = get_cpu_model();
     let mut io_buf = String::with_capacity(8192);
@@ -427,6 +438,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     storage_categories[all_pos] = cat;
                 } else {
                     storage_categories.insert(0, cat);
+                }
+            }
+            needs_redraw = true;
+        }
+
+        while let Ok((parent_path, _parent_depth, children)) = dust_tree_rx.try_recv() {
+            dust_scanning_paths.remove(&parent_path);
+            dust_dir_cache.insert(parent_path.clone(), children.clone());
+            if let Some(cat) = storage_categories.iter_mut().find(|c| c.name == "All")
+                && let Some(idx) = cat.items.iter().position(|i| i.path == parent_path)
+            {
+                cat.items[idx].is_scanning = false;
+                if !cat.items[idx].is_expanded {
+                    cat.items[idx].is_expanded = true;
+                    let insert_pos = idx + 1;
+                    cat.items.splice(insert_pos..insert_pos, children);
                 }
             }
             needs_redraw = true;
@@ -700,9 +727,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             &snap.disk_write_history,
                             &storage_categories,
                             disks_sub_tab,
+                            disks_selected_item,
                             disks_scroll_offset,
                             disks_box_tab,
                             is_snapshot,
+                            disks_show_hidden,
                             is_dust_scanning,
                         );
                     }
@@ -1086,8 +1115,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     cur_snap.map(|s| s.ram_info.as_str()).unwrap_or(&ram_info),
                                 );
                                 copy_to_clipboard(&text);
-                                copy_feedback_until =
-                                    Some(Instant::now() + Duration::from_secs(2));
+                                copy_feedback_until = Some(Instant::now() + Duration::from_secs(2));
                                 needs_redraw = true;
                             } else if key.code == KeyCode::Left {
                                 general_sub_tab = (general_sub_tab + 3) % 4;
@@ -1262,263 +1290,271 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             sort_ascending,
                                         );
                                     }
-                                KeyCode::Right => {
-                                    let cur_idx = cols
-                                        .iter()
-                                        .position(|&c| c == current_sort_col)
-                                        .unwrap_or(0);
-                                    let new_idx = (cur_idx + 1) % cols.len();
-                                    current_sort_col = cols[new_idx];
-                                    for s in &mut snapshots {
-                                        sort_processes(
-                                            &mut s.processes,
-                                            current_sort_col,
-                                            sort_ascending,
-                                        );
-                                    }
-                                    sort_processes(
-                                        &mut processes,
-                                        current_sort_col,
-                                        sort_ascending,
-                                    );
-                                }
-                                KeyCode::Char('r') => {
-                                    sort_ascending = !sort_ascending;
-                                    for s in &mut snapshots {
-                                        sort_processes(
-                                            &mut s.processes,
-                                            current_sort_col,
-                                            sort_ascending,
-                                        );
-                                    }
-                                    sort_processes(
-                                        &mut processes,
-                                        current_sort_col,
-                                        sort_ascending,
-                                    );
-                                }
-                                KeyCode::Char('a') => {
-                                    advanced_view = !advanced_view;
-                                    if !advanced_view
-                                        && !NORMAL_SORT_COLUMNS.contains(&current_sort_col)
-                                    {
-                                        current_sort_col = ProcessSortColumn::Mem;
-                                    }
-                                    for s in &mut snapshots {
-                                        sort_processes(
-                                            &mut s.processes,
-                                            current_sort_col,
-                                            sort_ascending,
-                                        );
-                                    }
-                                    sort_processes(
-                                        &mut processes,
-                                        current_sort_col,
-                                        sort_ascending,
-                                    );
-                                }
-                                KeyCode::Char('c') => {
-                                    if let Some(sel) = table_state.selected() {
-                                        let displayed: Vec<&ProcessInfo> = base_procs
+                                    KeyCode::Right => {
+                                        let cur_idx = cols
                                             .iter()
-                                            .filter(|p| advanced_view || p.rss_kb > 0)
-                                            .filter(|p| {
-                                                matches_process_search(
-                                                    p,
-                                                    &search_query,
-                                                    Some(&proc_map),
-                                                )
-                                            })
-                                            .collect();
-                                        if let Some(target) = displayed.get(sel) {
-                                            let mut targets = Vec::new();
-                                            if !target.grouped_pids.is_empty() {
-                                                for &p_id in &target.grouped_pids {
-                                                    let (comm, name) = if let Some(p) =
-                                                        proc_map.get(&p_id)
-                                                    {
-                                                        (p.comm.clone(), p.name.clone())
-                                                    } else {
-                                                        (target.comm.clone(), target.name.clone())
-                                                    };
+                                            .position(|&c| c == current_sort_col)
+                                            .unwrap_or(0);
+                                        let new_idx = (cur_idx + 1) % cols.len();
+                                        current_sort_col = cols[new_idx];
+                                        for s in &mut snapshots {
+                                            sort_processes(
+                                                &mut s.processes,
+                                                current_sort_col,
+                                                sort_ascending,
+                                            );
+                                        }
+                                        sort_processes(
+                                            &mut processes,
+                                            current_sort_col,
+                                            sort_ascending,
+                                        );
+                                    }
+                                    KeyCode::Char('r') => {
+                                        sort_ascending = !sort_ascending;
+                                        for s in &mut snapshots {
+                                            sort_processes(
+                                                &mut s.processes,
+                                                current_sort_col,
+                                                sort_ascending,
+                                            );
+                                        }
+                                        sort_processes(
+                                            &mut processes,
+                                            current_sort_col,
+                                            sort_ascending,
+                                        );
+                                    }
+                                    KeyCode::Char('a') => {
+                                        advanced_view = !advanced_view;
+                                        if !advanced_view
+                                            && !NORMAL_SORT_COLUMNS.contains(&current_sort_col)
+                                        {
+                                            current_sort_col = ProcessSortColumn::Mem;
+                                        }
+                                        for s in &mut snapshots {
+                                            sort_processes(
+                                                &mut s.processes,
+                                                current_sort_col,
+                                                sort_ascending,
+                                            );
+                                        }
+                                        sort_processes(
+                                            &mut processes,
+                                            current_sort_col,
+                                            sort_ascending,
+                                        );
+                                    }
+                                    KeyCode::Char('c') => {
+                                        if let Some(sel) = table_state.selected() {
+                                            let displayed: Vec<&ProcessInfo> = base_procs
+                                                .iter()
+                                                .filter(|p| advanced_view || p.rss_kb > 0)
+                                                .filter(|p| {
+                                                    matches_process_search(
+                                                        p,
+                                                        &search_query,
+                                                        Some(&proc_map),
+                                                    )
+                                                })
+                                                .collect();
+                                            if let Some(target) = displayed.get(sel) {
+                                                let mut targets = Vec::new();
+                                                if !target.grouped_pids.is_empty() {
+                                                    for &p_id in &target.grouped_pids {
+                                                        let (comm, name) =
+                                                            if let Some(p) = proc_map.get(&p_id) {
+                                                                (p.comm.clone(), p.name.clone())
+                                                            } else {
+                                                                (
+                                                                    target.comm.clone(),
+                                                                    target.name.clone(),
+                                                                )
+                                                            };
+                                                        targets.push(ProcessTarget {
+                                                            pid: p_id,
+                                                            comm,
+                                                            name,
+                                                        });
+                                                    }
+                                                } else {
                                                     targets.push(ProcessTarget {
-                                                        pid: p_id,
-                                                        comm,
-                                                        name,
+                                                        pid: target.pid,
+                                                        comm: target.comm.clone(),
+                                                        name: target.name.clone(),
                                                     });
                                                 }
-                                            } else {
-                                                targets.push(ProcessTarget {
-                                                    pid: target.pid,
-                                                    comm: target.comm.clone(),
-                                                    name: target.name.clone(),
-                                                });
-                                            }
 
-                                            let mut validation_err = None;
-                                            for t in &targets {
-                                                if let Err(e) = validate_process_target(t) {
-                                                    validation_err = Some(e);
-                                                    break;
+                                                let mut validation_err = None;
+                                                for t in &targets {
+                                                    if let Err(e) = validate_process_target(t) {
+                                                        validation_err = Some(e);
+                                                        break;
+                                                    }
                                                 }
-                                            }
 
-                                            if let Some(err_msg) = validation_err {
-                                                process_error_popup = Some(ProcessErrorPopup {
+                                                if let Some(err_msg) = validation_err {
+                                                    process_error_popup = Some(ProcessErrorPopup {
                                                     title: "Process Validation Error".to_string(),
                                                     message_lines: vec![
                                                         err_msg,
                                                         "Action cancelled to protect unintended processes.".to_string(),
                                                     ],
                                                 });
-                                            } else {
-                                                let pids = targets.iter().map(|t| t.pid).collect();
-                                                let clean_name = target
-                                                    .name
-                                                    .trim_start_matches("▼ ")
-                                                    .trim_start_matches("▶ ")
-                                                    .trim_start_matches("├─ ")
-                                                    .trim_start_matches("└─ ")
-                                                    .trim()
-                                                    .to_string();
-                                                kill_confirmation = Some(ProcessKillConfirmation {
-                                                    targets,
-                                                    pids,
-                                                    process_name: clean_name,
-                                                    signal: rustix::process::Signal::Term,
-                                                    is_kill: false,
-                                                });
+                                                } else {
+                                                    let pids =
+                                                        targets.iter().map(|t| t.pid).collect();
+                                                    let clean_name = target
+                                                        .name
+                                                        .trim_start_matches("▼ ")
+                                                        .trim_start_matches("▶ ")
+                                                        .trim_start_matches("├─ ")
+                                                        .trim_start_matches("└─ ")
+                                                        .trim()
+                                                        .to_string();
+                                                    kill_confirmation =
+                                                        Some(ProcessKillConfirmation {
+                                                            targets,
+                                                            pids,
+                                                            process_name: clean_name,
+                                                            signal: rustix::process::Signal::Term,
+                                                            is_kill: false,
+                                                        });
+                                                }
+                                                needs_redraw = true;
                                             }
-                                            needs_redraw = true;
                                         }
                                     }
-                                }
-                                KeyCode::Char('t') => {
-                                    if let Some(sel) = table_state.selected() {
-                                        let displayed: Vec<&ProcessInfo> = base_procs
-                                            .iter()
-                                            .filter(|p| advanced_view || p.rss_kb > 0)
-                                            .filter(|p| {
-                                                matches_process_search(
-                                                    p,
-                                                    &search_query,
-                                                    Some(&proc_map),
-                                                )
-                                            })
-                                            .collect();
-                                        if let Some(target) = displayed.get(sel) {
-                                            let mut targets = Vec::new();
-                                            if !target.grouped_pids.is_empty() {
-                                                for &p_id in &target.grouped_pids {
-                                                    let (comm, name) = if let Some(p) =
-                                                        proc_map.get(&p_id)
-                                                    {
-                                                        (p.comm.clone(), p.name.clone())
-                                                    } else {
-                                                        (target.comm.clone(), target.name.clone())
-                                                    };
+                                    KeyCode::Char('t') => {
+                                        if let Some(sel) = table_state.selected() {
+                                            let displayed: Vec<&ProcessInfo> = base_procs
+                                                .iter()
+                                                .filter(|p| advanced_view || p.rss_kb > 0)
+                                                .filter(|p| {
+                                                    matches_process_search(
+                                                        p,
+                                                        &search_query,
+                                                        Some(&proc_map),
+                                                    )
+                                                })
+                                                .collect();
+                                            if let Some(target) = displayed.get(sel) {
+                                                let mut targets = Vec::new();
+                                                if !target.grouped_pids.is_empty() {
+                                                    for &p_id in &target.grouped_pids {
+                                                        let (comm, name) =
+                                                            if let Some(p) = proc_map.get(&p_id) {
+                                                                (p.comm.clone(), p.name.clone())
+                                                            } else {
+                                                                (
+                                                                    target.comm.clone(),
+                                                                    target.name.clone(),
+                                                                )
+                                                            };
+                                                        targets.push(ProcessTarget {
+                                                            pid: p_id,
+                                                            comm,
+                                                            name,
+                                                        });
+                                                    }
+                                                } else {
                                                     targets.push(ProcessTarget {
-                                                        pid: p_id,
-                                                        comm,
-                                                        name,
+                                                        pid: target.pid,
+                                                        comm: target.comm.clone(),
+                                                        name: target.name.clone(),
                                                     });
                                                 }
-                                            } else {
-                                                targets.push(ProcessTarget {
-                                                    pid: target.pid,
-                                                    comm: target.comm.clone(),
-                                                    name: target.name.clone(),
-                                                });
-                                            }
 
-                                            let mut validation_err = None;
-                                            for t in &targets {
-                                                if let Err(e) = validate_process_target(t) {
-                                                    validation_err = Some(e);
-                                                    break;
+                                                let mut validation_err = None;
+                                                for t in &targets {
+                                                    if let Err(e) = validate_process_target(t) {
+                                                        validation_err = Some(e);
+                                                        break;
+                                                    }
                                                 }
-                                            }
 
-                                            if let Some(err_msg) = validation_err {
-                                                process_error_popup = Some(ProcessErrorPopup {
+                                                if let Some(err_msg) = validation_err {
+                                                    process_error_popup = Some(ProcessErrorPopup {
                                                     title: "Process Validation Error".to_string(),
                                                     message_lines: vec![
                                                         err_msg,
                                                         "Action cancelled to protect unintended processes.".to_string(),
                                                     ],
                                                 });
-                                            } else {
-                                                let pids = targets.iter().map(|t| t.pid).collect();
-                                                let clean_name = target
-                                                    .name
-                                                    .trim_start_matches("▼ ")
-                                                    .trim_start_matches("▶ ")
-                                                    .trim_start_matches("├─ ")
-                                                    .trim_start_matches("└─ ")
-                                                    .trim()
-                                                    .to_string();
-                                                kill_confirmation = Some(ProcessKillConfirmation {
-                                                    targets,
-                                                    pids,
-                                                    process_name: clean_name,
-                                                    signal: rustix::process::Signal::Kill,
-                                                    is_kill: true,
-                                                });
+                                                } else {
+                                                    let pids =
+                                                        targets.iter().map(|t| t.pid).collect();
+                                                    let clean_name = target
+                                                        .name
+                                                        .trim_start_matches("▼ ")
+                                                        .trim_start_matches("▶ ")
+                                                        .trim_start_matches("├─ ")
+                                                        .trim_start_matches("└─ ")
+                                                        .trim()
+                                                        .to_string();
+                                                    kill_confirmation =
+                                                        Some(ProcessKillConfirmation {
+                                                            targets,
+                                                            pids,
+                                                            process_name: clean_name,
+                                                            signal: rustix::process::Signal::Kill,
+                                                            is_kill: true,
+                                                        });
+                                                }
+                                                needs_redraw = true;
                                             }
-                                            needs_redraw = true;
                                         }
                                     }
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let i = match table_state.selected() {
-                                        Some(i) => i.saturating_sub(1),
-                                        None => 0,
-                                    };
-                                    table_state.select(Some(i));
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let i = match table_state.selected() {
-                                        Some(i) => (i + 1).min(num_procs.saturating_sub(1)),
-                                        None => 0,
-                                    };
-                                    table_state.select(Some(i));
-                                }
-                                KeyCode::Char('g') | KeyCode::Home => {
-                                    table_state.select(Some(0));
-                                }
-                                KeyCode::Char('G') | KeyCode::End => {
-                                    if num_procs > 0 {
-                                        table_state.select(Some(num_procs - 1));
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        let i = match table_state.selected() {
+                                            Some(i) => i.saturating_sub(1),
+                                            None => 0,
+                                        };
+                                        table_state.select(Some(i));
                                     }
-                                }
-                                KeyCode::PageUp => {
-                                    let i = match table_state.selected() {
-                                        Some(i) => i.saturating_sub(10),
-                                        None => 0,
-                                    };
-                                    table_state.select(Some(i));
-                                }
-                                KeyCode::PageDown => {
-                                    let i = match table_state.selected() {
-                                        Some(i) => (i + 10).min(num_procs.saturating_sub(1)),
-                                        None => 0,
-                                    };
-                                    table_state.select(Some(i));
-                                }
-                                KeyCode::Char(' ') => {
-                                    is_paused = !is_paused;
-                                    if !is_paused {
-                                        if !snapshots.is_empty() {
-                                            snapshot_idx = snapshots.len() - 1;
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        let i = match table_state.selected() {
+                                            Some(i) => (i + 1).min(num_procs.saturating_sub(1)),
+                                            None => 0,
+                                        };
+                                        table_state.select(Some(i));
+                                    }
+                                    KeyCode::Char('g') | KeyCode::Home => {
+                                        table_state.select(Some(0));
+                                    }
+                                    KeyCode::Char('G') | KeyCode::End => {
+                                        if num_procs > 0 {
+                                            table_state.select(Some(num_procs - 1));
                                         }
-                                        last_tick = Instant::now();
                                     }
-                                    needs_redraw = true;
+                                    KeyCode::PageUp => {
+                                        let i = match table_state.selected() {
+                                            Some(i) => i.saturating_sub(10),
+                                            None => 0,
+                                        };
+                                        table_state.select(Some(i));
+                                    }
+                                    KeyCode::PageDown => {
+                                        let i = match table_state.selected() {
+                                            Some(i) => (i + 10).min(num_procs.saturating_sub(1)),
+                                            None => 0,
+                                        };
+                                        table_state.select(Some(i));
+                                    }
+                                    KeyCode::Char(' ') => {
+                                        is_paused = !is_paused;
+                                        if !is_paused {
+                                            if !snapshots.is_empty() {
+                                                snapshot_idx = snapshots.len() - 1;
+                                            }
+                                            last_tick = Instant::now();
+                                        }
+                                        needs_redraw = true;
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
-                        }
-                    } else if current_tab == 3 {
+                        } else if current_tab == 3 {
                             let cur_gpu = snapshots
                                 .get(snapshot_idx)
                                 .map(|s| &s.gpu_metrics)
@@ -1630,6 +1666,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         } else {
                                             disks_sub_tab - 1
                                         };
+                                        disks_selected_item = 0;
                                         disks_scroll_offset = 0;
                                         needs_redraw = true;
                                     }
@@ -1638,12 +1675,43 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     if !storage_categories.is_empty() {
                                         disks_sub_tab =
                                             (disks_sub_tab + 1) % storage_categories.len();
+                                        disks_selected_item = 0;
                                         disks_scroll_offset = 0;
                                         needs_redraw = true;
                                     }
                                 }
+                                KeyCode::Char('.') => {
+                                    disks_show_hidden = !disks_show_hidden;
+                                    disks_selected_item = 0;
+                                    disks_scroll_offset = 0;
+                                    needs_redraw = true;
+                                }
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    disks_scroll_offset = disks_scroll_offset.saturating_sub(1);
+                                    let cat_idx = disks_sub_tab
+                                        .min(storage_categories.len().saturating_sub(1));
+                                    let num_items = storage_categories
+                                        .get(cat_idx)
+                                        .map(|c| {
+                                            if c.name == "All" {
+                                                c.items
+                                                    .iter()
+                                                    .filter(|i| {
+                                                        is_item_visible(i, disks_show_hidden)
+                                                    })
+                                                    .count()
+                                            } else {
+                                                c.items.len()
+                                            }
+                                        })
+                                        .unwrap_or(0);
+                                    if num_items > 0 {
+                                        disks_selected_item = disks_selected_item.saturating_sub(1);
+                                        if disks_selected_item < disks_scroll_offset {
+                                            disks_scroll_offset = disks_selected_item;
+                                        }
+                                    } else {
+                                        disks_scroll_offset = disks_scroll_offset.saturating_sub(1);
+                                    }
                                     needs_redraw = true;
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
@@ -1651,7 +1719,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .min(storage_categories.len().saturating_sub(1));
                                     let num_items = storage_categories
                                         .get(cat_idx)
-                                        .map(|c| c.items.len())
+                                        .map(|c| {
+                                            if c.name == "All" {
+                                                c.items
+                                                    .iter()
+                                                    .filter(|i| {
+                                                        is_item_visible(i, disks_show_hidden)
+                                                    })
+                                                    .count()
+                                            } else {
+                                                c.items.len()
+                                            }
+                                        })
                                         .unwrap_or(0);
                                     let box_h = if is_tabbed {
                                         table_area.height.saturating_sub(3)
@@ -1659,12 +1738,48 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         table_area.height.saturating_sub(table_area.height / 2)
                                     };
                                     let visible_rows = (box_h.saturating_sub(4) as usize).max(1);
-                                    let max_scroll = num_items.saturating_sub(visible_rows);
-                                    disks_scroll_offset = (disks_scroll_offset + 1).min(max_scroll);
+                                    if num_items > 0 {
+                                        if disks_selected_item + 1 < num_items {
+                                            disks_selected_item += 1;
+                                        }
+                                        if disks_selected_item >= disks_scroll_offset + visible_rows
+                                        {
+                                            disks_scroll_offset = disks_selected_item
+                                                .saturating_sub(visible_rows.saturating_sub(1));
+                                        }
+                                    } else {
+                                        let max_scroll = num_items.saturating_sub(visible_rows);
+                                        disks_scroll_offset =
+                                            (disks_scroll_offset + 1).min(max_scroll);
+                                    }
                                     needs_redraw = true;
                                 }
                                 KeyCode::PageUp => {
-                                    disks_scroll_offset = disks_scroll_offset.saturating_sub(5);
+                                    let cat_idx = disks_sub_tab
+                                        .min(storage_categories.len().saturating_sub(1));
+                                    let num_items = storage_categories
+                                        .get(cat_idx)
+                                        .map(|c| {
+                                            if c.name == "All" {
+                                                c.items
+                                                    .iter()
+                                                    .filter(|i| {
+                                                        is_item_visible(i, disks_show_hidden)
+                                                    })
+                                                    .count()
+                                            } else {
+                                                c.items.len()
+                                            }
+                                        })
+                                        .unwrap_or(0);
+                                    if num_items > 0 {
+                                        disks_selected_item = disks_selected_item.saturating_sub(5);
+                                        if disks_selected_item < disks_scroll_offset {
+                                            disks_scroll_offset = disks_selected_item;
+                                        }
+                                    } else {
+                                        disks_scroll_offset = disks_scroll_offset.saturating_sub(5);
+                                    }
                                     needs_redraw = true;
                                 }
                                 KeyCode::PageDown => {
@@ -1672,7 +1787,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .min(storage_categories.len().saturating_sub(1));
                                     let num_items = storage_categories
                                         .get(cat_idx)
-                                        .map(|c| c.items.len())
+                                        .map(|c| {
+                                            if c.name == "All" {
+                                                c.items
+                                                    .iter()
+                                                    .filter(|i| {
+                                                        is_item_visible(i, disks_show_hidden)
+                                                    })
+                                                    .count()
+                                            } else {
+                                                c.items.len()
+                                            }
+                                        })
                                         .unwrap_or(0);
                                     let box_h = if is_tabbed {
                                         table_area.height.saturating_sub(3)
@@ -1680,11 +1806,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         table_area.height.saturating_sub(table_area.height / 2)
                                     };
                                     let visible_rows = (box_h.saturating_sub(4) as usize).max(1);
-                                    let max_scroll = num_items.saturating_sub(visible_rows);
-                                    disks_scroll_offset = (disks_scroll_offset + 5).min(max_scroll);
+                                    if num_items > 0 {
+                                        disks_selected_item = (disks_selected_item + 5)
+                                            .min(num_items.saturating_sub(1));
+                                        if disks_selected_item >= disks_scroll_offset + visible_rows
+                                        {
+                                            disks_scroll_offset = disks_selected_item
+                                                .saturating_sub(visible_rows.saturating_sub(1));
+                                        }
+                                    } else {
+                                        let max_scroll = num_items.saturating_sub(visible_rows);
+                                        disks_scroll_offset =
+                                            (disks_scroll_offset + 5).min(max_scroll);
+                                    }
                                     needs_redraw = true;
                                 }
                                 KeyCode::Home | KeyCode::Char('g') => {
+                                    disks_selected_item = 0;
                                     disks_scroll_offset = 0;
                                     needs_redraw = true;
                                 }
@@ -1693,7 +1831,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         .min(storage_categories.len().saturating_sub(1));
                                     let num_items = storage_categories
                                         .get(cat_idx)
-                                        .map(|c| c.items.len())
+                                        .map(|c| {
+                                            if c.name == "All" {
+                                                c.items
+                                                    .iter()
+                                                    .filter(|i| {
+                                                        is_item_visible(i, disks_show_hidden)
+                                                    })
+                                                    .count()
+                                            } else {
+                                                c.items.len()
+                                            }
+                                        })
                                         .unwrap_or(0);
                                     let box_h = if is_tabbed {
                                         table_area.height.saturating_sub(3)
@@ -1701,28 +1850,125 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         table_area.height.saturating_sub(table_area.height / 2)
                                     };
                                     let visible_rows = (box_h.saturating_sub(4) as usize).max(1);
-                                    let max_scroll = num_items.saturating_sub(visible_rows);
-                                    disks_scroll_offset = max_scroll;
+                                    if num_items > 0 {
+                                        disks_selected_item = num_items.saturating_sub(1);
+                                        let max_scroll = num_items.saturating_sub(visible_rows);
+                                        disks_scroll_offset = max_scroll;
+                                    }
                                     needs_redraw = true;
                                 }
                                 KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R') => {
                                     if !is_tabbed || disks_box_tab == 2 {
                                         let cat_idx = disks_sub_tab
                                             .min(storage_categories.len().saturating_sub(1));
-                                        if let Some(cat) = storage_categories.get(cat_idx)
+                                        if let Some(cat) = storage_categories.get_mut(cat_idx)
                                             && cat.name == "All"
-                                            && !is_dust_scanning
                                         {
-                                            is_dust_scanning = true;
-                                            let tx = dust_tx.clone();
-                                            std::thread::Builder::new()
-                                                .name("dust-scanner".to_string())
-                                                .spawn(move || {
-                                                    let res = read_dust_storage();
-                                                    let _ = tx.send(res);
-                                                })
-                                                .ok();
-                                            needs_redraw = true;
+                                            if cat.items.is_empty() {
+                                                if !is_dust_scanning {
+                                                    is_dust_scanning = true;
+                                                    let tx = dust_tx.clone();
+                                                    std::thread::Builder::new()
+                                                        .name("dust-scanner".to_string())
+                                                        .spawn(move || {
+                                                            let res = read_dust_storage();
+                                                            let _ = tx.send(res);
+                                                        })
+                                                        .ok();
+                                                    needs_redraw = true;
+                                                }
+                                            } else {
+                                                let visible_indices: Vec<usize> = cat
+                                                    .items
+                                                    .iter()
+                                                    .enumerate()
+                                                    .filter(|(_, item)| {
+                                                        is_item_visible(item, disks_show_hidden)
+                                                    })
+                                                    .map(|(idx, _)| idx)
+                                                    .collect();
+                                                if let Some(&actual_item_idx) =
+                                                    visible_indices.get(disks_selected_item)
+                                                {
+                                                    let (
+                                                        item_path,
+                                                        item_depth,
+                                                        is_expanded,
+                                                        is_dir,
+                                                    ) = {
+                                                        let it = &cat.items[actual_item_idx];
+                                                        (
+                                                            it.path.clone(),
+                                                            it.depth,
+                                                            it.is_expanded,
+                                                            it.is_dir,
+                                                        )
+                                                    };
+                                                    if is_expanded {
+                                                        // Collapse: remove all following items with depth > item_depth
+                                                        cat.items[actual_item_idx].is_expanded =
+                                                            false;
+                                                        let mut remove_count = 0;
+                                                        for next_item in cat
+                                                            .items
+                                                            .iter()
+                                                            .skip(actual_item_idx + 1)
+                                                        {
+                                                            if next_item.depth > item_depth {
+                                                                remove_count += 1;
+                                                            } else {
+                                                                break;
+                                                            }
+                                                        }
+                                                        if remove_count > 0 {
+                                                            cat.items.drain(
+                                                                actual_item_idx + 1
+                                                                    ..actual_item_idx
+                                                                        + 1
+                                                                        + remove_count,
+                                                            );
+                                                        }
+                                                        needs_redraw = true;
+                                                    } else if is_dir {
+                                                        if let Some(cached) =
+                                                            dust_dir_cache.get(&item_path)
+                                                        {
+                                                            cat.items[actual_item_idx]
+                                                                .is_expanded = true;
+                                                            cat.items[actual_item_idx]
+                                                                .is_scanning = false;
+                                                            let insert_pos = actual_item_idx + 1;
+                                                            cat.items.splice(
+                                                                insert_pos..insert_pos,
+                                                                cached.clone(),
+                                                            );
+                                                            needs_redraw = true;
+                                                        } else if !dust_scanning_paths
+                                                            .contains(&item_path)
+                                                        {
+                                                            cat.items[actual_item_idx]
+                                                                .is_scanning = true;
+                                                            dust_scanning_paths
+                                                                .insert(item_path.clone());
+                                                            let p = item_path;
+                                                            let depth = item_depth;
+                                                            let tx = dust_tree_tx.clone();
+                                                            std::thread::Builder::new()
+                                                                .name(
+                                                                    "dust-tree-worker".to_string(),
+                                                                )
+                                                                .spawn(move || {
+                                                                    let children =
+                                                                        read_dust_path(&p, depth);
+                                                                    let _ = tx
+                                                                        .send((p, depth, children));
+                                                                })
+                                                                .ok();
+                                                            needs_redraw = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -2155,11 +2401,121 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                             && click_col < cur_col + tab_len
                                         {
                                             disks_sub_tab = i;
+                                            disks_selected_item = 0;
                                             disks_scroll_offset = 0;
                                             needs_redraw = true;
                                             break;
                                         }
                                         cur_col += tab_len;
+                                    }
+                                }
+                                MouseEventKind::Down(MouseButton::Left)
+                                    if (!is_tabbed || disks_box_tab == 2)
+                                        && my > tab_row_y + 1
+                                        && mx > table_area.x
+                                        && mx < table_area.x + storage_w =>
+                                {
+                                    let clicked_row = (my.saturating_sub(tab_row_y + 2)) as usize;
+                                    let v_idx = disks_scroll_offset + clicked_row;
+                                    let cat_idx = disks_sub_tab
+                                        .min(storage_categories.len().saturating_sub(1));
+                                    if let Some(cat) = storage_categories.get_mut(cat_idx) {
+                                        let visible_indices: Vec<usize> = if cat.name == "All" {
+                                            cat.items
+                                                .iter()
+                                                .enumerate()
+                                                .filter(|(_, item)| {
+                                                    is_item_visible(item, disks_show_hidden)
+                                                })
+                                                .map(|(idx, _)| idx)
+                                                .collect()
+                                        } else {
+                                            (0..cat.items.len()).collect()
+                                        };
+                                        if v_idx < visible_indices.len() {
+                                            disks_selected_item = v_idx;
+                                            let actual_item_idx = visible_indices[v_idx];
+                                            if cat.name == "All" {
+                                                let (item_path, item_depth, is_expanded, is_dir) = {
+                                                    let it = &cat.items[actual_item_idx];
+                                                    (
+                                                        it.path.clone(),
+                                                        it.depth,
+                                                        it.is_expanded,
+                                                        it.is_dir,
+                                                    )
+                                                };
+                                                if is_expanded {
+                                                    cat.items[actual_item_idx].is_expanded = false;
+                                                    let mut remove_count = 0;
+                                                    for next_item in
+                                                        cat.items.iter().skip(actual_item_idx + 1)
+                                                    {
+                                                        if next_item.depth > item_depth {
+                                                            remove_count += 1;
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                    if remove_count > 0 {
+                                                        cat.items.drain(
+                                                            actual_item_idx + 1
+                                                                ..actual_item_idx
+                                                                    + 1
+                                                                    + remove_count,
+                                                        );
+                                                    }
+                                                } else if is_dir {
+                                                    if let Some(cached) =
+                                                        dust_dir_cache.get(&item_path)
+                                                    {
+                                                        cat.items[actual_item_idx].is_expanded =
+                                                            true;
+                                                        cat.items[actual_item_idx].is_scanning =
+                                                            false;
+                                                        let insert_pos = actual_item_idx + 1;
+                                                        cat.items.splice(
+                                                            insert_pos..insert_pos,
+                                                            cached.clone(),
+                                                        );
+                                                    } else if !dust_scanning_paths
+                                                        .contains(&item_path)
+                                                    {
+                                                        cat.items[actual_item_idx].is_scanning =
+                                                            true;
+                                                        dust_scanning_paths
+                                                            .insert(item_path.clone());
+                                                        let p = item_path;
+                                                        let depth = item_depth;
+                                                        let tx = dust_tree_tx.clone();
+                                                        std::thread::Builder::new()
+                                                            .name("dust-tree-worker".to_string())
+                                                            .spawn(move || {
+                                                                let children =
+                                                                    read_dust_path(&p, depth);
+                                                                let _ =
+                                                                    tx.send((p, depth, children));
+                                                            })
+                                                            .ok();
+                                                    }
+                                                }
+                                            }
+                                            needs_redraw = true;
+                                        } else if cat.name == "All"
+                                            && cat.items.is_empty()
+                                            && !is_dust_scanning
+                                        {
+                                            is_dust_scanning = true;
+                                            let tx = dust_tx.clone();
+                                            std::thread::Builder::new()
+                                                .name("dust-scanner".to_string())
+                                                .spawn(move || {
+                                                    let res = read_dust_storage();
+                                                    let _ = tx.send(res);
+                                                })
+                                                .ok();
+                                            needs_redraw = true;
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -2464,7 +2820,12 @@ mod tests {
 
         // Pressing Esc / q / Enter restores process list
         let key_code = crossterm::event::KeyCode::Esc;
-        if matches!(key_code, crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Enter) {
+        if matches!(
+            key_code,
+            crossterm::event::KeyCode::Esc
+                | crossterm::event::KeyCode::Char('q')
+                | crossterm::event::KeyCode::Enter
+        ) {
             selected_proc_detail = None;
         }
         assert_eq!(selected_proc_detail, None);
@@ -2472,10 +2833,12 @@ mod tests {
         // Stopping (c) or Killing (t) zoomed in process also resets selected_proc_detail back to process list
         selected_proc_detail = Some(target_pid);
         let stop_key = crossterm::event::KeyCode::Char('c');
-        if matches!(stop_key, crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('t')) {
+        if matches!(
+            stop_key,
+            crossterm::event::KeyCode::Char('c') | crossterm::event::KeyCode::Char('t')
+        ) {
             selected_proc_detail = None;
         }
         assert_eq!(selected_proc_detail, None);
     }
 }
-
