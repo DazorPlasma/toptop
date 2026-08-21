@@ -60,9 +60,9 @@ use crate::{
     },
     theme::io_gradient_pct,
     ui::{
-        format_system_overview_copy_text, is_disks_overflow, render_cpu_ram_tab, render_disks_tab,
-        render_general_tab, render_gpu_tab, render_kill_confirmation_modal, render_network_tab,
-        render_process_tab,
+        format_system_overview_copy_text, is_disks_overflow, is_gpu_overflow, render_cpu_ram_tab,
+        render_disks_tab, render_general_tab, render_gpu_tab, render_kill_confirmation_modal,
+        render_network_tab, render_process_tab,
     },
     utils::copy_to_clipboard,
 };
@@ -171,6 +171,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
     let mut storage_categories = Vec::new();
     let mut general_sub_tab = 0;
+    let mut gpu_sub_tab = 0;
     let mut disks_sub_tab = 0;
     let mut disks_box_tab = 0;
     let mut disks_scroll_offset = 0;
@@ -296,10 +297,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
                 let titles: Vec<Line> = TAB_TITLES.iter().map(|&t| Line::from(t)).collect();
                 let pause_badge = if is_paused { " [PAUSED] " } else { "" };
-                let tabs_title = format!(
-                    " System Monitor - 'q' to quit, Space to pause{} ",
-                    pause_badge
-                );
+                let tabs_title = format!(" System Monitor - Space to pause{} ", pause_badge);
                 #[allow(unused_mut)]
                 let mut tabs_block = Block::default()
                     .borders(Borders::ALL)
@@ -399,6 +397,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             &gpu_metrics,
                             &gpu_history,
                             &gpu_vram_history,
+                            gpu_sub_tab,
                         );
                     }
                     4 => {
@@ -461,43 +460,88 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             }
         };
 
+        if let Some(confirm) = kill_confirmation.as_ref() {
+            if event::poll(timeout)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+                        ) {
+                            for &p_id in &confirm.pids {
+                                if let Some(pid) = rustix::process::Pid::from_raw(p_id as i32) {
+                                    let _ = rustix::process::kill_process(pid, confirm.signal);
+                                }
+                            }
+                            std::thread::sleep(Duration::from_millis(40));
+                            let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
+                            processes = read_processes(&mut prev_procs, &users, cur_dt);
+                            sort_processes(&mut processes, current_sort_col, sort_ascending);
+                            mem = read_memory(&mut io_buf);
+                            if !is_paused {
+                                last_tick = Instant::now();
+                            }
+                            kill_confirmation = None;
+                            needs_redraw = true;
+                        } else if matches!(
+                            key.code,
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc
+                        ) {
+                            kill_confirmation = None;
+                            needs_redraw = true;
+                        }
+                    }
+                    Event::Mouse(mouse_event) => {
+                        let mx = mouse_event.column;
+                        let my = mouse_event.row;
+                        if let MouseEventKind::Down(MouseButton::Left) = mouse_event.kind
+                            && let Some((yes_rect, no_rect)) = modal_btn_rects
+                        {
+                            if mx >= yes_rect.x
+                                && mx < yes_rect.right()
+                                && my >= yes_rect.y
+                                && my < yes_rect.bottom()
+                            {
+                                for &p_id in &confirm.pids {
+                                    if let Some(pid) = rustix::process::Pid::from_raw(p_id as i32) {
+                                        let _ = rustix::process::kill_process(pid, confirm.signal);
+                                    }
+                                }
+                                std::thread::sleep(Duration::from_millis(40));
+                                let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
+                                processes = read_processes(&mut prev_procs, &users, cur_dt);
+                                sort_processes(&mut processes, current_sort_col, sort_ascending);
+                                mem = read_memory(&mut io_buf);
+                                if !is_paused {
+                                    last_tick = Instant::now();
+                                }
+                                kill_confirmation = None;
+                                needs_redraw = true;
+                            } else if mx >= no_rect.x
+                                && mx < no_rect.right()
+                                && my >= no_rect.y
+                                && my < no_rect.bottom()
+                            {
+                                kill_confirmation = None;
+                                needs_redraw = true;
+                            }
+                        }
+                    }
+                    Event::Resize(_, _) => {
+                        needs_redraw = true;
+                    }
+                    _ => {}
+                }
+            }
+            continue 'main_loop;
+        }
+
         if event::poll(timeout)? {
             let mut more = true;
             while more {
                 match event::read()? {
                     Event::Key(key) => {
                         needs_redraw = true;
-                        if let Some(confirm) = kill_confirmation.take() {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                    for &p_id in &confirm.pids {
-                                        if let Some(pid) =
-                                            rustix::process::Pid::from_raw(p_id as i32)
-                                        {
-                                            let _ =
-                                                rustix::process::kill_process(pid, confirm.signal);
-                                        }
-                                    }
-                                    std::thread::sleep(Duration::from_millis(40));
-                                    let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
-                                    processes = read_processes(&mut prev_procs, &users, cur_dt);
-                                    sort_processes(
-                                        &mut processes,
-                                        current_sort_col,
-                                        sort_ascending,
-                                    );
-                                    mem = read_memory(&mut io_buf);
-                                    if !is_paused {
-                                        last_tick = Instant::now();
-                                    }
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {}
-                                _ => {
-                                    kill_confirmation = Some(confirm);
-                                }
-                            }
-                            continue;
-                        }
 
                         if is_searching {
                             let grouped_cache;
@@ -851,7 +895,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         }
                                     }
                                 }
-                                KeyCode::Char('k') => {
+                                KeyCode::Char('t') => {
                                     if let Some(sel) = table_state.selected() {
                                         let displayed: Vec<&ProcessInfo> = base_procs
                                             .iter()
@@ -888,7 +932,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         }
                                     }
                                 }
-                                KeyCode::Up => {
+                                KeyCode::Up | KeyCode::Char('k') => {
                                     let i = match table_state.selected() {
                                         Some(i) => i.saturating_sub(1),
                                         None => 0,
@@ -929,6 +973,31 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     if !is_paused {
                                         last_tick = Instant::now();
                                     }
+                                }
+                                _ => {}
+                            }
+                        } else if current_tab == 3 {
+                            let is_tabbed = is_gpu_overflow(table_area, &gpu_metrics);
+                            match key.code {
+                                KeyCode::Left | KeyCode::Char('h') => {
+                                    if is_tabbed {
+                                        gpu_sub_tab =
+                                            if gpu_sub_tab == 0 { 1 } else { gpu_sub_tab - 1 };
+                                        needs_redraw = true;
+                                    }
+                                }
+                                KeyCode::Right | KeyCode::Char('l') => {
+                                    if is_tabbed {
+                                        gpu_sub_tab = (gpu_sub_tab + 1) % 2;
+                                        needs_redraw = true;
+                                    }
+                                }
+                                KeyCode::Char(' ') => {
+                                    is_paused = !is_paused;
+                                    if !is_paused {
+                                        last_tick = Instant::now();
+                                    }
+                                    needs_redraw = true;
                                 }
                                 _ => {}
                             }
@@ -1012,7 +1081,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     needs_redraw = true;
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    disks_scroll_offset = disks_scroll_offset.saturating_add(1);
+                                    let cat_idx = disks_sub_tab
+                                        .min(storage_categories.len().saturating_sub(1));
+                                    let num_items = storage_categories
+                                        .get(cat_idx)
+                                        .map(|c| c.items.len())
+                                        .unwrap_or(0);
+                                    let is_tabbed =
+                                        is_disks_overflow(table_area, &disk_io, &disk_mounts);
+                                    let box_h = if is_tabbed {
+                                        table_area.height.saturating_sub(3)
+                                    } else {
+                                        table_area.height.saturating_sub(table_area.height / 2)
+                                    };
+                                    let visible_rows = (box_h.saturating_sub(4) as usize).max(1);
+                                    let max_scroll = num_items.saturating_sub(visible_rows);
+                                    disks_scroll_offset = (disks_scroll_offset + 1).min(max_scroll);
                                     needs_redraw = true;
                                 }
                                 KeyCode::PageUp => {
@@ -1020,7 +1104,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     needs_redraw = true;
                                 }
                                 KeyCode::PageDown => {
-                                    disks_scroll_offset = disks_scroll_offset.saturating_add(5);
+                                    let cat_idx = disks_sub_tab
+                                        .min(storage_categories.len().saturating_sub(1));
+                                    let num_items = storage_categories
+                                        .get(cat_idx)
+                                        .map(|c| c.items.len())
+                                        .unwrap_or(0);
+                                    let is_tabbed =
+                                        is_disks_overflow(table_area, &disk_io, &disk_mounts);
+                                    let box_h = if is_tabbed {
+                                        table_area.height.saturating_sub(3)
+                                    } else {
+                                        table_area.height.saturating_sub(table_area.height / 2)
+                                    };
+                                    let visible_rows = (box_h.saturating_sub(4) as usize).max(1);
+                                    let max_scroll = num_items.saturating_sub(visible_rows);
+                                    disks_scroll_offset = (disks_scroll_offset + 5).min(max_scroll);
                                     needs_redraw = true;
                                 }
                                 KeyCode::Home | KeyCode::Char('g') => {
@@ -1028,7 +1127,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     needs_redraw = true;
                                 }
                                 KeyCode::End | KeyCode::Char('G') => {
-                                    disks_scroll_offset = usize::MAX;
+                                    let cat_idx = disks_sub_tab
+                                        .min(storage_categories.len().saturating_sub(1));
+                                    let num_items = storage_categories
+                                        .get(cat_idx)
+                                        .map(|c| c.items.len())
+                                        .unwrap_or(0);
+                                    let is_tabbed =
+                                        is_disks_overflow(table_area, &disk_io, &disk_mounts);
+                                    let box_h = if is_tabbed {
+                                        table_area.height.saturating_sub(3)
+                                    } else {
+                                        table_area.height.saturating_sub(table_area.height / 2)
+                                    };
+                                    let visible_rows = (box_h.saturating_sub(4) as usize).max(1);
+                                    let max_scroll = num_items.saturating_sub(visible_rows);
+                                    disks_scroll_offset = max_scroll;
                                     needs_redraw = true;
                                 }
                                 KeyCode::Char(' ') => {
@@ -1050,50 +1164,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                     Event::Mouse(mouse_event) => {
                         let mx = mouse_event.column;
                         let my = mouse_event.row;
-
-                        if let Some(confirm) = kill_confirmation.take() {
-                            if let MouseEventKind::Down(MouseButton::Left) = mouse_event.kind
-                                && let Some((yes_rect, no_rect)) = modal_btn_rects
-                            {
-                                if mx >= yes_rect.x
-                                    && mx < yes_rect.right()
-                                    && my >= yes_rect.y
-                                    && my < yes_rect.bottom()
-                                {
-                                    for &p_id in &confirm.pids {
-                                        if let Some(pid) =
-                                            rustix::process::Pid::from_raw(p_id as i32)
-                                        {
-                                            let _ =
-                                                rustix::process::kill_process(pid, confirm.signal);
-                                        }
-                                    }
-                                    std::thread::sleep(Duration::from_millis(40));
-                                    let cur_dt = last_tick.elapsed().as_secs_f64().max(0.001);
-                                    processes = read_processes(&mut prev_procs, &users, cur_dt);
-                                    sort_processes(
-                                        &mut processes,
-                                        current_sort_col,
-                                        sort_ascending,
-                                    );
-                                    mem = read_memory(&mut io_buf);
-                                    if !is_paused {
-                                        last_tick = Instant::now();
-                                    }
-                                    needs_redraw = true;
-                                    continue;
-                                } else if mx >= no_rect.x
-                                    && mx < no_rect.right()
-                                    && my >= no_rect.y
-                                    && my < no_rect.bottom()
-                                {
-                                    needs_redraw = true;
-                                    continue;
-                                }
-                            }
-                            kill_confirmation = Some(confirm);
-                            continue;
-                        }
 
                         if let MouseEventKind::Down(MouseButton::Left) = mouse_event.kind
                             && my == tabs_area.y + 1
@@ -1330,6 +1400,44 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 }
                                 _ => {}
                             }
+                        } else if current_tab == 3 {
+                            let is_tabbed = is_gpu_overflow(table_area, &gpu_metrics);
+                            match mouse_event.kind {
+                                MouseEventKind::ScrollDown => {
+                                    if is_tabbed {
+                                        gpu_sub_tab = (gpu_sub_tab + 1) % 2;
+                                        needs_redraw = true;
+                                    }
+                                }
+                                MouseEventKind::ScrollUp => {
+                                    if is_tabbed {
+                                        gpu_sub_tab =
+                                            if gpu_sub_tab == 0 { 1 } else { gpu_sub_tab - 1 };
+                                        needs_redraw = true;
+                                    }
+                                }
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    let top_w = (table_area.width * 60) / 100;
+                                    if is_tabbed
+                                        && my == table_area.y + 1
+                                        && mx >= table_area.x
+                                        && mx < table_area.x + top_w
+                                    {
+                                        let titles = ["GPU Utilization", "VRAM History"];
+                                        let mut tab_x = table_area.x + 2;
+                                        for (i, title) in titles.iter().enumerate() {
+                                            let w = title.chars().count() as u16 + 2;
+                                            if mx >= tab_x && mx < tab_x + w {
+                                                gpu_sub_tab = i;
+                                                needs_redraw = true;
+                                                break;
+                                            }
+                                            tab_x += w + 1;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         } else if current_tab == 4 {
                             let num_conns = net_connections.as_ref().map(|c| c.len()).unwrap_or(0);
                             let visible_rows =
@@ -1351,12 +1459,28 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             let (tab_row_y, storage_w) = if is_tabbed {
                                 (table_area.y + 4, table_area.width)
                             } else {
-                                (table_area.y + table_area.height / 2 + 1, (table_area.width * 70) / 100)
+                                (
+                                    table_area.y + table_area.height / 2 + 1,
+                                    (table_area.width * 70) / 100,
+                                )
                             };
 
                             match mouse_event.kind {
                                 MouseEventKind::ScrollDown => {
-                                    disks_scroll_offset = disks_scroll_offset.saturating_add(2);
+                                    let cat_idx = disks_sub_tab
+                                        .min(storage_categories.len().saturating_sub(1));
+                                    let num_items = storage_categories
+                                        .get(cat_idx)
+                                        .map(|c| c.items.len())
+                                        .unwrap_or(0);
+                                    let box_h = if is_tabbed {
+                                        table_area.height.saturating_sub(3)
+                                    } else {
+                                        table_area.height.saturating_sub(table_area.height / 2)
+                                    };
+                                    let visible_rows = (box_h.saturating_sub(4) as usize).max(1);
+                                    let max_scroll = num_items.saturating_sub(visible_rows);
+                                    disks_scroll_offset = (disks_scroll_offset + 2).min(max_scroll);
                                     needs_redraw = true;
                                 }
                                 MouseEventKind::ScrollUp => {

@@ -16,8 +16,8 @@ use ratatui::{
 
 use crate::{
     process::{
-        group_processes_for_simple_view, matches_process_search, ProcessInfo,
-        ProcessKillConfirmation, ProcessSortColumn,
+        ProcessInfo, ProcessKillConfirmation, ProcessSortColumn, group_processes_for_simple_view,
+        matches_process_search,
     },
     system::{
         BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo,
@@ -431,8 +431,7 @@ pub fn render_process_tab(
             } else {
                 ("▼", Color::Rgb(255, 255, 0))
             };
-            Cell::from(format!("{} {}", title, arrow))
-                .style(Style::default().fg(color).bold())
+            Cell::from(format!("{} {}", title, arrow)).style(Style::default().fg(color).bold())
         } else {
             Cell::from(title).style(Style::default().fg(Color::Rgb(255, 255, 255)))
         }
@@ -522,18 +521,38 @@ pub fn render_process_tab(
             cells.push(Cell::from(p.name.clone()).style(Style::default().fg(text_color)));
             cells.push(Cell::from(p.state.clone()).style(Style::default().fg(text_color)));
             cells.push(Cell::from(p.threads.to_string()).style(Style::default().fg(text_color)));
-            cells.push(Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)));
-            cells.push(Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64)).style(Style::default().fg(mem_color)));
-            cells.push(Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)));
-            cells.push(Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64)).style(Style::default().fg(gpu_mem_color)));
+            cells.push(
+                Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)),
+            );
+            cells.push(
+                Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64))
+                    .style(Style::default().fg(mem_color)),
+            );
+            cells.push(
+                Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)),
+            );
+            cells.push(
+                Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64))
+                    .style(Style::default().fg(gpu_mem_color)),
+            );
             cells.push(Cell::from(io_text).style(Style::default().fg(io_color)));
             cells.push(Cell::from(net_text).style(Style::default().fg(net_color)));
         } else {
             cells.push(Cell::from(format_command_spans(&p.name, is_selected)));
-            cells.push(Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)));
-            cells.push(Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64)).style(Style::default().fg(mem_color)));
-            cells.push(Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)));
-            cells.push(Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64)).style(Style::default().fg(gpu_mem_color)));
+            cells.push(
+                Cell::from(format_percent(p.cpu_percent)).style(Style::default().fg(cpu_color)),
+            );
+            cells.push(
+                Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64))
+                    .style(Style::default().fg(mem_color)),
+            );
+            cells.push(
+                Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)),
+            );
+            cells.push(
+                Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64))
+                    .style(Style::default().fg(gpu_mem_color)),
+            );
             cells.push(Cell::from(io_text).style(Style::default().fg(io_color)));
             cells.push(Cell::from(net_text).style(Style::default().fg(net_color)));
         }
@@ -542,22 +561,22 @@ pub fn render_process_tab(
 
     let table_title = if is_searching {
         format!(
-            " Search: {}_ (Enter/Esc to finish, 'c' Term, 'k' Kill) ",
+            " Search: {}_ (Enter to finish, Esc to cancel) ",
             search_query
         )
     } else if !search_query.is_empty() {
         let mode_str = if advanced_view { "Advanced, " } else { "" };
         format!(
-            " Processes [{}Filter: \"{}\" - {} matches] ('/' Search, Esc Clear, ←/→ Sort, 'r' Order, 'c' Term, 'k' Kill, ↑/↓/g/G Select) ",
+            " Processes [{}Filter: \"{}\" - {} matches] ('/' Search, Esc Clear, ←/→ Sort, 'r' Order, 'c' Term, 't' Kill, ↑/↓/g/G Select) ",
             mode_str,
             search_query,
             displayed_processes.len()
         )
     } else if advanced_view {
-        " Processes [Advanced] ('/' Search, ←/→ Sort, 'r' Order, 'c' Term, 'k' Kill, ↑/↓/g/G Select, 'a' Normal View) "
+        " Processes [Advanced] ('/' Search, 'r' Order, 'c' Term, 't' Kill, 'a' Normal View) "
             .to_string()
     } else {
-        " Processes ('/' Search, Enter Expand/Collapse, ←/→ Sort, 'r' Order, 'c' Term, 'k' Kill, ↑/↓/g/G Select, 'a' Advanced View) "
+        " Processes ('/' Search, 'r' Order, 'c' Term, 't' Kill, 'a' Advanced View) "
             .to_string()
     }.fg(Color::Rgb(170, 170, 170));
 
@@ -624,11 +643,7 @@ pub fn render_cpu_ram_tab(
 
     let cpu_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            cores_constraint,
-            Constraint::Length(9),
-        ])
+        .constraints([Constraint::Min(0), cores_constraint, Constraint::Length(9)])
         .split(body_chunks[0]);
 
     let cpu_freq_pct = if cpu_max_mhz > cpu_min_mhz {
@@ -670,11 +685,7 @@ pub fn render_cpu_ram_tab(
         };
 
         for (i, &usage) in core_usages.iter().enumerate() {
-            let (col_idx, row_idx) = if is_two_col {
-                (i % 2, i / 2)
-            } else {
-                (0, i)
-            };
+            let (col_idx, row_idx) = if is_two_col { (i % 2, i / 2) } else { (0, i) };
 
             let row_y = cores_inner.y + row_idx as u16;
             if row_y >= cores_inner.bottom() {
@@ -846,12 +857,7 @@ pub fn render_cpu_ram_tab(
         } else {
             "0 MB / 0 MB (No Swap Configured)".to_string()
         };
-        draw_centered_gradient_bar(
-            frame.buffer_mut(),
-            swap_inner,
-            &label,
-            swap_pct,
-        );
+        draw_centered_gradient_bar(frame.buffer_mut(), swap_inner, &label, swap_pct);
     }
 }
 
@@ -905,6 +911,28 @@ fn draw_centered_gradient_bar(
     }
 }
 
+/// Checks whether the GPU model name exceeds available chart title width in side-by-side mode,
+/// causing title text overlap with "GPU Utilization".
+///
+/// # Arguments
+/// * `area` - Target bounding box for the GPU tab.
+/// * `gpu_metrics` - Current GPU metrics containing name and VRAM info.
+///
+/// # Returns
+/// `true` if GPU utilization and VRAM history charts should collapse into a tabbed sub-view.
+pub fn is_gpu_overflow(area: Rect, gpu_metrics: &GpuMetrics) -> bool {
+    let top_w = (area.width * 60) / 100;
+    let graph_w = top_w / 2;
+    let vram_gb = ((gpu_metrics.vram_total_mb as f64) / 1024.0).round() as u64;
+    let gpu_label_len = if vram_gb > 0 {
+        gpu_metrics.name.chars().count() + format!(" ({}GB)", vram_gb).chars().count()
+    } else {
+        gpu_metrics.name.chars().count()
+    };
+    let min_needed = (15 + gpu_label_len + 4) as u16;
+    graph_w < min_needed
+}
+
 /// Renders the GPU (Tab 4) utilization graph, VRAM graph, core/memory clocks, power, fans, and temperatures.
 ///
 /// # Arguments
@@ -913,13 +941,19 @@ fn draw_centered_gradient_bar(
 /// * `gpu_metrics` - Current GPU metrics and status.
 /// * `gpu_history` - Historical GPU core busy percentages for Braille graphing.
 /// * `gpu_vram_history` - Historical GPU VRAM consumption for Braille graphing.
+/// * `sub_tab` - Active sub-tab index (0: GPU Utilization, 1: VRAM History) when in tabbed view.
 pub fn render_gpu_tab(
     frame: &mut Frame,
     area: Rect,
     gpu_metrics: &GpuMetrics,
     gpu_history: &[Option<f64>],
     gpu_vram_history: &[Option<f64>],
+    sub_tab: usize,
 ) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -929,11 +963,6 @@ pub fn render_gpu_tab(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(body_chunks[0]);
-
-    let graph_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(top_chunks[0]);
 
     let vram_gb = ((gpu_metrics.vram_total_mb as f64) / 1024.0).round() as u64;
     let gpu_label = if vram_gb > 0 {
@@ -952,16 +981,6 @@ pub fn render_gpu_tab(
     let gpu_freq_label = format_freq(gpu_metrics.cur_mhz);
     let gpu_freq_color = gradient_color(gpu_freq_pct);
 
-    render_gradient_chart(
-        frame,
-        graph_chunks[0],
-        "GPU Utilization",
-        Some((&gpu_freq_label, gpu_freq_color)),
-        Some(&gpu_label),
-        Color::Rgb(60, 60, 60),
-        gpu_history,
-    );
-
     let vram_label = format!(
         "{} MB / {} MB",
         gpu_metrics.vram_used_mb, gpu_metrics.vram_total_mb
@@ -972,15 +991,81 @@ pub fn render_gpu_tab(
         "VRAM".to_string()
     };
 
-    render_gradient_chart(
-        frame,
-        graph_chunks[1],
-        "VRAM History",
-        None,
-        Some(&vram_label),
-        Color::Rgb(60, 60, 60),
-        gpu_vram_history,
-    );
+    let is_tabbed = is_gpu_overflow(area, gpu_metrics);
+
+    if is_tabbed {
+        let sub_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(top_chunks[0]);
+
+        let titles = vec!["GPU Utilization", "VRAM History"];
+        let tabs = Tabs::new(titles)
+            .style(Style::default().fg(Color::Rgb(170, 170, 170)))
+            .select(sub_tab % 2)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Plain)
+                    .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
+                    .title(" View (←/→ switch tab) ".fg(Color::Rgb(170, 170, 170))),
+            )
+            .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold())
+            .divider("|");
+
+        frame.render_widget(tabs, sub_chunks[0]);
+
+        match sub_tab % 2 {
+            0 => {
+                render_gradient_chart(
+                    frame,
+                    sub_chunks[1],
+                    "GPU Utilization",
+                    Some((&gpu_freq_label, gpu_freq_color)),
+                    Some(&gpu_label),
+                    Color::Rgb(60, 60, 60),
+                    gpu_history,
+                );
+            }
+            1 => {
+                render_gradient_chart(
+                    frame,
+                    sub_chunks[1],
+                    "VRAM History",
+                    None,
+                    Some(&vram_label),
+                    Color::Rgb(60, 60, 60),
+                    gpu_vram_history,
+                );
+            }
+            _ => {}
+        }
+    } else {
+        let graph_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(top_chunks[0]);
+
+        render_gradient_chart(
+            frame,
+            graph_chunks[0],
+            "GPU Utilization",
+            Some((&gpu_freq_label, gpu_freq_color)),
+            Some(&gpu_label),
+            Color::Rgb(60, 60, 60),
+            gpu_history,
+        );
+
+        render_gradient_chart(
+            frame,
+            graph_chunks[1],
+            "VRAM History",
+            None,
+            Some(&vram_label),
+            Color::Rgb(60, 60, 60),
+            gpu_vram_history,
+        );
+    }
 
     // Top Right: Hardware & Telemetry card
     let hw_block = Block::default()
@@ -1042,7 +1127,11 @@ pub fn render_gpu_tab(
 
     // Bottom Left: Dedicated VRAM + GTT System RAM
     let mem_constraints = if gpu_metrics.gtt_total_mb > 0 {
-        vec![Constraint::Length(3), Constraint::Length(3), Constraint::Min(0)]
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ]
     } else {
         vec![Constraint::Length(3), Constraint::Min(0)]
     };
@@ -1073,7 +1162,10 @@ pub fn render_gpu_tab(
         draw_centered_gradient_bar(
             frame.buffer_mut(),
             vram_inner,
-            &format!("{} MB / {} MB ({:.0}%)", gpu_metrics.vram_used_mb, gpu_metrics.vram_total_mb, vram_pct),
+            &format!(
+                "{} MB / {} MB ({:.0}%)",
+                gpu_metrics.vram_used_mb, gpu_metrics.vram_total_mb, vram_pct
+            ),
             vram_pct,
         );
     }
@@ -1092,7 +1184,10 @@ pub fn render_gpu_tab(
             draw_centered_gradient_bar(
                 frame.buffer_mut(),
                 gtt_inner,
-                &format!("{} MB / {} MB ({:.0}%)", gpu_metrics.gtt_used_mb, gpu_metrics.gtt_total_mb, gtt_pct),
+                &format!(
+                    "{} MB / {} MB ({:.0}%)",
+                    gpu_metrics.gtt_used_mb, gpu_metrics.gtt_total_mb, gtt_pct
+                ),
                 gtt_pct,
             );
         }
@@ -1113,7 +1208,12 @@ pub fn render_gpu_tab(
             let pct = ((gpu_metrics.temp_edge_c as f64 - 25.0) / 75.0 * 100.0).clamp(0.0, 100.0);
             draw_labeled_bar(
                 frame.buffer_mut(),
-                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                Rect {
+                    x: thermal_inner.x,
+                    y: thermal_inner.y + row_idx,
+                    width: thermal_inner.width,
+                    height: 1,
+                },
                 "Edge Temp:    ",
                 &format!("{}°C", gpu_metrics.temp_edge_c),
                 pct,
@@ -1121,10 +1221,16 @@ pub fn render_gpu_tab(
             row_idx += 1;
         }
         if gpu_metrics.temp_junction_c > 0 && thermal_inner.y + row_idx < thermal_inner.bottom() {
-            let pct = ((gpu_metrics.temp_junction_c as f64 - 25.0) / 85.0 * 100.0).clamp(0.0, 100.0);
+            let pct =
+                ((gpu_metrics.temp_junction_c as f64 - 25.0) / 85.0 * 100.0).clamp(0.0, 100.0);
             draw_labeled_bar(
                 frame.buffer_mut(),
-                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                Rect {
+                    x: thermal_inner.x,
+                    y: thermal_inner.y + row_idx,
+                    width: thermal_inner.width,
+                    height: 1,
+                },
                 "Hotspot Temp: ",
                 &format!("{}°C", gpu_metrics.temp_junction_c),
                 pct,
@@ -1135,21 +1241,40 @@ pub fn render_gpu_tab(
             let pct = ((gpu_metrics.temp_mem_c as f64 - 25.0) / 80.0 * 100.0).clamp(0.0, 100.0);
             draw_labeled_bar(
                 frame.buffer_mut(),
-                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                Rect {
+                    x: thermal_inner.x,
+                    y: thermal_inner.y + row_idx,
+                    width: thermal_inner.width,
+                    height: 1,
+                },
                 "Memory Temp:  ",
                 &format!("{}°C", gpu_metrics.temp_mem_c),
                 pct,
             );
             row_idx += 1;
         }
-        if (gpu_metrics.power_w > 0.0 || gpu_metrics.power_cap_w > 0.0) && thermal_inner.y + row_idx < thermal_inner.bottom() {
-            let cap = if gpu_metrics.power_cap_w > 0.0 { gpu_metrics.power_cap_w } else { 200.0 };
+        if (gpu_metrics.power_w > 0.0 || gpu_metrics.power_cap_w > 0.0)
+            && thermal_inner.y + row_idx < thermal_inner.bottom()
+        {
+            let cap = if gpu_metrics.power_cap_w > 0.0 {
+                gpu_metrics.power_cap_w
+            } else {
+                200.0
+            };
             let pct = (gpu_metrics.power_w / cap * 100.0).clamp(0.0, 100.0);
             draw_labeled_bar(
                 frame.buffer_mut(),
-                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                Rect {
+                    x: thermal_inner.x,
+                    y: thermal_inner.y + row_idx,
+                    width: thermal_inner.width,
+                    height: 1,
+                },
                 "Power Draw:   ",
-                &format!("{:.1} W / {:.1} W", gpu_metrics.power_w, gpu_metrics.power_cap_w),
+                &format!(
+                    "{:.1} W / {:.1} W",
+                    gpu_metrics.power_w, gpu_metrics.power_cap_w
+                ),
                 pct,
             );
             row_idx += 1;
@@ -1162,7 +1287,12 @@ pub fn render_gpu_tab(
             };
             draw_labeled_bar(
                 frame.buffer_mut(),
-                Rect { x: thermal_inner.x, y: thermal_inner.y + row_idx, width: thermal_inner.width, height: 1 },
+                Rect {
+                    x: thermal_inner.x,
+                    y: thermal_inner.y + row_idx,
+                    width: thermal_inner.width,
+                    height: 1,
+                },
                 "Fan Speed:    ",
                 &fan_label,
                 gpu_metrics.fan_pct as f64,
@@ -1253,8 +1383,14 @@ pub fn render_network_tab(
             lines.push(format!("Speed:    {} Mbps", iface.speed_mbps));
             lines.push(format!("Duplex:   {}", iface.duplex));
             lines.push(format!("MAC:      {}", iface.mac));
-            lines.push(format!("Total RX: {}", format_bytes_dyn(iface.rx_bytes as f64)));
-            lines.push(format!("Total TX: {}", format_bytes_dyn(iface.tx_bytes as f64)));
+            lines.push(format!(
+                "Total RX: {}",
+                format_bytes_dyn(iface.rx_bytes as f64)
+            ));
+            lines.push(format!(
+                "Total TX: {}",
+                format_bytes_dyn(iface.tx_bytes as f64)
+            ));
         }
         if net_ifaces.len() > 1 {
             lines.push("".to_string());
@@ -1278,7 +1414,9 @@ pub fn render_network_tab(
                 for (c_idx, ch) in line_str.chars().enumerate() {
                     let col = iface_inner.x + c_idx as u16;
                     if col < iface_inner.right() {
-                        let color = if idx == 1 && primary_iface.map(|i| i.operstate.as_str()) == Some("up") {
+                        let color = if idx == 1
+                            && primary_iface.map(|i| i.operstate.as_str()) == Some("up")
+                        {
                             Color::Rgb(0, 255, 128)
                         } else {
                             Color::Rgb(170, 170, 170)
@@ -1390,7 +1528,8 @@ pub fn render_network_tab(
                         } else {
                             format!("{}:{}", conn.local_ip, conn.local_port)
                         };
-                        let remote_str = if conn.remote_ip.is_unspecified() && conn.remote_port == 0 {
+                        let remote_str = if conn.remote_ip.is_unspecified() && conn.remote_port == 0
+                        {
                             "*.*".to_string()
                         } else if let Some(ref host) = conn.remote_host {
                             format!("{}:{}", host, conn.remote_port)
@@ -1402,7 +1541,9 @@ pub fn render_network_tab(
                         let state_color = match state_str {
                             "ESTABLISHED" => Color::Rgb(0, 255, 128),
                             "LISTEN" => Color::Rgb(100, 180, 255),
-                            "TIME_WAIT" | "CLOSE_WAIT" | "FIN_WAIT1" | "FIN_WAIT2" => Color::Rgb(150, 150, 150),
+                            "TIME_WAIT" | "CLOSE_WAIT" | "FIN_WAIT1" | "FIN_WAIT2" => {
+                                Color::Rgb(150, 150, 150)
+                            }
                             "SYN_SENT" | "SYN_RECV" => Color::Rgb(255, 200, 50),
                             _ => Color::Rgb(170, 170, 170),
                         };
@@ -1432,7 +1573,10 @@ pub fn render_network_tab(
                         let truncated_prog = if prog_str.chars().count() > prog_w {
                             format!(
                                 "{}…",
-                                prog_str.chars().take(prog_w.saturating_sub(1)).collect::<String>()
+                                prog_str
+                                    .chars()
+                                    .take(prog_w.saturating_sub(1))
+                                    .collect::<String>()
                             )
                         } else {
                             format!("{:<prog_w$}", prog_str, prog_w = prog_w)
@@ -1450,7 +1594,10 @@ pub fn render_network_tab(
                         let truncated_local = if local_str.chars().count() > local_w {
                             format!(
                                 "{}…",
-                                local_str.chars().take(local_w.saturating_sub(1)).collect::<String>()
+                                local_str
+                                    .chars()
+                                    .take(local_w.saturating_sub(1))
+                                    .collect::<String>()
                             )
                         } else {
                             format!("{:<local_w$}", local_str, local_w = local_w)
@@ -1468,7 +1615,10 @@ pub fn render_network_tab(
                         let truncated_remote = if remote_str.chars().count() > remote_w {
                             format!(
                                 "{}…",
-                                remote_str.chars().take(remote_w.saturating_sub(1)).collect::<String>()
+                                remote_str
+                                    .chars()
+                                    .take(remote_w.saturating_sub(1))
+                                    .collect::<String>()
                             )
                         } else {
                             format!("{:<remote_w$}", remote_str, remote_w = remote_w)
@@ -1599,7 +1749,7 @@ pub fn render_disks_tab(
         let titles = vec![
             "Graphs (a)",
             "Physical Disks (s)",
-            "Storage (d)",
+            "Store (d)",
             "Mounted Filesystems (f)",
         ];
         let tabs = Tabs::new(titles)
@@ -1610,7 +1760,7 @@ pub fn render_disks_tab(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Plain)
                     .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-                    .title(" Disk View (a/s/d/f switch box) ".fg(Color::Rgb(170, 170, 170))),
+                    .title(" View (a/s/d/f switch box) ".fg(Color::Rgb(170, 170, 170))),
             )
             .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold())
             .divider("|");
@@ -1870,7 +2020,6 @@ fn render_package_storage_card(
             let cat_idx = active_cat_idx.min(storage_categories.len().saturating_sub(1));
             let active_cat = &storage_categories[cat_idx];
             let total_items = active_cat.items.len();
-            let start_idx = scroll_offset.min(total_items.saturating_sub(1));
 
             // 1. Render Sub-Tabs Header Line (wrapping to 2 rows if overflowing)
             let mut subtab_rows = 1;
@@ -1886,7 +2035,8 @@ fn render_package_storage_card(
                 let tab_len = tab_label.chars().count() as u16;
 
                 // Wrap to next row if overflowing first row
-                if cur_row == 0 && cur_col > pkg_inner.x && (cur_col + tab_len) > pkg_inner.right() {
+                if cur_row == 0 && cur_col > pkg_inner.x && (cur_col + tab_len) > pkg_inner.right()
+                {
                     cur_row = 1;
                     cur_col = pkg_inner.x;
                     subtab_rows = 2;
@@ -1916,7 +2066,14 @@ fn render_package_storage_card(
 
             // 2. Items list with scroll offset (clean 1-line text with size)
             let start_row_offset = subtab_rows + 1;
-            for (row_offset, item) in (start_row_offset..).zip(active_cat.items.iter().skip(start_idx)) {
+            let visible_rows =
+                (pkg_inner.height as usize).saturating_sub(start_row_offset as usize);
+            let max_scroll = total_items.saturating_sub(visible_rows);
+            let start_idx = scroll_offset.min(max_scroll);
+
+            for (row_offset, item) in
+                (start_row_offset..).zip(active_cat.items.iter().skip(start_idx))
+            {
                 if row_offset >= pkg_inner.height {
                     break;
                 }
@@ -2435,11 +2592,7 @@ fn render_general_overview_card(
 }
 
 /// Renders the Battery & Power telemetry metadata card.
-fn render_general_battery_card(
-    frame: &mut Frame,
-    area: Rect,
-    battery: Option<&BatteryInfo>,
-) {
+fn render_general_battery_card(frame: &mut Frame, area: Rect, battery: Option<&BatteryInfo>) {
     let pwr_block = Block::default()
         .title(" Battery & Power ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
@@ -2674,12 +2827,7 @@ fn render_general_cpu_card(
 }
 
 /// Renders the Memory and Swap utilization card.
-fn render_general_memory_card(
-    frame: &mut Frame,
-    area: Rect,
-    mem: &MemoryMetrics,
-    ram_info: &str,
-) {
+fn render_general_memory_card(frame: &mut Frame, area: Rect, mem: &MemoryMetrics, ram_info: &str) {
     let mut mem_block = Block::default()
         .title(" Memory ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
@@ -2840,8 +2988,7 @@ fn render_general_processes_card(
             let hdr_gpu = "GPU%";
             let hdr_vram = "VRAM%";
 
-            let name_w =
-                (heavy_inner.width.saturating_sub(7 + 8 + 8 + 8 + 8 + 2) as usize).max(8);
+            let name_w = (heavy_inner.width.saturating_sub(7 + 8 + 8 + 8 + 8 + 2) as usize).max(8);
             let header_str = format!(
                 "{:<7}{:<name_w$} {:>7} {:>7} {:>7} {:>7}",
                 hdr_pid,
@@ -2989,11 +3136,7 @@ fn render_general_processes_card(
 }
 
 /// Renders the GPU utilization and VRAM allocation card.
-fn render_general_gpu_card(
-    frame: &mut Frame,
-    area: Rect,
-    gpu: &GpuMetrics,
-) {
+fn render_general_gpu_card(frame: &mut Frame, area: Rect, gpu: &GpuMetrics) {
     let mut gpu_block = Block::default()
         .title(" GPU ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
@@ -3074,11 +3217,7 @@ fn render_general_gpu_card(
 }
 
 /// Renders the Network throughput card with RX and TX bandwidth.
-fn render_general_net_card(
-    frame: &mut Frame,
-    area: Rect,
-    net_ifaces: &[NetInterfaceInfo],
-) {
+fn render_general_net_card(frame: &mut Frame, area: Rect, net_ifaces: &[NetInterfaceInfo]) {
     let net_block = Block::default()
         .title(" Network ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
@@ -3131,11 +3270,7 @@ fn render_general_net_card(
 }
 
 /// Renders the Disk IO throughput card with read and write rates.
-fn render_general_disk_card(
-    frame: &mut Frame,
-    area: Rect,
-    disk_io: &DiskIoInfo,
-) {
+fn render_general_disk_card(frame: &mut Frame, area: Rect, disk_io: &DiskIoInfo) {
     let disk_block = Block::default()
         .title(" IO ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
@@ -3181,11 +3316,7 @@ fn render_general_disk_card(
 }
 
 /// Renders the mounted filesystem storage partitions card.
-fn render_general_storage_card(
-    frame: &mut Frame,
-    area: Rect,
-    disk_mounts: &[MountInfo],
-) {
+fn render_general_storage_card(frame: &mut Frame, area: Rect, disk_mounts: &[MountInfo]) {
     let storage_block = Block::default()
         .title(" Partitions ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
@@ -3295,7 +3426,7 @@ pub fn render_general_tab(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Plain)
                     .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-                    .title(" General View (←/→ switch box) ".fg(Color::Rgb(170, 170, 170))),
+                    .title(" View (←/→ switch box) ".fg(Color::Rgb(170, 170, 170))),
             )
             .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)))
             .divider("|");
@@ -3310,14 +3441,18 @@ pub fn render_general_tab(
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .split(body);
-                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied);
+                    render_general_overview_card(
+                        frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied,
+                    );
                     render_general_battery_card(frame, chunks[1], battery);
                 } else {
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([Constraint::Min(0), Constraint::Length(6)])
                         .split(body);
-                    render_general_overview_card(frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied);
+                    render_general_overview_card(
+                        frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied,
+                    );
                     render_general_battery_card(frame, chunks[1], battery);
                 }
             }
@@ -3405,7 +3540,16 @@ pub fn render_general_tab(
             ])
             .split(columns[0]);
 
-        render_general_overview_card(frame, left_chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied);
+        render_general_overview_card(
+            frame,
+            left_chunks[0],
+            sys_info,
+            cpu_model,
+            num_cores,
+            ram_info,
+            gpu,
+            copied,
+        );
         render_general_cpu_card(
             frame,
             left_chunks[1],
@@ -3464,9 +3608,17 @@ pub fn render_kill_confirmation_modal(
     frame.render_widget(ratatui::widgets::Clear, popup_rect);
 
     let (title, border_color, sig_text) = if confirm.is_kill {
-        (" Force Kill (SIGKILL) ", Color::Rgb(255, 60, 60), "force kill")
+        (
+            " Force Kill (SIGKILL) ",
+            Color::Rgb(255, 60, 60),
+            "force kill",
+        )
     } else {
-        (" Terminate (SIGTERM) ", Color::Rgb(255, 190, 0), "terminate")
+        (
+            " Terminate (SIGTERM) ",
+            Color::Rgb(255, 190, 0),
+            "terminate",
+        )
     };
 
     let block = Block::default()
@@ -3479,7 +3631,11 @@ pub fn render_kill_confirmation_modal(
     frame.render_widget(block, popup_rect);
 
     let target_desc = if confirm.pids.len() > 1 {
-        format!("{} ({} processes)", confirm.process_name, confirm.pids.len())
+        format!(
+            "{} ({} processes)",
+            confirm.process_name,
+            confirm.pids.len()
+        )
     } else if let Some(&pid) = confirm.pids.first() {
         format!("{} [PID: {}]", confirm.process_name, pid)
     } else {
@@ -3494,7 +3650,10 @@ pub fn render_kill_confirmation_modal(
 
     let target_line = Line::from(vec![
         Span::raw("   "),
-        Span::styled(target_desc, Style::default().fg(Color::Rgb(255, 255, 255)).bold()),
+        Span::styled(
+            target_desc,
+            Style::default().fg(Color::Rgb(255, 255, 255)).bold(),
+        ),
     ]);
 
     let btn_y = inner.y + inner.height.saturating_sub(2);
@@ -3506,19 +3665,22 @@ pub fn render_kill_confirmation_modal(
     let yes_rect = Rect::new(btn_start_x, btn_y, yes_w, 1);
     let no_rect = Rect::new(btn_start_x + yes_w + 4, btn_y, no_w, 1);
 
-    let lines = vec![
-        question,
-        target_line,
-    ];
+    let lines = vec![question, target_line];
 
     let paragraph = ratatui::widgets::Paragraph::new(lines);
     frame.render_widget(paragraph, Rect::new(inner.x, inner.y + 1, inner.width, 2));
 
     // Render Yes Button
     let yes_style = if confirm.is_kill {
-        Style::default().bg(Color::Rgb(200, 30, 30)).fg(Color::Rgb(255, 255, 255)).bold()
+        Style::default()
+            .bg(Color::Rgb(200, 30, 30))
+            .fg(Color::Rgb(255, 255, 255))
+            .bold()
     } else {
-        Style::default().bg(Color::Rgb(200, 140, 0)).fg(Color::Rgb(0, 0, 0)).bold()
+        Style::default()
+            .bg(Color::Rgb(200, 140, 0))
+            .fg(Color::Rgb(0, 0, 0))
+            .bold()
     };
     frame.render_widget(
         ratatui::widgets::Paragraph::new(" [ Yes (y) ] ")
@@ -3528,7 +3690,10 @@ pub fn render_kill_confirmation_modal(
     );
 
     // Render No Button
-    let no_style = Style::default().bg(Color::Rgb(70, 70, 70)).fg(Color::Rgb(255, 255, 255)).bold();
+    let no_style = Style::default()
+        .bg(Color::Rgb(70, 70, 70))
+        .fg(Color::Rgb(255, 255, 255))
+        .bold();
     frame.render_widget(
         ratatui::widgets::Paragraph::new(" [ No (n) ] ")
             .style(no_style)
@@ -3589,4 +3754,32 @@ mod tests {
         // On large area (width 160, height 50), it fits comfortably without overflow
         assert!(!is_disks_overflow(area_large, &disk_io, &mounts));
     }
+
+    #[test]
+    fn test_is_gpu_overflow() {
+        let area_small = Rect::new(0, 0, 100, 30);
+        let area_large = Rect::new(0, 0, 200, 40);
+
+        let gpu_long = GpuMetrics {
+            name: "NVIDIA GeForce RTX 4090".to_string(),
+            vram_total_mb: 24576,
+            ..Default::default()
+        };
+
+        let gpu_short = GpuMetrics {
+            name: "GPU".to_string(),
+            vram_total_mb: 0,
+            ..Default::default()
+        };
+
+        // Long GPU model (30 chars) on width 100 (graph_w = 30) overflows (needs >= 49)
+        assert!(is_gpu_overflow(area_small, &gpu_long));
+
+        // Short GPU model on width 100 (graph_w = 30 >= 23) fits without overflow
+        assert!(!is_gpu_overflow(area_small, &gpu_short));
+
+        // On large area (width 200 -> graph_w = 60 >= 49), long GPU model fits without overflow
+        assert!(!is_gpu_overflow(area_large, &gpu_long));
+    }
 }
+
