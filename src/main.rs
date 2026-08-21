@@ -991,8 +991,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     table_state.select(Some(best_match));
                                 }
                                 KeyCode::Char('w')
-                                    if key.modifiers
-                                        == crossterm::event::KeyModifiers::CONTROL =>
+                                    if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
                                 {
                                     // Delete last word (vim Ctrl+W behaviour):
                                     // trim trailing whitespace, then drop chars until whitespace
