@@ -2457,7 +2457,7 @@ fn render_package_storage_card(
                 let msg = if is_dust_scanning && active_cat.name == "All" {
                     "Scanning disk..."
                 } else if active_cat.name == "All" {
-                    "Press Enter to scan disk scan."
+                    "Press Enter to scan disk."
                 } else {
                     "No items detected in category."
                 };

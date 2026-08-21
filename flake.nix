@@ -1,5 +1,5 @@
 {
-  description = "modern CLI system monitor";
+  description = "A fast, lightweight, and modern terminal system monitor";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -11,6 +11,7 @@
   };
 
   outputs = {
+    self,
     nixpkgs,
     flake-utils,
     rust-overlay,
@@ -35,24 +36,8 @@
           rustc = rustToolchain;
         };
 
-        toptop = rustPlatform.buildRustPackage {
-          pname = "toptop";
-          version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
-
-          src = pkgs.lib.cleanSource ./.;
-
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-          };
-
-          meta = with pkgs.lib; {
-            description = "modern CLI system monitor";
-            homepage = "https://github.com/DazorPlasma/toptop";
-            license = licenses.gpl3Plus;
-            maintainers = [];
-            mainProgram = "toptop";
-            platforms = platforms.linux;
-          };
+        toptop = pkgs.callPackage ./package.nix {
+          inherit rustPlatform;
         };
       in {
         packages = {
@@ -69,6 +54,7 @@
             rustToolchain
             pkg-config
             openssl
+            dust
           ];
 
           env = {
