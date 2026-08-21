@@ -1148,9 +1148,7 @@ pub fn read_ram_temp() -> Option<u32> {
                 || (name.contains("dram") && !name.contains("gpu"))
                 || (name.contains("dimm") && !name.contains("gpu"));
 
-            if is_ram_driver
-                && let Ok(h_entries) = fs::read_dir(&path)
-            {
+            if is_ram_driver && let Ok(h_entries) = fs::read_dir(&path) {
                 for h_entry in h_entries.filter_map(Result::ok) {
                     let fname = h_entry.file_name().to_string_lossy().to_string();
                     if fname.starts_with("temp")
@@ -1173,9 +1171,7 @@ pub fn read_ram_temp() -> Option<u32> {
                 && !name.contains("xe")
                 && !name.contains("nvme");
 
-            if is_non_gpu
-                && let Ok(h_entries) = fs::read_dir(&path)
-            {
+            if is_non_gpu && let Ok(h_entries) = fs::read_dir(&path) {
                 for h_entry in h_entries.filter_map(Result::ok) {
                     let fname = h_entry.file_name().to_string_lossy().to_string();
                     if fname.starts_with("temp") && fname.ends_with("_label") {
