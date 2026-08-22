@@ -3,6 +3,7 @@
   rustPlatform,
   makeWrapper,
   dust,
+  mesa-demos,
 }:
 rustPlatform.buildRustPackage {
   pname = "toptop";
@@ -20,7 +21,7 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     wrapProgram $out/bin/toptop \
-      --prefix PATH : ${lib.makeBinPath [dust]}
+      --prefix PATH : ${lib.makeBinPath [dust mesa-demos]}
   '';
 
   meta = with lib; {

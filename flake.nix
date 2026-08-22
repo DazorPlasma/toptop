@@ -55,6 +55,7 @@
             pkg-config
             openssl
             dust
+            mesa-demos
           ];
 
           env = {

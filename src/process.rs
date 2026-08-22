@@ -85,7 +85,7 @@ pub struct ProcessKillConfirmation {
     pub pids: Vec<u32>,
     /// Name or summary of the target process/group.
     pub process_name: String,
-    /// Signal to dispatch (`Signal::Term` for SIGTERM, `Signal::Kill` for SIGKILL).
+    /// Signal to dispatch (`Signal::TERM` for SIGTERM, `Signal::KILL` for SIGKILL).
     pub signal: rustix::process::Signal,
     /// Indicates whether this is a forceful SIGKILL (`true`) or graceful SIGTERM (`false`).
     pub is_kill: bool,
@@ -1020,6 +1020,16 @@ fn resolve_process_group(
 ///
 /// # Returns
 /// Vector of grouped, sorted, and cleanly nested `ProcessInfo` structs.
+/// Strips tree branch markers (`▼ `, `▶ `, `├─ `, `└─ `) from a display name,
+/// yielding the plain process or group label underneath.
+pub fn strip_tree_markers(name: &str) -> &str {
+    name.trim_start_matches("▼ ")
+        .trim_start_matches("▶ ")
+        .trim_start_matches("├─ ")
+        .trim_start_matches("└─ ")
+        .trim()
+}
+
 /// Computes a match relevance score for a process given a search query.
 /// Higher score indicates higher match quality (exact/prefix matches on name/PID rank highest).
 pub fn process_search_score(p: &ProcessInfo, query: &str) -> u32 {
@@ -1046,12 +1056,7 @@ pub fn process_search_score(p: &ProcessInfo, query: &str) -> u32 {
     }
 
     // Cleaned display name (strip tree branch markers)
-    let clean_name = name_lower
-        .trim_start_matches("▼ ")
-        .trim_start_matches("▶ ")
-        .trim_start_matches("├─ ")
-        .trim_start_matches("└─ ")
-        .trim();
+    let clean_name = strip_tree_markers(&name_lower);
 
     if clean_name == q_lower {
         return 1000;
@@ -1414,21 +1419,8 @@ pub fn validate_process_target(target: &ProcessTarget) -> Result<(), String> {
         ));
     }
 
-    let clean_exp_comm = target
-        .comm
-        .trim_start_matches("▼ ")
-        .trim_start_matches("▶ ")
-        .trim_start_matches("├─ ")
-        .trim_start_matches("└─ ")
-        .trim();
-
-    let clean_exp_name = target
-        .name
-        .trim_start_matches("▼ ")
-        .trim_start_matches("▶ ")
-        .trim_start_matches("├─ ")
-        .trim_start_matches("└─ ")
-        .trim();
+    let clean_exp_comm = strip_tree_markers(&target.comm);
+    let clean_exp_name = strip_tree_markers(&target.name);
 
     let exp_comm_short: String = clean_exp_comm.chars().take(15).collect();
     let cur_comm_short: String = current_comm.chars().take(15).collect();

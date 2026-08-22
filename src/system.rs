@@ -10,7 +10,7 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         mpsc::{Receiver, Sender, channel},
     },
 };
@@ -751,6 +751,103 @@ pub struct GpuMetrics {
     pub fan_max_rpm: u32,
     /// Fan duty percentage (0 to 100).
     pub fan_pct: u32,
+    /// Mesa OpenGL implementation version reported by `glxinfo` (e.g. "25.0.1-arch1.2").
+    pub gl_mesa_version: String,
+    /// OpenGL compatibility-profile version string (e.g. "4.6 (Compatibility Profile)").
+    pub gl_version: String,
+    /// OpenGL core-profile version string (e.g. "4.6 (Core Profile)").
+    pub gl_core_version: String,
+    /// GLSL shading language version (e.g. "4.60").
+    pub glsl_version: String,
+    /// OpenGL renderer string including driver build details (LLVM, DRM, kernel).
+    pub gl_renderer: String,
+    /// OpenGL vendor string.
+    pub gl_vendor: String,
+    /// Whether the GL stack reports direct rendering.
+    pub direct_rendering: bool,
+}
+
+/// OpenGL / Mesa userspace driver stack details probed from `glxinfo`.
+#[derive(Clone, Default)]
+struct GlxInfo {
+    /// Mesa version (e.g. "25.0.1-arch1.2").
+    mesa_version: String,
+    /// Compatibility-profile GL version string.
+    gl_version: String,
+    /// Core-profile GL version string.
+    gl_core_version: String,
+    /// GLSL shading language version string.
+    glsl_version: String,
+    /// Renderer string (GPU model plus LLVM/DRM/kernel build details).
+    renderer: String,
+    /// Vendor string.
+    vendor: String,
+    /// Whether direct rendering is active.
+    direct_rendering: bool,
+}
+
+/// Cached `glxinfo` probe; the Mesa/GL stack cannot change during a session,
+/// so the external binary is executed at most once per process lifetime.
+static GLX_INFO_CACHE: OnceLock<GlxInfo> = OnceLock::new();
+
+/// Probes `glxinfo -B` for Mesa and OpenGL stack information used for debugging.
+///
+/// Returns an empty [`GlxInfo`] when `glxinfo` is unavailable or no display
+/// server can be reached (e.g. headless sessions).
+fn read_glx_info() -> &'static GlxInfo {
+    GLX_INFO_CACHE.get_or_init(|| {
+        let mut info = GlxInfo::default();
+        if let Ok(output) = std::process::Command::new("glxinfo").arg("-B").output()
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some(v) =
+                    line.strip_prefix("OpenGL core profile shading language version string:")
+                {
+                    info.glsl_version = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("OpenGL core profile version string:") {
+                    info.gl_core_version = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("OpenGL shading language version string:")
+                {
+                    if info.glsl_version.is_empty() {
+                        info.glsl_version = v.trim().to_string();
+                    }
+                } else if let Some(v) = line.strip_prefix("OpenGL version string:") {
+                    info.gl_version = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("OpenGL renderer string:") {
+                    info.renderer = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("OpenGL vendor string:") {
+                    info.vendor = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("direct rendering:") {
+                    info.direct_rendering = v.trim().eq_ignore_ascii_case("yes");
+                }
+            }
+            // Mesa appends its version to the GL version strings, e.g.
+            // "4.6 (Core Profile) Mesa 25.0.1-arch1.2".
+            let src = if !info.gl_core_version.is_empty() {
+                &info.gl_core_version
+            } else {
+                &info.gl_version
+            };
+            info.mesa_version = parse_mesa_version(src);
+        }
+        info
+    })
+}
+
+/// Extracts the Mesa implementation version from a GL version string.
+///
+/// # Arguments
+/// * `version_str` - A GL version string such as "4.6 (Core Profile) Mesa 25.0.1".
+///
+/// # Returns
+/// The trailing Mesa version token, or an empty string when absent.
+fn parse_mesa_version(version_str: &str) -> String {
+    version_str
+        .find("Mesa ")
+        .map(|idx| version_str[idx + "Mesa ".len()..].trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Reads `/sys/class/drm` and `/sys/class/hwmon` to query AMD, NVIDIA, or Intel GPU metrics.
@@ -782,7 +879,23 @@ pub fn read_gpu_metrics() -> GpuMetrics {
         fan_rpm: 0,
         fan_max_rpm: 0,
         fan_pct: 0,
+        gl_mesa_version: String::new(),
+        gl_version: String::new(),
+        gl_core_version: String::new(),
+        glsl_version: String::new(),
+        gl_renderer: String::new(),
+        gl_vendor: String::new(),
+        direct_rendering: false,
     };
+
+    let glx = read_glx_info();
+    metrics.gl_mesa_version = glx.mesa_version.clone();
+    metrics.gl_version = glx.gl_version.clone();
+    metrics.gl_core_version = glx.gl_core_version.clone();
+    metrics.glsl_version = glx.glsl_version.clone();
+    metrics.gl_renderer = glx.renderer.clone();
+    metrics.gl_vendor = glx.vendor.clone();
+    metrics.direct_rendering = glx.direct_rendering;
 
     if let Ok(entries) = fs::read_dir("/sys/class/drm") {
         for entry in entries.filter_map(Result::ok) {
@@ -2178,29 +2291,6 @@ pub struct PackageStorageItem {
     pub depth: usize,
 }
 
-impl PackageStorageItem {
-    /// Creates a new storage item with default tree properties.
-    #[allow(dead_code)]
-    pub fn new(
-        name: impl Into<String>,
-        detail: impl Into<String>,
-        size_bytes: u64,
-        size_str: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            detail: detail.into(),
-            size_bytes,
-            size_str: size_str.into(),
-            path: String::new(),
-            is_dir: false,
-            is_expanded: false,
-            is_scanning: false,
-            depth: 0,
-        }
-    }
-}
-
 /// Disk space metrics for a detected package manager, container engine, or runtime environment.
 #[derive(Clone, Default)]
 pub struct PackageStorageCategory {
@@ -2511,252 +2601,214 @@ pub fn read_dust_storage() -> Option<PackageStorageCategory> {
 /// # Returns
 /// A vector of `PackageStorageCategory` for all detected systems.
 pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
-    let mut categories = Vec::new();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
 
-    // 1. Docker Volumes
-    let docker_info = read_docker_storage();
-    if docker_info.is_available
-        && (!docker_info.volumes.is_empty() || docker_info.total_volumes_bytes > 0)
-    {
-        let mut items = Vec::new();
-        for vol in docker_info.volumes {
-            items.push(PackageStorageItem {
-                name: vol.name,
-                detail: if vol.links == 1 {
-                    "1 link".to_string()
-                } else {
-                    format!("{} links", vol.links)
-                },
-                size_bytes: vol.size_bytes,
-                size_str: vol.size_str,
-                ..Default::default()
-            });
+    [
+        scan_docker_category(),
+        scan_wine_category(&home),
+        scan_flatpak_category(&home),
+        scan_snap_category(&home),
+        scan_nix_category(&home),
+        scan_apt_category(),
+        scan_dnf_category(),
+        scan_pacman_category(),
+        scan_podman_category(&home),
+        scan_cargo_category(&home),
+        scan_javascript_category(&home),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Sorts storage items by descending size, breaking ties alphabetically by name.
+fn sort_items_by_size(items: &mut [PackageStorageItem]) {
+    items.sort_by(|a, b| {
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// Assembles a category from `items`, sorting them and formatting the total size.
+///
+/// Returns `None` when no items were found, signalling that the package
+/// manager or runtime is not meaningfully present on this system.
+fn build_category(
+    name: &str,
+    mut items: Vec<PackageStorageItem>,
+) -> Option<PackageStorageCategory> {
+    if items.is_empty() {
+        return None;
+    }
+    sort_items_by_size(&mut items);
+    let total: u64 = items.iter().map(|i| i.size_bytes).sum();
+    Some(PackageStorageCategory {
+        name: name.to_string(),
+        total_str: format_bytes_dyn(total as f64),
+        items,
+    })
+}
+
+/// Builds a storage item sized from a directory, or `None` if it is empty or missing.
+fn dir_size_item(
+    name: impl Into<String>,
+    detail: impl Into<String>,
+    path: &str,
+) -> Option<PackageStorageItem> {
+    let size = get_dir_size(path);
+    (size > 0).then(|| PackageStorageItem {
+        name: name.into(),
+        detail: detail.into(),
+        size_bytes: size,
+        size_str: format_bytes_dyn(size as f64),
+        ..Default::default()
+    })
+}
+
+/// Runs the first working CLI from `bins` with `args`, returning its stdout on success.
+fn probe_command_output(bins: &[&str], args: &[&str]) -> Option<String> {
+    for bin in bins {
+        if let Ok(output) = std::process::Command::new(bin).args(args).output()
+            && output.status.success()
+        {
+            return Some(String::from_utf8_lossy(&output.stdout).to_string());
         }
-        items.sort_by(|a, b| {
-            b.size_bytes
-                .cmp(&a.size_bytes)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        categories.push(PackageStorageCategory {
-            name: "Docker".to_string(),
-            total_str: docker_info.total_volumes_str,
-            items,
-        });
+    }
+    None
+}
+
+/// Scans Docker volumes via `docker system df -v`.
+fn scan_docker_category() -> Option<PackageStorageCategory> {
+    let docker_info = read_docker_storage();
+    if !docker_info.is_available
+        || (docker_info.volumes.is_empty() && docker_info.total_volumes_bytes == 0)
+    {
+        return None;
     }
 
-    // 2. Wine Prefixes
-    let mut wine_items = Vec::new();
-    let mut wine_total = 0;
-    let mut prefix_dirs = Vec::new();
+    let items: Vec<PackageStorageItem> = docker_info
+        .volumes
+        .into_iter()
+        .map(|vol| PackageStorageItem {
+            detail: if vol.links == 1 {
+                "1 link".to_string()
+            } else {
+                format!("{} links", vol.links)
+            },
+            name: vol.name,
+            size_bytes: vol.size_bytes,
+            size_str: vol.size_str,
+            ..Default::default()
+        })
+        .collect();
+    let mut items = items;
+    sort_items_by_size(&mut items);
+    Some(PackageStorageCategory {
+        name: "Docker".to_string(),
+        total_str: docker_info.total_volumes_str,
+        items,
+    })
+}
 
-    let default_wine = format!("{}/.wine", home);
+/// Adds `label/name` entries for subdirectories that look like wine prefixes.
+fn push_wine_prefixes_from(parent_dir: &str, label: &str, out: &mut Vec<(String, String)>) {
+    if let Ok(entries) = fs::read_dir(parent_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_dir() && (p.join("drive_c").exists() || p.join("system.reg").exists()) {
+                out.push((
+                    format!("{}/{}", label, entry.file_name().to_string_lossy()),
+                    p.to_string_lossy().to_string(),
+                ));
+            }
+        }
+    }
+}
+
+/// Discovers wine prefix directories across default, custom, and launcher locations.
+fn collect_wine_prefixes(home: &str) -> Vec<(String, String)> {
+    let mut prefixes = Vec::new();
+
+    let default_wine = format!("{home}/.wine");
     if std::path::Path::new(&default_wine).exists() {
-        prefix_dirs.push(("Default (~/.wine)".to_string(), default_wine.clone()));
+        prefixes.push(("Default (~/.wine)".to_string(), default_wine.clone()));
     }
     if let Ok(wp) = std::env::var("WINEPREFIX")
         && !wp.is_empty()
-        && std::path::Path::new(&wp).exists()
         && wp != default_wine
+        && std::path::Path::new(&wp).exists()
     {
-        prefix_dirs.push(("Custom ($WINEPREFIX)".to_string(), wp));
-    }
-    let share_prefixes = format!("{}/.local/share/wineprefixes", home);
-    if let Ok(entries) = fs::read_dir(&share_prefixes) {
-        for entry in entries.filter_map(Result::ok) {
-            let p = entry.path();
-            if p.is_dir() && (p.join("drive_c").exists() || p.join("system.reg").exists()) {
-                let name = format!("wineprefix/{}", entry.file_name().to_string_lossy());
-                prefix_dirs.push((name, p.to_string_lossy().to_string()));
-            }
-        }
-    }
-    let vinegar_prefixes = format!("{}/.local/share/vinegar/prefixes", home);
-    if let Ok(entries) = fs::read_dir(&vinegar_prefixes) {
-        for entry in entries.filter_map(Result::ok) {
-            let p = entry.path();
-            if p.is_dir() && (p.join("drive_c").exists() || p.join("system.reg").exists()) {
-                let name = format!("vinegar/{}", entry.file_name().to_string_lossy());
-                prefix_dirs.push((name, p.to_string_lossy().to_string()));
-            }
-        }
-    }
-    for b_path in &[
-        format!("{}/.local/share/bottles/bottles", home),
-        format!(
-            "{}/.var/app/com.usebottles.bottles/data/bottles/bottles",
-            home
-        ),
-    ] {
-        if let Ok(entries) = fs::read_dir(b_path) {
-            for entry in entries.filter_map(Result::ok) {
-                let p = entry.path();
-                if p.is_dir() && (p.join("drive_c").exists() || p.join("system.reg").exists()) {
-                    let name = format!("bottle/{}", entry.file_name().to_string_lossy());
-                    prefix_dirs.push((name, p.to_string_lossy().to_string()));
-                }
-            }
-        }
-    }
-    let lutris_prefixes = format!("{}/.local/share/lutris/prefixes", home);
-    if let Ok(entries) = fs::read_dir(&lutris_prefixes) {
-        for entry in entries.filter_map(Result::ok) {
-            let p = entry.path();
-            if p.is_dir() && (p.join("drive_c").exists() || p.join("system.reg").exists()) {
-                let name = format!("lutris/{}", entry.file_name().to_string_lossy());
-                prefix_dirs.push((name, p.to_string_lossy().to_string()));
-            }
-        }
+        prefixes.push(("Custom ($WINEPREFIX)".to_string(), wp));
     }
 
-    for (name, path_str) in prefix_dirs {
-        let size = get_dir_size(&path_str);
-        if size > 0 {
-            wine_total += size;
-            wine_items.push(PackageStorageItem {
-                name,
-                detail: path_str,
-                size_bytes: size,
-                size_str: format_bytes_dyn(size as f64),
-                ..Default::default()
-            });
-        }
-    }
+    push_wine_prefixes_from(
+        &format!("{home}/.local/share/wineprefixes"),
+        "wineprefix",
+        &mut prefixes,
+    );
+    push_wine_prefixes_from(
+        &format!("{home}/.local/share/vinegar/prefixes"),
+        "vinegar",
+        &mut prefixes,
+    );
+    push_wine_prefixes_from(
+        &format!("{home}/.local/share/bottles/bottles"),
+        "bottle",
+        &mut prefixes,
+    );
+    push_wine_prefixes_from(
+        &format!("{home}/.var/app/com.usebottles.bottles/data/bottles/bottles"),
+        "bottle",
+        &mut prefixes,
+    );
+    push_wine_prefixes_from(
+        &format!("{home}/.local/share/lutris/prefixes"),
+        "lutris",
+        &mut prefixes,
+    );
 
-    if !wine_items.is_empty() {
-        wine_items.sort_by(|a, b| {
-            b.size_bytes
-                .cmp(&a.size_bytes)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        categories.push(PackageStorageCategory {
-            name: "Wine".to_string(),
-            total_str: format_bytes_dyn(wine_total as f64),
-            items: wine_items,
-        });
-    }
+    prefixes
+}
 
-    // 3. Flatpak
-    let mut flatpak_items = Vec::new();
-    let mut flatpak_total = 0;
-    for bin in &[
-        "flatpak",
-        "/run/current-system/sw/bin/flatpak",
-        "/usr/bin/flatpak",
-    ] {
-        if let Ok(output) = std::process::Command::new(bin)
-            .args(["list", "--columns=application,size,runtime"])
-            .output()
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines().skip(1) {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    let app_id = parts[0];
-                    let size_str = parts[1].replace(',', ".");
-                    let size = parse_size_to_bytes(&size_str);
-                    let is_runtime = parts.len() >= 3 && !parts[2].is_empty();
-                    let detail = if is_runtime {
-                        "Runtime".to_string()
-                    } else {
-                        "Application".to_string()
-                    };
-                    if size > 0 {
-                        flatpak_total += size;
-                        flatpak_items.push(PackageStorageItem {
-                            name: app_id.to_string(),
-                            detail,
-                            size_bytes: size,
-                            size_str: format_bytes_dyn(size as f64),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-            break;
-        }
-    }
-    let var_app = format!("{}/.var/app", home);
-    if std::path::Path::new(&var_app).exists() {
-        let app_data_size = get_dir_size(&var_app);
-        if app_data_size > 0 {
-            flatpak_total += app_data_size;
-            flatpak_items.push(PackageStorageItem {
-                name: "Flatpak App Data (~/.var/app)".to_string(),
-                detail: "Per-application storage & config".to_string(),
-                size_bytes: app_data_size,
-                size_str: format_bytes_dyn(app_data_size as f64),
-                ..Default::default()
-            });
-        }
-    }
-    if !flatpak_items.is_empty() || std::path::Path::new("/var/lib/flatpak").exists() {
-        if flatpak_items.is_empty() {
-            let sys_flatpak = get_dir_size("/var/lib/flatpak");
-            if sys_flatpak > 0 {
-                flatpak_total += sys_flatpak;
-                flatpak_items.push(PackageStorageItem {
-                    name: "System Flatpak Runtimes".to_string(),
-                    detail: "/var/lib/flatpak".to_string(),
-                    size_bytes: sys_flatpak,
-                    size_str: format_bytes_dyn(sys_flatpak as f64),
-                    ..Default::default()
-                });
-            }
-        }
-        if flatpak_total > 0 {
-            flatpak_items.sort_by(|a, b| {
-                b.size_bytes
-                    .cmp(&a.size_bytes)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            categories.push(PackageStorageCategory {
-                name: "Flatpak".to_string(),
-                total_str: format_bytes_dyn(flatpak_total as f64),
-                items: flatpak_items,
-            });
-        }
-    }
+/// Sizes every discovered wine prefix into a "Wine" category.
+fn scan_wine_category(home: &str) -> Option<PackageStorageCategory> {
+    let items: Vec<PackageStorageItem> = collect_wine_prefixes(home)
+        .into_iter()
+        .filter_map(|(name, path)| dir_size_item(name, path.clone(), &path))
+        .collect();
+    build_category("Wine", items)
+}
 
-    // 4. Snap
-    let mut snap_items = Vec::new();
-    let mut snap_total = 0;
-    for bin in &["snap", "/run/current-system/sw/bin/snap", "/usr/bin/snap"] {
-        if let Ok(output) = std::process::Command::new(bin).args(["list"]).output()
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
-                    let name = parts[0].to_string();
-                    let rev = parts[2].to_string();
-                    let publisher = parts[3].to_string();
-                    snap_items.push(PackageStorageItem {
-                        name: format!("{} (rev {})", name, rev),
-                        detail: format!("Publisher: {}", publisher),
-                        size_bytes: 0,
-                        size_str: "Installed".to_string(),
-                        ..Default::default()
-                    });
-                }
+/// Scans Flatpak applications plus per-user app data and system runtimes.
+fn scan_flatpak_category(home: &str) -> Option<PackageStorageCategory> {
+    let mut items = Vec::new();
+
+    let stdout = probe_command_output(
+        &[
+            "flatpak",
+            "/run/current-system/sw/bin/flatpak",
+            "/usr/bin/flatpak",
+        ],
+        &["list", "--columns=application,size,runtime"],
+    );
+    if let Some(stdout) = stdout {
+        for line in stdout.lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            break;
-        }
-    }
-    for snap_dir in &["/var/lib/snapd/snaps", &format!("{}/snap", home)] {
-        if std::path::Path::new(snap_dir).exists() {
-            let size = get_dir_size(snap_dir);
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let size = parse_size_to_bytes(&parts[1].replace(',', "."));
+            let is_runtime = parts.len() >= 3 && !parts[2].is_empty();
+            let detail = if is_runtime { "Runtime" } else { "Application" };
             if size > 0 {
-                snap_total += size;
-                snap_items.push(PackageStorageItem {
-                    name: format!("Snap Data ({})", snap_dir),
-                    detail: snap_dir.to_string(),
+                items.push(PackageStorageItem {
+                    name: parts[0].to_string(),
+                    detail: detail.to_string(),
                     size_bytes: size,
                     size_str: format_bytes_dyn(size as f64),
                     ..Default::default()
@@ -2764,655 +2816,500 @@ pub fn read_package_storage_categories() -> Vec<PackageStorageCategory> {
             }
         }
     }
-    if snap_total > 0 || !snap_items.is_empty() {
-        snap_items.sort_by(|a, b| {
-            b.size_bytes
-                .cmp(&a.size_bytes)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        categories.push(PackageStorageCategory {
-            name: "Snap".to_string(),
-            total_str: format_bytes_dyn(snap_total as f64),
-            items: snap_items,
-        });
-    }
 
-    // 5. NixOS / Nix Store
-    if std::path::Path::new("/nix/store").exists() {
-        let mut path_count = 0;
-        if let Ok(entries) = fs::read_dir("/nix/store") {
-            path_count = entries.count();
-        }
-        let nix_size = if let Ok(stat) = rustix::fs::statvfs("/nix/store") {
-            let total_bytes = stat.f_blocks * stat.f_frsize;
-            let free_bytes = stat.f_bfree * stat.f_frsize;
-            total_bytes.saturating_sub(free_bytes)
-        } else {
-            get_dir_size("/nix/store")
-        };
-
-        let mut items = Vec::new();
-        let mut seen_paths = HashSet::new();
-
-        // Enumerate installed packages from system and user profiles
-        for bin_dir in &[
-            "/run/current-system/sw/bin",
-            "/nix/var/nix/profiles/system/sw/bin",
-            &format!("{}/.nix-profile/bin", home),
-        ] {
-            if let Ok(entries) = fs::read_dir(bin_dir) {
-                for entry in entries.filter_map(Result::ok) {
-                    if let Ok(target) = fs::read_link(entry.path()) {
-                        let target_path = if target.is_relative() {
-                            entry
-                                .path()
-                                .parent()
-                                .unwrap_or_else(|| std::path::Path::new("/"))
-                                .join(target)
-                        } else {
-                            target
-                        };
-
-                        if let Some(store_str) = target_path.to_str()
-                            && store_str.starts_with("/nix/store/")
-                        {
-                            let rel = &store_str["/nix/store/".len()..];
-                            let pkg_dir_name = rel.split('/').next().unwrap_or("");
-                            let pkg_root = format!("/nix/store/{}", pkg_dir_name);
-
-                            if !seen_paths.contains(&pkg_root)
-                                && std::path::Path::new(&pkg_root).exists()
-                            {
-                                seen_paths.insert(pkg_root.clone());
-                                let size = get_dir_size(&pkg_root);
-                                let clean_name = if pkg_dir_name.len() > 33
-                                    && pkg_dir_name.as_bytes()[32] == b'-'
-                                {
-                                    &pkg_dir_name[33..]
-                                } else {
-                                    pkg_dir_name
-                                };
-
-                                items.push(PackageStorageItem {
-                                    name: clean_name.to_string(),
-                                    detail: pkg_root,
-                                    size_bytes: size,
-                                    size_str: format_bytes_dyn(size as f64),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add System Generations
-        if let Ok(entries) = fs::read_dir("/nix/var/nix/profiles") {
-            for entry in entries.filter_map(Result::ok) {
-                let fname = entry.file_name().to_string_lossy().to_string();
-                if fname.starts_with("system-")
-                    && fname.ends_with("-link")
-                    && let Ok(target) = fs::read_link(entry.path())
-                {
-                    let target_str = target.to_string_lossy().to_string();
-                    let size = get_dir_size(&target_str);
-                    items.push(PackageStorageItem {
-                        name: format!("Generation {}", fname.trim_end_matches("-link")),
-                        detail: target_str,
-                        size_bytes: size,
-                        size_str: format_bytes_dyn(size as f64),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-
-        // Add Nix Store summary item
-        items.push(PackageStorageItem {
-            name: "Nix Store Total Partition".to_string(),
-            detail: format!("{} total store paths indexed", path_count),
-            size_bytes: nix_size,
-            size_str: format_bytes_dyn(nix_size as f64),
-            ..Default::default()
-        });
-
-        items.sort_by(|a, b| {
-            b.size_bytes
-                .cmp(&a.size_bytes)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-
-        categories.push(PackageStorageCategory {
-            name: "Nix Store".to_string(),
-            total_str: format_bytes_dyn(nix_size as f64),
-            items,
-        });
-    }
-
-    // 6. APT
-    if std::path::Path::new("/var/cache/apt/archives").exists()
-        || std::path::Path::new("/var/lib/dpkg").exists()
+    let var_app = format!("{home}/.var/app");
+    if std::path::Path::new(&var_app).exists()
+        && let Some(item) = dir_size_item(
+            "Flatpak App Data (~/.var/app)",
+            "Per-application storage & config",
+            &var_app,
+        )
     {
-        let mut items = Vec::new();
-        let mut apt_total = 0;
-        let archives_size = get_dir_size("/var/cache/apt/archives");
-        if archives_size > 0 {
-            apt_total += archives_size;
-            items.push(PackageStorageItem {
-                name: "APT Package Cache".to_string(),
-                detail: "/var/cache/apt/archives".to_string(),
-                size_bytes: archives_size,
-                size_str: format_bytes_dyn(archives_size as f64),
-                ..Default::default()
-            });
-        }
-        let dpkg_size = get_dir_size("/var/lib/dpkg");
-        if dpkg_size > 0 {
-            apt_total += dpkg_size;
-            items.push(PackageStorageItem {
-                name: "DPKG Database & Status".to_string(),
-                detail: "/var/lib/dpkg".to_string(),
-                size_bytes: dpkg_size,
-                size_str: format_bytes_dyn(dpkg_size as f64),
-                ..Default::default()
-            });
-        }
-        if apt_total > 0 || !items.is_empty() {
-            items.sort_by(|a, b| {
-                b.size_bytes
-                    .cmp(&a.size_bytes)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            categories.push(PackageStorageCategory {
-                name: "APT".to_string(),
-                total_str: format_bytes_dyn(apt_total as f64),
-                items,
-            });
-        }
+        items.push(item);
     }
 
-    // 7. DNF
-    if std::path::Path::new("/var/cache/dnf").exists()
-        || std::path::Path::new("/var/lib/dnf").exists()
-        || std::path::Path::new("/var/cache/yum").exists()
-    {
-        let mut items = Vec::new();
-        let mut dnf_total = 0;
-        for path in &["/var/cache/dnf", "/var/cache/yum", "/var/lib/dnf"] {
-            if std::path::Path::new(path).exists() {
-                let size = get_dir_size(path);
-                if size > 0 {
-                    dnf_total += size;
-                    items.push(PackageStorageItem {
-                        name: format!("DNF Storage ({})", path),
-                        detail: path.to_string(),
-                        size_bytes: size,
-                        size_str: format_bytes_dyn(size as f64),
-                        ..Default::default()
-                    });
-                }
-            }
+    // Fall back to reporting system-wide runtimes when no user installs exist.
+    if items.is_empty() && std::path::Path::new("/var/lib/flatpak").exists() {
+        if let Some(item) = dir_size_item(
+            "System Flatpak Runtimes",
+            "/var/lib/flatpak",
+            "/var/lib/flatpak",
+        ) {
+            return build_category("Flatpak", vec![item]);
         }
-        if dnf_total > 0 {
-            items.sort_by(|a, b| {
-                b.size_bytes
-                    .cmp(&a.size_bytes)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            categories.push(PackageStorageCategory {
-                name: "DNF".to_string(),
-                total_str: format_bytes_dyn(dnf_total as f64),
-                items,
-            });
-        }
+        return None;
     }
+    build_category("Flatpak", items)
+}
 
-    // 8. Pacman
-    if std::path::Path::new("/var/cache/pacman/pkg").exists()
-        || std::path::Path::new("/var/lib/pacman").exists()
-    {
-        let mut items = Vec::new();
-        let mut pac_total = 0;
-        let pkg_size = get_dir_size("/var/cache/pacman/pkg");
-        if pkg_size > 0 {
-            pac_total += pkg_size;
-            items.push(PackageStorageItem {
-                name: "Pacman Package Cache".to_string(),
-                detail: "/var/cache/pacman/pkg".to_string(),
-                size_bytes: pkg_size,
-                size_str: format_bytes_dyn(pkg_size as f64),
-                ..Default::default()
-            });
-        }
-        let db_size = get_dir_size("/var/lib/pacman");
-        if db_size > 0 {
-            pac_total += db_size;
-            items.push(PackageStorageItem {
-                name: "Pacman Local Database".to_string(),
-                detail: "/var/lib/pacman".to_string(),
-                size_bytes: db_size,
-                size_str: format_bytes_dyn(db_size as f64),
-                ..Default::default()
-            });
-        }
-        if pac_total > 0 || !items.is_empty() {
-            items.sort_by(|a, b| {
-                b.size_bytes
-                    .cmp(&a.size_bytes)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            categories.push(PackageStorageCategory {
-                name: "Pacman".to_string(),
-                total_str: format_bytes_dyn(pac_total as f64),
-                items,
-            });
-        }
-    }
+/// Lists installed snaps and sizes snap data directories.
+fn scan_snap_category(home: &str) -> Option<PackageStorageCategory> {
+    let mut items = Vec::new();
 
-    // 9. Podman Container Storage
-    let mut podman_items = Vec::new();
-    let mut podman_total = 0;
-    let podman_rootless = format!("{}/.local/share/containers/storage", home);
-    for (root, kind) in &[
-        (podman_rootless.as_str(), "User (~/.local/share/containers)"),
-        (
-            "/var/lib/containers/storage",
-            "System (/var/lib/containers)",
-        ),
-    ] {
-        if std::path::Path::new(root).exists() {
-            let subdirs = [
-                ("overlay-images", "Image Layers & Manifests"),
-                ("overlay-containers", "Container Layers & Configs"),
-                ("volumes", "Named Data Volumes"),
-                ("overlay", "Storage Overlayfs Rootfs"),
-                ("mounts", "Bind & Ephemeral Mounts"),
-            ];
-            for (subdir, desc) in subdirs {
-                let p = format!("{}/{}", root, subdir);
-                if std::path::Path::new(&p).exists() {
-                    let size = get_dir_size(&p);
-                    if size > 0 {
-                        podman_total += size;
-                        podman_items.push(PackageStorageItem {
-                            name: format!(
-                                "{}: {}",
-                                if root.starts_with("/var") {
-                                    "sys"
-                                } else {
-                                    "user"
-                                },
-                                subdir
-                            ),
-                            detail: format!("{} ({})", desc, kind),
-                            size_bytes: size,
-                            size_str: format_bytes_dyn(size as f64),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-        }
-    }
-    if podman_total > 0 || !podman_items.is_empty() {
-        podman_items.sort_by(|a, b| {
-            b.size_bytes
-                .cmp(&a.size_bytes)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        categories.push(PackageStorageCategory {
-            name: "Podman".to_string(),
-            total_str: format_bytes_dyn(podman_total as f64),
-            items: podman_items,
-        });
-    }
-
-    // 10. Cargo & Rust Toolchains
-    let cargo_home = format!("{}/.cargo", home);
-    let rustup_home = format!("{}/.rustup", home);
-    let mut cargo_items = Vec::new();
-    let mut cargo_total = 0;
-
-    // Installed binaries in ~/.cargo/bin
-    let cargo_bin = format!("{}/bin", cargo_home);
-    if let Ok(entries) = fs::read_dir(&cargo_bin) {
-        for entry in entries.filter_map(Result::ok) {
-            let p = entry.path();
-            if p.is_file()
-                && let Ok(meta) = p.metadata()
-            {
-                let size = meta.len();
-                if size > 0 {
-                    cargo_total += size;
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    cargo_items.push(PackageStorageItem {
-                        name: format!("bin: {}", name),
-                        detail: format!("Installed CLI Binary ({})", p.to_string_lossy()),
-                        size_bytes: size,
-                        size_str: format_bytes_dyn(size as f64),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    // Downloaded .crate archives in ~/.cargo/registry/cache/*
-    let registry_cache = format!("{}/registry/cache", cargo_home);
-    if let Ok(entries) = fs::read_dir(&registry_cache) {
-        for entry in entries.filter_map(Result::ok) {
-            let p = entry.path();
-            if p.is_dir() {
-                let cache_dir_size = get_dir_size(&p);
-                if cache_dir_size > 0 {
-                    cargo_total += cache_dir_size;
-                    let reg_name = entry.file_name().to_string_lossy().to_string();
-                    let clean_reg = if let Some(idx) = reg_name.find('-') {
-                        &reg_name[..idx]
-                    } else {
-                        &reg_name
-                    };
-                    let count = fs::read_dir(&p).map(|d| d.count()).unwrap_or(0);
-                    cargo_items.push(PackageStorageItem {
-                        name: format!("crates.io cache ({})", clean_reg),
-                        detail: format!("{} downloaded .crate packages", count),
-                        size_bytes: cache_dir_size,
-                        size_str: format_bytes_dyn(cache_dir_size as f64),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    // Extracted crate sources in ~/.cargo/registry/src/*
-    let registry_src = format!("{}/registry/src", cargo_home);
-    if std::path::Path::new(&registry_src).exists() {
-        let src_size = get_dir_size(&registry_src);
-        if src_size > 0 {
-            cargo_total += src_size;
-            cargo_items.push(PackageStorageItem {
-                name: "registry/src (Unpacked Sources)".to_string(),
-                detail: registry_src,
-                size_bytes: src_size,
-                size_str: format_bytes_dyn(src_size as f64),
-                ..Default::default()
-            });
-        }
-    }
-
-    // Git dependency repositories in ~/.cargo/git
-    let cargo_git = format!("{}/git", cargo_home);
-    if std::path::Path::new(&cargo_git).exists() {
-        let git_size = get_dir_size(&cargo_git);
-        if git_size > 0 {
-            cargo_total += git_size;
-            cargo_items.push(PackageStorageItem {
-                name: "git/db (Git Dependencies)".to_string(),
-                detail: cargo_git,
-                size_bytes: git_size,
-                size_str: format_bytes_dyn(git_size as f64),
-                ..Default::default()
-            });
-        }
-    }
-
-    // Rustup toolchains in ~/.rustup/toolchains/*
-    let toolchains_dir = format!("{}/toolchains", rustup_home);
-    if let Ok(entries) = fs::read_dir(&toolchains_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let p = entry.path();
-            if p.is_dir() {
-                let size = get_dir_size(&p);
-                if size > 0 {
-                    cargo_total += size;
-                    let tc_name = entry.file_name().to_string_lossy().to_string();
-                    cargo_items.push(PackageStorageItem {
-                        name: format!("toolchain: {}", tc_name),
-                        detail: format!(
-                            "Rust compiler & standard library ({})",
-                            p.to_string_lossy()
-                        ),
-                        size_bytes: size,
-                        size_str: format_bytes_dyn(size as f64),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    // Shared compiler cache ~/.cache/sccache
-    let sccache_dir = format!("{}/.cache/sccache", home);
-    if std::path::Path::new(&sccache_dir).exists() {
-        let sc_size = get_dir_size(&sccache_dir);
-        if sc_size > 0 {
-            cargo_total += sc_size;
-            cargo_items.push(PackageStorageItem {
-                name: "sccache (Compilation Cache)".to_string(),
-                detail: sccache_dir,
-                size_bytes: sc_size,
-                size_str: format_bytes_dyn(sc_size as f64),
-                ..Default::default()
-            });
-        }
-    }
-
-    if cargo_total > 0 || !cargo_items.is_empty() {
-        cargo_items.sort_by(|a, b| {
-            b.size_bytes
-                .cmp(&a.size_bytes)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        categories.push(PackageStorageCategory {
-            name: "Cargo".to_string(),
-            total_str: format_bytes_dyn(cargo_total as f64),
-            items: cargo_items,
-        });
-    }
-
-    // 11. npm & Node.js Packages
-    let mut npm_items = Vec::new();
-    let mut npm_total = 0;
-
-    // Cache directories
-    let npm_cache = format!("{}/.npm", home);
-    if std::path::Path::new(&npm_cache).exists() {
-        let cacache = format!("{}/_cacache", npm_cache);
-        let cacache_size = get_dir_size(&cacache);
-        if cacache_size > 0 {
-            npm_total += cacache_size;
-            npm_items.push(PackageStorageItem {
-                name: "npm Content Cache (~/.npm/_cacache)".to_string(),
-                detail: "HTTP responses, tarballs & metadata index".to_string(),
-                size_bytes: cacache_size,
-                size_str: format_bytes_dyn(cacache_size as f64),
-                ..Default::default()
-            });
-        }
-
-        // Scan npx cached packages in ~/.npm/_npx/*/node_modules/*
-        let npx_dir = format!("{}/_npx", npm_cache);
-        if let Ok(entries) = fs::read_dir(&npx_dir) {
-            for hash_entry in entries.filter_map(Result::ok) {
-                let nm = hash_entry.path().join("node_modules");
-                if let Ok(sub_entries) = fs::read_dir(&nm) {
-                    for pkg_entry in sub_entries.filter_map(Result::ok) {
-                        let p = pkg_entry.path();
-                        if p.is_dir() {
-                            let name = pkg_entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.') {
-                                continue;
-                            }
-                            let size = get_dir_size(&p);
-                            if size > 0 {
-                                npm_total += size;
-                                npm_items.push(PackageStorageItem {
-                                    name: format!("npx: {}", name),
-                                    detail: format!(
-                                        "Cached npx runner package ({})",
-                                        p.to_string_lossy()
-                                    ),
-                                    size_bytes: size,
-                                    size_str: format_bytes_dyn(size as f64),
-                                    ..Default::default()
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let logs_cache = format!("{}/_logs", npm_cache);
-        let logs_size = get_dir_size(&logs_cache);
-        if logs_size > 0 {
-            npm_total += logs_size;
-            npm_items.push(PackageStorageItem {
-                name: "npm Debug Logs (~/.npm/_logs)".to_string(),
-                detail: "CLI run logs".to_string(),
-                size_bytes: logs_size,
-                size_str: format_bytes_dyn(logs_size as f64),
-                ..Default::default()
-            });
-        }
-    }
-
-    // Scan individual global node_modules packages
-    for node_mod_dir in &[
-        format!("{}/.npm-global/lib/node_modules", home),
-        "/usr/lib/node_modules".to_string(),
-        "/usr/local/lib/node_modules".to_string(),
-    ] {
-        if let Ok(entries) = fs::read_dir(node_mod_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let p = entry.path();
-                if p.is_dir() {
-                    let pkg_name = entry.file_name().to_string_lossy().to_string();
-                    if pkg_name.starts_with('.') {
-                        continue;
-                    }
-                    let mut ver = String::new();
-                    if let Ok(pkg_json) = fs::read_to_string(p.join("package.json")) {
-                        for line in pkg_json.lines() {
-                            if line.trim().starts_with("\"version\":")
-                                && let Some(v) = line.split('"').nth(3)
-                            {
-                                ver = format!("v{}", v);
-                                break;
-                            }
-                        }
-                    }
-                    let size = get_dir_size(&p);
-                    if size > 0 {
-                        npm_total += size;
-                        let label = if !ver.is_empty() {
-                            format!("global: {} ({})", pkg_name, ver)
-                        } else {
-                            format!("global: {}", pkg_name)
-                        };
-                        npm_items.push(PackageStorageItem {
-                            name: label,
-                            detail: p.to_string_lossy().to_string(),
-                            size_bytes: size,
-                            size_str: format_bytes_dyn(size as f64),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    // Scan NVM versions
-    let nvm_versions = format!("{}/.nvm/versions/node", home);
-    if let Ok(entries) = fs::read_dir(&nvm_versions) {
-        for entry in entries.filter_map(Result::ok) {
-            let p = entry.path();
-            if p.is_dir() {
-                let ver_name = entry.file_name().to_string_lossy().to_string();
-                let size = get_dir_size(&p);
-                if size > 0 {
-                    npm_total += size;
-                    npm_items.push(PackageStorageItem {
-                        name: format!("Node.js runtime ({})", ver_name),
-                        detail: p.to_string_lossy().to_string(),
-                        size_bytes: size,
-                        size_str: format_bytes_dyn(size as f64),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
-    }
-
-    // pnpm global & store
-    let pnpm_store = format!("{}/.local/share/pnpm", home);
-    if std::path::Path::new(&pnpm_store).exists() {
-        let pnpm_size = get_dir_size(&pnpm_store);
-        if pnpm_size > 0 {
-            npm_total += pnpm_size;
-            npm_items.push(PackageStorageItem {
-                name: "pnpm Store (~/.local/share/pnpm)".to_string(),
-                detail: "Content-addressable package store".to_string(),
-                size_bytes: pnpm_size,
-                size_str: format_bytes_dyn(pnpm_size as f64),
-                ..Default::default()
-            });
-        }
-    }
-
-    // Yarn cache
-    for y_path in &[
-        format!("{}/.cache/yarn", home),
-        format!("{}/.yarn/berry/cache", home),
-    ] {
-        if std::path::Path::new(y_path).exists() {
-            let y_size = get_dir_size(y_path);
-            if y_size > 0 {
-                npm_total += y_size;
-                npm_items.push(PackageStorageItem {
-                    name: "Yarn Package Cache".to_string(),
-                    detail: y_path.to_string(),
-                    size_bytes: y_size,
-                    size_str: format_bytes_dyn(y_size as f64),
+    let stdout = probe_command_output(
+        &["snap", "/run/current-system/sw/bin/snap", "/usr/bin/snap"],
+        &["list"],
+    );
+    if let Some(stdout) = stdout {
+        for line in stdout.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                items.push(PackageStorageItem {
+                    name: format!("{} (rev {})", parts[0], parts[2]),
+                    detail: format!("Publisher: {}", parts[3]),
+                    size_str: "Installed".to_string(),
                     ..Default::default()
                 });
             }
         }
     }
 
-    // Bun cache
-    let bun_cache = format!("{}/.bun/install/cache", home);
-    if std::path::Path::new(&bun_cache).exists() {
-        let bun_size = get_dir_size(&bun_cache);
-        if bun_size > 0 {
-            npm_total += bun_size;
-            npm_items.push(PackageStorageItem {
-                name: "Bun Package Cache".to_string(),
-                detail: bun_cache,
-                size_bytes: bun_size,
-                size_str: format_bytes_dyn(bun_size as f64),
+    for snap_dir in ["/var/lib/snapd/snaps", &format!("{home}/snap")] {
+        if let Some(item) = dir_size_item(format!("Snap Data ({})", snap_dir), snap_dir, snap_dir) {
+            items.push(item);
+        }
+    }
+    build_category("Snap", items)
+}
+
+/// Summarizes the Nix store partition and enumerates installed packages and generations.
+fn scan_nix_category(home: &str) -> Option<PackageStorageCategory> {
+    if !std::path::Path::new("/nix/store").exists() {
+        return None;
+    }
+
+    let path_count = fs::read_dir("/nix/store").map(|d| d.count()).unwrap_or(0);
+    let nix_size = match rustix::fs::statvfs("/nix/store") {
+        Ok(stat) => {
+            let total = stat.f_blocks * stat.f_frsize;
+            total.saturating_sub(stat.f_bfree * stat.f_frsize)
+        }
+        Err(_) => get_dir_size("/nix/store"),
+    };
+
+    let mut items = Vec::new();
+    let mut seen_paths = HashSet::new();
+
+    // Enumerate installed packages from system and user profiles.
+    for bin_dir in [
+        "/run/current-system/sw/bin",
+        "/nix/var/nix/profiles/system/sw/bin",
+        &format!("{home}/.nix-profile/bin"),
+    ] {
+        let Ok(entries) = fs::read_dir(bin_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(target) = fs::read_link(entry.path()) else {
+                continue;
+            };
+            let target_path = if target.is_relative() {
+                entry
+                    .path()
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("/"))
+                    .join(target)
+            } else {
+                target
+            };
+            let Some(store_str) = target_path.to_str() else {
+                continue;
+            };
+            let Some(rel) = store_str.strip_prefix("/nix/store/") else {
+                continue;
+            };
+            let pkg_dir_name = rel.split('/').next().unwrap_or("");
+            let pkg_root = format!("/nix/store/{pkg_dir_name}");
+
+            if seen_paths.insert(pkg_root.clone()) && std::path::Path::new(&pkg_root).exists() {
+                let clean_name = if pkg_dir_name.len() > 33 && pkg_dir_name.as_bytes()[32] == b'-' {
+                    &pkg_dir_name[33..]
+                } else {
+                    pkg_dir_name
+                };
+                if let Some(item) =
+                    dir_size_item(clean_name.to_string(), pkg_root.clone(), &pkg_root)
+                {
+                    items.push(item);
+                }
+            }
+        }
+    }
+
+    // Add system generations.
+    if let Ok(entries) = fs::read_dir("/nix/var/nix/profiles") {
+        for entry in entries.filter_map(Result::ok) {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if fname.starts_with("system-")
+                && fname.ends_with("-link")
+                && let Ok(target) = fs::read_link(entry.path())
+            {
+                let target_str = target.to_string_lossy().to_string();
+                let size = get_dir_size(&target_str);
+                items.push(PackageStorageItem {
+                    name: format!("Generation {}", fname.trim_end_matches("-link")),
+                    detail: target_str,
+                    size_bytes: size,
+                    size_str: format_bytes_dyn(size as f64),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // Add Nix Store summary item.
+    items.push(PackageStorageItem {
+        name: "Nix Store Total Partition".to_string(),
+        detail: format!("{path_count} total store paths indexed"),
+        size_bytes: nix_size,
+        size_str: format_bytes_dyn(nix_size as f64),
+        ..Default::default()
+    });
+
+    build_category("Nix Store", items)
+}
+
+/// Sizes APT archive caches and the dpkg database.
+fn scan_apt_category() -> Option<PackageStorageCategory> {
+    if !std::path::Path::new("/var/cache/apt/archives").exists()
+        && !std::path::Path::new("/var/lib/dpkg").exists()
+    {
+        return None;
+    }
+    let items = [
+        dir_size_item(
+            "APT Package Cache",
+            "/var/cache/apt/archives",
+            "/var/cache/apt/archives",
+        ),
+        dir_size_item("DPKG Database & Status", "/var/lib/dpkg", "/var/lib/dpkg"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    build_category("APT", items)
+}
+
+/// Sizes DNF/YUM cache and database directories.
+fn scan_dnf_category() -> Option<PackageStorageCategory> {
+    if !std::path::Path::new("/var/cache/dnf").exists()
+        && !std::path::Path::new("/var/lib/dnf").exists()
+        && !std::path::Path::new("/var/cache/yum").exists()
+    {
+        return None;
+    }
+    let items: Vec<PackageStorageItem> = ["/var/cache/dnf", "/var/cache/yum", "/var/lib/dnf"]
+        .into_iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .filter_map(|p| dir_size_item(format!("DNF Storage ({p})"), p, p))
+        .collect();
+    build_category("DNF", items)
+}
+
+/// Sizes the pacman package cache and local database.
+fn scan_pacman_category() -> Option<PackageStorageCategory> {
+    if !std::path::Path::new("/var/cache/pacman/pkg").exists()
+        && !std::path::Path::new("/var/lib/pacman").exists()
+    {
+        return None;
+    }
+    let items = [
+        dir_size_item(
+            "Pacman Package Cache",
+            "/var/cache/pacman/pkg",
+            "/var/cache/pacman/pkg",
+        ),
+        dir_size_item(
+            "Pacman Local Database",
+            "/var/lib/pacman",
+            "/var/lib/pacman",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    build_category("Pacman", items)
+}
+
+/// Sizes podman container storage overlays, images, and volumes.
+fn scan_podman_category(home: &str) -> Option<PackageStorageCategory> {
+    let podman_rootless = format!("{home}/.local/share/containers/storage");
+    let mut items = Vec::new();
+    for (root, kind) in [
+        (podman_rootless.as_str(), "User (~/.local/share/containers)"),
+        (
+            "/var/lib/containers/storage",
+            "System (/var/lib/containers)",
+        ),
+    ] {
+        if !std::path::Path::new(root).exists() {
+            continue;
+        }
+        let subdirs = [
+            ("overlay-images", "Image Layers & Manifests"),
+            ("overlay-containers", "Container Layers & Configs"),
+            ("volumes", "Named Data Volumes"),
+            ("overlay", "Storage Overlayfs Rootfs"),
+            ("mounts", "Bind & Ephemeral Mounts"),
+        ];
+        let scope = if root.starts_with("/var") {
+            "sys"
+        } else {
+            "user"
+        };
+        for (subdir, desc) in subdirs {
+            let p = format!("{root}/{subdir}");
+            if let Some(item) = dir_size_item(
+                format!("{scope}: {subdir}"),
+                format!("{} ({})", desc, kind),
+                &p,
+            ) {
+                items.push(item);
+            }
+        }
+    }
+    build_category("Podman", items)
+}
+
+/// Sizes cargo registries, binaries, rustup toolchains, and compilation caches.
+fn scan_cargo_category(home: &str) -> Option<PackageStorageCategory> {
+    let cargo_home = format!("{home}/.cargo");
+    let rustup_home = format!("{home}/.rustup");
+    let mut items = Vec::new();
+
+    // Installed binaries in ~/.cargo/bin
+    if let Ok(entries) = fs::read_dir(format!("{cargo_home}/bin")) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_file()
+                && let Ok(meta) = p.metadata()
+                && meta.len() > 0
+            {
+                let size = meta.len();
+                items.push(PackageStorageItem {
+                    name: format!("bin: {}", entry.file_name().to_string_lossy()),
+                    detail: format!("Installed CLI Binary ({})", p.to_string_lossy()),
+                    size_bytes: size,
+                    size_str: format_bytes_dyn(size as f64),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // Downloaded .crate archives in ~/.cargo/registry/cache/*
+    let registry_cache = format!("{cargo_home}/registry/cache");
+    if let Ok(entries) = fs::read_dir(&registry_cache) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let cache_dir_size = get_dir_size(&p);
+            if cache_dir_size == 0 {
+                continue;
+            }
+            let reg_name = entry.file_name().to_string_lossy().to_string();
+            let clean_reg = reg_name.split('-').next().unwrap_or(&reg_name);
+            let count = fs::read_dir(&p).map(|d| d.count()).unwrap_or(0);
+            items.push(PackageStorageItem {
+                name: format!("crates.io cache ({clean_reg})"),
+                detail: format!("{count} downloaded .crate packages"),
+                size_bytes: cache_dir_size,
+                size_str: format_bytes_dyn(cache_dir_size as f64),
                 ..Default::default()
             });
         }
     }
 
-    if npm_total > 0 || !npm_items.is_empty() {
-        npm_items.sort_by(|a, b| {
-            b.size_bytes
-                .cmp(&a.size_bytes)
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        categories.push(PackageStorageCategory {
-            name: "npm".to_string(),
-            total_str: format_bytes_dyn(npm_total as f64),
-            items: npm_items,
-        });
+    // Extracted crate sources and git dependency repositories.
+    let registry_src = format!("{cargo_home}/registry/src");
+    if let Some(item) = dir_size_item(
+        "registry/src (Unpacked Sources)",
+        registry_src.clone(),
+        &registry_src,
+    ) {
+        items.push(item);
+    }
+    let cargo_git = format!("{cargo_home}/git");
+    if let Some(item) = dir_size_item("git/db (Git Dependencies)", cargo_git.clone(), &cargo_git) {
+        items.push(item);
     }
 
-    categories
+    // Rustup toolchains in ~/.rustup/toolchains/*
+    if let Ok(entries) = fs::read_dir(format!("{rustup_home}/toolchains")) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let size = get_dir_size(&p);
+            if size > 0 {
+                items.push(PackageStorageItem {
+                    name: format!("toolchain: {}", entry.file_name().to_string_lossy()),
+                    detail: format!("Rust compiler & standard library ({})", p.to_string_lossy()),
+                    size_bytes: size,
+                    size_str: format_bytes_dyn(size as f64),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // Shared compiler cache ~/.cache/sccache
+    let sccache_dir = format!("{home}/.cache/sccache");
+    if let Some(item) = dir_size_item(
+        "sccache (Compilation Cache)",
+        sccache_dir.clone(),
+        &sccache_dir,
+    ) {
+        items.push(item);
+    }
+
+    build_category("Cargo", items)
+}
+
+/// Reads the `"version"` field from a package.json file, formatted as `vX.Y.Z`.
+fn read_package_json_version(path: &std::path::Path) -> String {
+    let Ok(pkg_json) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    for line in pkg_json.lines() {
+        if line.trim().starts_with("\"version\":")
+            && let Some(v) = line.split('"').nth(3)
+        {
+            return format!("v{v}");
+        }
+    }
+    String::new()
+}
+
+/// Sizes npm/pnpm/yarn/bun caches, global node_modules packages, and Node.js runtimes.
+fn scan_javascript_category(home: &str) -> Option<PackageStorageCategory> {
+    let mut items = Vec::new();
+
+    // Cache directories under ~/.npm
+    let npm_cache = format!("{home}/.npm");
+    if std::path::Path::new(&npm_cache).exists() {
+        let cacache = format!("{npm_cache}/_cacache");
+        if let Some(item) = dir_size_item(
+            "npm Content Cache (~/.npm/_cacache)",
+            "HTTP responses, tarballs & metadata index",
+            &cacache,
+        ) {
+            items.push(item);
+        }
+
+        // Cached npx runner packages in ~/.npm/_npx/*/node_modules/*
+        if let Ok(entries) = fs::read_dir(format!("{npm_cache}/_npx")) {
+            for hash_entry in entries.filter_map(Result::ok) {
+                let node_modules = hash_entry.path().join("node_modules");
+                let Ok(sub_entries) = fs::read_dir(&node_modules) else {
+                    continue;
+                };
+                for pkg_entry in sub_entries.filter_map(Result::ok) {
+                    let p = pkg_entry.path();
+                    let name = pkg_entry.file_name().to_string_lossy().to_string();
+                    if !p.is_dir() || name.starts_with('.') {
+                        continue;
+                    }
+                    let size = get_dir_size(&p);
+                    if size > 0 {
+                        items.push(PackageStorageItem {
+                            name: format!("npx: {name}"),
+                            detail: format!("Cached npx runner package ({})", p.to_string_lossy()),
+                            size_bytes: size,
+                            size_str: format_bytes_dyn(size as f64),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+
+        let logs_cache = format!("{npm_cache}/_logs");
+        if let Some(item) =
+            dir_size_item("npm Debug Logs (~/.npm/_logs)", "CLI run logs", &logs_cache)
+        {
+            items.push(item);
+        }
+    }
+
+    // Global node_modules installations.
+    for node_mod_dir in [
+        format!("{home}/.npm-global/lib/node_modules"),
+        "/usr/lib/node_modules".to_string(),
+        "/usr/local/lib/node_modules".to_string(),
+    ] {
+        let Ok(entries) = fs::read_dir(&node_mod_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            let pkg_name = entry.file_name().to_string_lossy().to_string();
+            if !p.is_dir() || pkg_name.starts_with('.') {
+                continue;
+            }
+            let ver = read_package_json_version(&p.join("package.json"));
+            let size = get_dir_size(&p);
+            if size > 0 {
+                let label = if ver.is_empty() {
+                    format!("global: {pkg_name}")
+                } else {
+                    format!("global: {pkg_name} ({ver})")
+                };
+                items.push(PackageStorageItem {
+                    name: label,
+                    detail: p.to_string_lossy().to_string(),
+                    size_bytes: size,
+                    size_str: format_bytes_dyn(size as f64),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    // NVM-managed Node.js runtimes.
+    if let Ok(entries) = fs::read_dir(format!("{home}/.nvm/versions/node")) {
+        for entry in entries.filter_map(Result::ok) {
+            let p = entry.path();
+            if p.is_dir()
+                && let Some(item) = dir_size_item(
+                    format!("Node.js runtime ({})", entry.file_name().to_string_lossy()),
+                    p.to_string_lossy().to_string(),
+                    &p.to_string_lossy(),
+                )
+            {
+                items.push(item);
+            }
+        }
+    }
+
+    // pnpm content-addressable store.
+    let pnpm_store = format!("{home}/.local/share/pnpm");
+    if let Some(item) = dir_size_item(
+        "pnpm Store (~/.local/share/pnpm)",
+        "Content-addressable package store",
+        &pnpm_store,
+    ) {
+        items.push(item);
+    }
+
+    // Yarn and Bun caches.
+    for y_path in [
+        format!("{home}/.cache/yarn"),
+        format!("{home}/.yarn/berry/cache"),
+    ] {
+        if let Some(item) = dir_size_item("Yarn Package Cache", y_path.clone(), &y_path) {
+            items.push(item);
+        }
+    }
+    let bun_cache = format!("{home}/.bun/install/cache");
+    if let Some(item) = dir_size_item("Bun Package Cache", bun_cache.clone(), &bun_cache) {
+        items.push(item);
+    }
+
+    build_category("npm", items)
 }
 
 /// Represents an active network socket connection (TCP / UDP) parsed from `/proc/net/`.
@@ -3438,9 +3335,6 @@ pub struct NetConnectionInfo {
     pub process_name: Option<String>,
     /// Resolved reverse DNS hostname if available.
     pub remote_host: Option<String>,
-    /// Socket inode identifier.
-    #[allow(dead_code)]
-    pub inode: u64,
 }
 
 impl Default for NetConnectionInfo {
@@ -3456,7 +3350,6 @@ impl Default for NetConnectionInfo {
             pid: None,
             process_name: None,
             remote_host: None,
-            inode: 0,
         }
     }
 }
@@ -3809,7 +3702,6 @@ pub fn read_network_connections(dns: &DnsResolver) -> Result<Vec<NetConnectionIn
                 pid,
                 process_name,
                 remote_host,
-                inode,
             });
         }
     }
@@ -3843,6 +3735,20 @@ pub fn read_network_connections(dns: &DnsResolver) -> Result<Vec<NetConnectionIn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_mesa_version() {
+        assert_eq!(
+            parse_mesa_version("4.6 (Core Profile) Mesa 25.0.1-arch1.2"),
+            "25.0.1-arch1.2"
+        );
+        assert_eq!(
+            parse_mesa_version("4.6 (Compatibility Profile) Mesa 24.3.1"),
+            "24.3.1"
+        );
+        assert_eq!(parse_mesa_version("4.6 (Core Profile) NVIDIA 565.77"), "");
+        assert_eq!(parse_mesa_version(""), "");
+    }
 
     #[test]
     fn test_read_gpu_metrics() {

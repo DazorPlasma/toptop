@@ -8,10 +8,10 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Row, Table, TableState, Tabs},
+    widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Tabs},
 };
 
 use crate::{
@@ -19,17 +19,274 @@ use crate::{
         ProcessDetailInfo, ProcessErrorPopup, ProcessInfo, ProcessKillConfirmation,
         ProcessSortColumn, group_processes_for_simple_view, matches_process_search,
     },
+    snapshot::Snapshot,
     system::{
-        BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetConnectionInfo,
-        NetInterfaceInfo, PackageStorageCategory, SystemGeneralInfo, is_item_visible,
-        read_power_plan,
+        BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetInterfaceInfo,
+        PackageStorageCategory, SystemGeneralInfo, is_item_visible, read_power_plan,
     },
     theme::{darken_color, gradient_color, io_gradient_pct, process_cpu_color},
     utils::{
-        format_bytes_dyn, format_freq, format_percent, format_uptime, is_lts_or_latest_kernel,
-        is_ram_under_8gb, wrap_text,
+        format_bytes_dyn, format_datetime, format_freq, format_percent, format_uptime,
+        is_lts_or_latest_kernel, is_ram_under_8gb, wrap_text,
     },
 };
+
+/// Terminal width below which the dashboard refuses to render.
+pub const MIN_TERM_WIDTH: u16 = 98;
+
+/// Terminal height below which the dashboard refuses to render.
+pub const MIN_TERM_HEIGHT: u16 = 20;
+
+/// Terminal width at which the PID column appears in the process table.
+pub const PID_COLUMN_MIN_WIDTH: u16 = 150;
+
+/// Titles of the six primary tabs, in display order.
+pub const TAB_TITLES: [&str; 6] = [
+    "General (1)",
+    "Processes (2)",
+    "CPU & RAM (3)",
+    "GPU (4)",
+    "Network (5)",
+    "Disk (6)",
+];
+
+/// State rendered into the top tab bar.
+pub struct TopbarState {
+    /// Zero-based index of the active tab.
+    pub selected_tab: usize,
+    /// Whether telemetry polling is paused.
+    pub paused: bool,
+    /// Seconds between the viewed snapshot and now.
+    pub seconds_back: u64,
+    /// One-based position of the viewed snapshot in history.
+    pub position: usize,
+    /// Total snapshots retained.
+    pub total: usize,
+}
+
+/// View configuration and navigation state for the Disks & Storage tab.
+#[derive(Default)]
+pub struct DisksViewState {
+    /// Selected package-storage category tab.
+    pub sub_tab: usize,
+    /// Selected box when the layout stacks cards behind tabs (0..4).
+    pub box_tab: usize,
+    /// Scroll offset inside the active category item list.
+    pub scroll_offset: usize,
+    /// Cursor row within the active category item list.
+    pub selected_item: usize,
+    /// Whether hidden dotfiles below 1 GB are shown in the tree.
+    pub show_hidden: bool,
+}
+
+/// Everything the process table renderer needs, borrowed for one frame.
+pub struct ProcessView<'a> {
+    /// Process rows backing the table.
+    pub processes: &'a [ProcessInfo],
+    /// Whether advanced (all-column) mode is active.
+    pub advanced: bool,
+    /// Application groups expanded into child rows.
+    pub expanded_groups: &'a HashSet<String>,
+    /// Active search filter text.
+    pub query: &'a str,
+    /// Whether the search input currently has focus.
+    pub searching: bool,
+    /// Column the table is sorted by.
+    pub sort_col: ProcessSortColumn,
+    /// Sort direction flag (`true` for ascending).
+    pub ascending: bool,
+    /// Total system memory in MB, for usage percentage bars.
+    pub total_mem_mb: u64,
+    /// Logical core count, for CPU gradient scaling.
+    pub num_cores: usize,
+}
+
+/// One column of the process table; `width == 0` marks the flexible Name column.
+pub(crate) struct ProcessColumn {
+    /// Header label.
+    pub title: &'static str,
+    /// Sort key mapped to this column.
+    pub sort: ProcessSortColumn,
+    /// Fixed cell width, or 0 for the flexible name column.
+    pub width: u16,
+}
+
+/// Ordered process-table columns honouring PID visibility.
+pub(crate) fn process_columns(advanced: bool, show_pid: bool) -> Vec<ProcessColumn> {
+    let mut columns = Vec::with_capacity(11);
+    if show_pid {
+        columns.push(ProcessColumn {
+            title: "PID",
+            sort: ProcessSortColumn::Pid,
+            width: 8,
+        });
+    }
+    if advanced {
+        columns.push(ProcessColumn {
+            title: "User",
+            sort: ProcessSortColumn::User,
+            width: 10,
+        });
+    }
+    columns.push(ProcessColumn {
+        title: "Name",
+        sort: ProcessSortColumn::Name,
+        width: 0,
+    });
+    if advanced {
+        columns.push(ProcessColumn {
+            title: "State",
+            sort: ProcessSortColumn::State,
+            width: 7,
+        });
+        columns.push(ProcessColumn {
+            title: "Threads",
+            sort: ProcessSortColumn::Threads,
+            width: 8,
+        });
+    }
+    columns.push(ProcessColumn {
+        title: "CPU",
+        sort: ProcessSortColumn::Cpu,
+        width: 5,
+    });
+    columns.push(ProcessColumn {
+        title: "RAM",
+        sort: ProcessSortColumn::Mem,
+        width: 10,
+    });
+    columns.push(ProcessColumn {
+        title: "GPU",
+        sort: ProcessSortColumn::Gpu,
+        width: 5,
+    });
+    columns.push(ProcessColumn {
+        title: "VRAM",
+        sort: ProcessSortColumn::GpuMem,
+        width: 9,
+    });
+    columns.push(ProcessColumn {
+        title: "IO",
+        sort: ProcessSortColumn::Io,
+        width: 21,
+    });
+    columns.push(ProcessColumn {
+        title: "Net",
+        sort: ProcessSortColumn::Net,
+        width: 21,
+    });
+    columns
+}
+
+/// Renders the top tab bar with pause/time-travel badge and clock.
+///
+/// # Arguments
+/// * `frame` - Terminal rendering frame buffer.
+/// * `area` - Target bounding box for the three-row header.
+/// * `state` - Active tab, pause state, and time-travel position.
+pub fn render_topbar(frame: &mut Frame, area: Rect, state: &TopbarState) {
+    let TopbarState {
+        selected_tab,
+        paused,
+        seconds_back,
+        position,
+        total,
+    } = *state;
+    let steps_back = total.saturating_sub(position);
+
+    let time_badge = if paused && steps_back > 0 {
+        format!(
+            " [PAUSED -{}s ({}/{}) | '[' / ']' time travel] ",
+            seconds_back, position, total
+        )
+    } else if paused {
+        " [PAUSED (LIVE) | '[' / ']' time travel] ".to_string()
+    } else {
+        " - Space to pause ".to_string()
+    };
+
+    let (border, title_style) = if paused {
+        (
+            Color::Rgb(255, 255, 0),
+            Style::default().fg(Color::Rgb(255, 255, 0)).bold(),
+        )
+    } else {
+        (
+            Color::Rgb(60, 60, 60),
+            Style::default().fg(Color::Rgb(170, 170, 170)),
+        )
+    };
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let target_unix = now_unix.saturating_sub(seconds_back as i64);
+    let datetime_str = format_datetime(target_unix);
+
+    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(format!(" System Monitor{time_badge} ")).style(title_style))
+        .title(
+            Line::from(format!(" {datetime_str} "))
+                .fg(border)
+                .alignment(Alignment::Right),
+        );
+
+    #[cfg(debug_assertions)]
+    {
+        block = block.title_bottom(
+            Line::from(format!(" [{}x{}] ", area.width, area.height).fg(Color::Rgb(150, 150, 150)))
+                .alignment(Alignment::Right),
+        );
+    }
+
+    let titles: Vec<Line> = TAB_TITLES.iter().map(|&t| Line::from(t)).collect();
+    let tabs = Tabs::new(titles)
+        .style(Style::default().not_bold().fg(Color::Rgb(170, 170, 170)))
+        .select(selected_tab)
+        .block(block)
+        .highlight_style(Style::default().fg(Color::Rgb(255, 255, 255)).bold())
+        .divider("|")
+        .padding(" ", " ");
+    frame.render_widget(tabs, area);
+}
+
+/// Renders the full-screen notice shown when the terminal is too small.
+///
+/// # Arguments
+/// * `frame` - Terminal rendering frame buffer.
+/// * `area` - Full terminal area.
+pub fn render_min_size_warning(frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Color::Rgb(255, 80, 80)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height > 0 {
+        let text = vec![
+            Line::from(format!(
+                "Terminal too small, minimum of {}x{} required.",
+                MIN_TERM_WIDTH, MIN_TERM_HEIGHT
+            ))
+            .fg(Color::Rgb(255, 100, 100))
+            .bold()
+            .alignment(Alignment::Center),
+        ];
+        let msg_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height / 2,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(text), msg_area);
+    }
+}
 
 /// Computes the 8-bit Unicode Braille dot bitmask for a given sub-pixel cell coordinate.
 ///
@@ -323,31 +580,24 @@ pub fn format_command_spans<'a>(cmd: &'a str, is_selected: bool) -> Line<'a> {
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the table.
-/// * `processes` - Current snapshot of system processes.
-/// * `advanced_view` - Whether advanced view (all columns, kernel threads, raw paths) is enabled.
-/// * `expanded_groups` - Set of group names currently expanded in tree view.
-/// * `search_query` - Current user search filter text.
-/// * `is_searching` - Whether the search query input box is active.
-/// * `current_sort_col` - Currently selected sort column.
-/// * `sort_ascending` - Sort order direction.
-/// * `total_mem` - Total system memory in megabytes for percentage calculations.
-/// * `num_cores` - Logical CPU core count for gradient scaling.
+/// * `view` - Borrowed view configuration: rows, filters, sort, and layout inputs.
 /// * `table_state` - Mutable Ratatui table state maintaining cursor selection and scroll offset.
-#[allow(clippy::too_many_arguments)]
 pub fn render_process_tab(
     frame: &mut Frame,
     area: Rect,
-    processes: &[ProcessInfo],
-    advanced_view: bool,
-    expanded_groups: &HashSet<String>,
-    search_query: &str,
-    is_searching: bool,
-    current_sort_col: ProcessSortColumn,
-    sort_ascending: bool,
-    total_mem: u64,
-    num_cores: usize,
+    view: &ProcessView<'_>,
     table_state: &mut TableState,
 ) {
+    let processes = view.processes;
+    let advanced_view = view.advanced;
+    let expanded_groups = view.expanded_groups;
+    let search_query = view.query;
+    let is_searching = view.searching;
+    let current_sort_col = view.sort_col;
+    let sort_ascending = view.ascending;
+    let total_mem = view.total_mem_mb;
+    let num_cores = view.num_cores;
+
     let grouped_storage;
     let base_processes: &[ProcessInfo] = if advanced_view {
         processes
@@ -370,71 +620,30 @@ pub fn render_process_tab(
         .filter(|p| matches_process_search(p, search_query, Some(&proc_map)))
         .collect();
 
-    let show_pid = area.width >= 150;
+    let show_pid = area.width >= PID_COLUMN_MIN_WIDTH;
 
-    let (header_titles, constraints): (Vec<(&str, ProcessSortColumn)>, Vec<Constraint>) =
-        if advanced_view {
-            let mut titles = Vec::with_capacity(11);
-            let mut cons = Vec::with_capacity(11);
-            if show_pid {
-                titles.push(("PID", ProcessSortColumn::Pid));
-                cons.push(Constraint::Length(8));
+    let columns = process_columns(advanced_view, show_pid);
+    let constraints: Vec<Constraint> = columns
+        .iter()
+        .map(|col| {
+            if col.width == 0 {
+                Constraint::Fill(1)
+            } else {
+                Constraint::Length(col.width)
             }
-            titles.push(("User", ProcessSortColumn::User));
-            cons.push(Constraint::Length(10));
-            titles.push(("Name", ProcessSortColumn::Name));
-            cons.push(Constraint::Fill(1));
-            titles.push(("State", ProcessSortColumn::State));
-            cons.push(Constraint::Length(7));
-            titles.push(("Threads", ProcessSortColumn::Threads));
-            cons.push(Constraint::Length(8));
-            titles.push(("CPU", ProcessSortColumn::Cpu));
-            cons.push(Constraint::Length(5));
-            titles.push(("RAM", ProcessSortColumn::Mem));
-            cons.push(Constraint::Length(10));
-            titles.push(("GPU", ProcessSortColumn::Gpu));
-            cons.push(Constraint::Length(5));
-            titles.push(("VRAM", ProcessSortColumn::GpuMem));
-            cons.push(Constraint::Length(9));
-            titles.push(("IO", ProcessSortColumn::Io));
-            cons.push(Constraint::Length(21));
-            titles.push(("Net", ProcessSortColumn::Net));
-            cons.push(Constraint::Length(21));
-            (titles, cons)
-        } else {
-            let mut titles = Vec::with_capacity(8);
-            let mut cons = Vec::with_capacity(8);
-            if show_pid {
-                titles.push(("PID", ProcessSortColumn::Pid));
-                cons.push(Constraint::Length(8));
-            }
-            titles.push(("Name", ProcessSortColumn::Name));
-            cons.push(Constraint::Fill(1));
-            titles.push(("CPU", ProcessSortColumn::Cpu));
-            cons.push(Constraint::Length(5));
-            titles.push(("RAM", ProcessSortColumn::Mem));
-            cons.push(Constraint::Length(10));
-            titles.push(("GPU", ProcessSortColumn::Gpu));
-            cons.push(Constraint::Length(5));
-            titles.push(("VRAM", ProcessSortColumn::GpuMem));
-            cons.push(Constraint::Length(9));
-            titles.push(("IO", ProcessSortColumn::Io));
-            cons.push(Constraint::Length(21));
-            titles.push(("Net", ProcessSortColumn::Net));
-            cons.push(Constraint::Length(21));
-            (titles, cons)
-        };
+        })
+        .collect();
 
-    let header_cells = header_titles.iter().map(|&(title, col)| {
-        if col == current_sort_col {
+    let header_cells = columns.iter().map(|col| {
+        if col.sort == current_sort_col {
             let (arrow, color) = if sort_ascending {
                 ("▲", Color::Rgb(0, 255, 255))
             } else {
                 ("▼", Color::Rgb(255, 255, 0))
             };
-            Cell::from(format!("{} {}", title, arrow)).style(Style::default().fg(color).bold())
+            Cell::from(format!("{} {}", col.title, arrow)).style(Style::default().fg(color).bold())
         } else {
-            Cell::from(title).style(Style::default().fg(Color::Rgb(255, 255, 255)))
+            Cell::from(col.title).style(Style::default().fg(Color::Rgb(255, 255, 255)))
         }
     });
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -601,15 +810,16 @@ pub fn render_process_tab(
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the view.
 /// * `detail` - Diagnostic telemetry and metadata for the selected process.
-/// * `total_mem` - Total system memory in megabytes for percentage calculations.
-/// * `num_cores` - Logical CPU core count for gradient scaling.
+/// * `snap` - Snapshot supplying memory totals and core counts for scaling.
 pub fn render_process_detail(
     frame: &mut Frame,
     area: Rect,
     detail: &ProcessDetailInfo,
-    total_mem: u64,
-    num_cores: usize,
+    snap: &Snapshot,
 ) {
+    let total_mem = snap.mem.total_mem_mb;
+    let num_cores = snap.core_usages.len().max(1);
+
     let main_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -924,35 +1134,20 @@ pub fn render_process_detail(
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the tab.
-/// * `cpu_history` - Historical CPU usage samples for Braille graphing.
-/// * `core_usages` - Current per-core load percentages.
-/// * `cpu_cur_mhz` - Current CPU clock frequency in MHz.
-/// * `cpu_min_mhz` - Minimum CPU clock frequency in MHz.
-/// * `cpu_max_mhz` - Maximum CPU clock frequency in MHz.
-/// * `cpu_temp` - CPU temperature in degrees Celsius.
-/// * `ram_temp` - Optional RAM/DIMM temperature in degrees Celsius.
+/// * `snap` - Snapshot supplying CPU/memory telemetry and their histories.
 /// * `cpu_model` - Marketing CPU model identifier string.
-/// * `mem` - Memory utilization metrics (RAM and swap).
-/// * `mem_history` - Historical RAM usage samples for Braille graphing.
-/// * `swap_history` - Historical Swap usage samples for Braille graphing.
-/// * `ram_info` - DMI memory capacity, speed, and DDR generation string.
-#[allow(clippy::too_many_arguments)]
-pub fn render_cpu_ram_tab(
-    frame: &mut Frame,
-    area: Rect,
-    cpu_history: &[Option<f64>],
-    core_usages: &[f64],
-    cpu_cur_mhz: f64,
-    cpu_min_mhz: f64,
-    cpu_max_mhz: f64,
-    cpu_temp: u32,
-    ram_temp: Option<u32>,
-    cpu_model: &str,
-    mem: &MemoryMetrics,
-    mem_history: &[Option<f64>],
-    swap_history: &[Option<f64>],
-    ram_info: &str,
-) {
+pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_model: &str) {
+    let cpu_history = &snap.history.cpu;
+    let core_usages = &snap.core_usages[..];
+    let cpu_cur_mhz = snap.cpu_cur_mhz;
+    let cpu_min_mhz = snap.cpu_min_mhz;
+    let cpu_max_mhz = snap.cpu_max_mhz;
+    let cpu_temp = snap.cpu_temp;
+    let ram_temp = snap.ram_temp;
+    let mem = &snap.mem;
+    let mem_history = &snap.history.mem;
+    let swap_history = &snap.history.swap;
+    let ram_info = &snap.ram_info;
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -1442,18 +1637,12 @@ pub fn is_gpu_overflow(area: Rect, gpu_metrics: &GpuMetrics) -> bool {
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the tab.
-/// * `gpu_metrics` - Current GPU metrics and status.
-/// * `gpu_history` - Historical GPU core busy percentages for Braille graphing.
-/// * `gpu_vram_history` - Historical GPU VRAM consumption for Braille graphing.
+/// * `snap` - Snapshot supplying GPU metrics and utilization/VRAM histories.
 /// * `sub_tab` - Active sub-tab index (0: GPU Utilization, 1: VRAM History) when in tabbed view.
-pub fn render_gpu_tab(
-    frame: &mut Frame,
-    area: Rect,
-    gpu_metrics: &GpuMetrics,
-    gpu_history: &[Option<f64>],
-    gpu_vram_history: &[Option<f64>],
-    sub_tab: usize,
-) {
+pub fn render_gpu_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, sub_tab: usize) {
+    let gpu_metrics = &snap.gpu_metrics;
+    let gpu_history = &snap.history.gpu;
+    let gpu_vram_history = &snap.history.gpu_vram;
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -1582,9 +1771,19 @@ pub fn render_gpu_tab(
 
     if hw_inner.height > 0 && hw_inner.width > 0 {
         let mut lines = Vec::new();
+        let mut direct_no_idx: Option<usize> = None;
         lines.push(format!("Model:    {}", gpu_metrics.name));
         if !gpu_metrics.driver.is_empty() {
             lines.push(format!("Driver:   {}", gpu_metrics.driver));
+        }
+        if !gpu_metrics.gl_mesa_version.is_empty() {
+            lines.push(format!("Mesa:     {}", gpu_metrics.gl_mesa_version));
+        }
+        if !gpu_metrics.gl_version.is_empty() {
+            lines.push(format!("OpenGL:   {}", gpu_metrics.gl_version));
+        }
+        if !gpu_metrics.glsl_version.is_empty() {
+            lines.push(format!("GLSL:     {}", gpu_metrics.glsl_version));
         }
         if !gpu_metrics.pcie_link.is_empty() {
             lines.push(format!("PCIe Bus: {}", gpu_metrics.pcie_link));
@@ -1602,6 +1801,25 @@ pub fn render_gpu_tab(
                 gpu_metrics.voltage_mv as f64 / 1000.0
             ));
         }
+        if !gpu_metrics.gl_renderer.is_empty() {
+            lines.push(format!("Renderer: {}", gpu_metrics.gl_renderer));
+        }
+        if !gpu_metrics.gl_vendor.is_empty() {
+            lines.push(format!("Vendor:   {}", gpu_metrics.gl_vendor));
+        }
+        if !gpu_metrics.gl_version.is_empty() || !gpu_metrics.gl_core_version.is_empty() {
+            if !gpu_metrics.direct_rendering {
+                direct_no_idx = Some(lines.len());
+            }
+            lines.push(format!(
+                "Direct:   {}",
+                if gpu_metrics.direct_rendering {
+                    "Yes"
+                } else {
+                    "No"
+                }
+            ));
+        }
 
         for (idx, line_str) in lines.iter().enumerate() {
             let row = hw_inner.y + idx as u16;
@@ -1609,7 +1827,9 @@ pub fn render_gpu_tab(
                 for (c_idx, ch) in line_str.chars().enumerate() {
                     let col = hw_inner.x + c_idx as u16;
                     if col < hw_inner.right() {
-                        let color = if idx == 0 {
+                        let color = if Some(idx) == direct_no_idx {
+                            Color::Rgb(255, 80, 80)
+                        } else if idx == 0 {
                             Color::Rgb(220, 220, 220)
                         } else {
                             Color::Rgb(170, 170, 170)
@@ -1810,20 +2030,18 @@ pub fn render_gpu_tab(
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the tab.
-/// * `net_ifaces` - List of detected network interfaces and throughput rates.
-/// * `net_rx_history` - Historical download (RX) speed samples for Braille graphing.
-/// * `net_tx_history` - Historical upload (TX) speed samples for Braille graphing.
-/// * `connections_res` - Active network connections or permission error message.
+/// * `snap` - Snapshot supplying interface telemetry, rate histories, and socket connections.
 /// * `conn_scroll_offset` - Vertical scroll offset for connections list.
 pub fn render_network_tab(
     frame: &mut Frame,
     area: Rect,
-    net_ifaces: &[NetInterfaceInfo],
-    net_rx_history: &[Option<f64>],
-    net_tx_history: &[Option<f64>],
-    connections_res: &Result<Vec<NetConnectionInfo>, &'static str>,
+    snap: &Snapshot,
     conn_scroll_offset: usize,
 ) {
+    let net_ifaces = &snap.net_ifaces[..];
+    let net_rx_history = &snap.history.net_rx;
+    let net_tx_history = &snap.history.net_tx;
+    let connections_res = &snap.net_connections;
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -2217,34 +2435,25 @@ pub fn is_disks_overflow(area: Rect, disk_io: &DiskIoInfo, disk_mounts: &[MountI
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the tab.
-/// * `disk_io` - Aggregate and per-disk I/O metrics.
-/// * `disk_mounts` - List of mounted partition usage statistics.
-/// * `disk_read_history` - Historical read speed samples for Braille graphing.
-/// * `disk_write_history` - Historical write speed samples for Braille graphing.
+/// * `snap` - Snapshot supplying disk I/O metrics, mounts, and throughput histories.
 /// * `storage_categories` - Detected package and runtime storage categories.
-/// * `active_cat_idx` - Selected sub-tab category index.
-/// * `selected_item_idx` - Selected item row index in the active category for interactive tree expansion.
-/// * `scroll_offset` - Vertical scroll offset within the active category's item list.
-/// * `box_tab` - Selected box index when in tabbed view (0: Graphs, 1: Physical Disks, 2: Storage, 3: Mounted Filesystems).
+/// * `disks` - Disk-tab navigation state (category tab, cursor, scroll, hidden toggle).
 /// * `is_snapshot` - Whether historical snapshot telemetry is currently being inspected.
 /// * `is_dust_scanning` - Whether a background dust whole-disk scan is currently in progress.
-#[allow(clippy::too_many_arguments)]
 pub fn render_disks_tab(
     frame: &mut Frame,
     area: Rect,
-    disk_io: &DiskIoInfo,
-    disk_mounts: &[MountInfo],
-    disk_read_history: &[Option<f64>],
-    disk_write_history: &[Option<f64>],
+    snap: &Snapshot,
     storage_categories: &[PackageStorageCategory],
-    active_cat_idx: usize,
-    selected_item_idx: usize,
-    scroll_offset: usize,
-    box_tab: usize,
+    disks: &DisksViewState,
     is_snapshot: bool,
-    show_hidden: bool,
     is_dust_scanning: bool,
 ) {
+    let disk_io = &snap.disk_io;
+    let disk_mounts = &snap.disk_mounts[..];
+    let disk_read_history = &snap.history.disk_read;
+    let disk_write_history = &snap.history.disk_write;
+    let box_tab = disks.box_tab;
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -2339,11 +2548,8 @@ pub fn render_disks_tab(
                     frame,
                     body,
                     storage_categories,
-                    active_cat_idx,
-                    selected_item_idx,
-                    scroll_offset,
+                    disks,
                     is_snapshot,
-                    show_hidden,
                     is_dust_scanning,
                 );
             }
@@ -2400,11 +2606,8 @@ pub fn render_disks_tab(
             frame,
             bottom_chunks[0],
             storage_categories,
-            active_cat_idx,
-            selected_item_idx,
-            scroll_offset,
+            disks,
             is_snapshot,
-            show_hidden,
             is_dust_scanning,
         );
         render_mounted_filesystems_card(frame, bottom_chunks[1], disk_mounts);
@@ -2490,18 +2693,18 @@ fn render_physical_disks_card(frame: &mut Frame, area: Rect, disk_io: &DiskIoInf
 }
 
 /// Renders the Package & Application Storage block displaying detected storage categories.
-#[allow(clippy::too_many_arguments)]
 fn render_package_storage_card(
     frame: &mut Frame,
     area: Rect,
     storage_categories: &[PackageStorageCategory],
-    active_cat_idx: usize,
-    selected_item_idx: usize,
-    scroll_offset: usize,
+    disks: &DisksViewState,
     is_snapshot: bool,
-    show_hidden: bool,
     is_dust_scanning: bool,
 ) {
+    let active_cat_idx = disks.sub_tab;
+    let selected_item_idx = disks.selected_item;
+    let scroll_offset = disks.scroll_offset;
+    let show_hidden = disks.show_hidden;
     let (card_title, is_all_cat) = if is_snapshot || storage_categories.is_empty() {
         (" Store ".to_string(), false)
     } else {
@@ -3083,23 +3286,20 @@ pub fn format_system_overview_copy_text(
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the overview card.
-/// * `sys_info` - Host system overview metadata.
+/// * `snap` - Snapshot supplying system identity and hardware telemetry.
 /// * `cpu_model` - Marketing CPU model identifier string.
-/// * `num_cores` - Count of logical CPU cores.
-/// * `ram_info` - DMI memory capacity, speed, and DDR generation string.
-/// * `gpu` - GPU metrics.
 /// * `copied` - Whether the overview copy button feedback is currently active.
-#[allow(clippy::too_many_arguments)]
 fn render_general_overview_card(
     frame: &mut Frame,
     area: Rect,
-    sys_info: &SystemGeneralInfo,
+    snap: &Snapshot,
     cpu_model: &str,
-    num_cores: usize,
-    ram_info: &str,
-    gpu: &GpuMetrics,
     copied: bool,
 ) {
+    let sys_info = &snap.sys_info;
+    let num_cores = snap.core_usages.len();
+    let ram_info = &snap.ram_info;
+    let gpu = &snap.gpu_metrics;
     let btn_text = if copied {
         "[ ✓ Copied! ]"
     } else {
@@ -3370,18 +3570,19 @@ fn render_general_battery_card(frame: &mut Frame, area: Rect, battery: Option<&B
 }
 
 /// Renders the CPU performance card with total bar and per-core grid.
-#[allow(clippy::too_many_arguments)]
-fn render_general_cpu_card(
-    frame: &mut Frame,
-    area: Rect,
-    global_cpu_usage: f64,
-    core_usages: &[f64],
-    cpu_cur_mhz: f64,
-    cpu_min_mhz: f64,
-    cpu_max_mhz: f64,
-    cpu_temp: u32,
-    cpu_model: &str,
-) {
+///
+/// # Arguments
+/// * `frame` - Terminal rendering frame buffer.
+/// * `area` - Target bounding box for the card.
+/// * `snap` - Snapshot supplying CPU frequency, temperature, and per-core load.
+/// * `cpu_model` - Marketing CPU model identifier string.
+fn render_general_cpu_card(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_model: &str) {
+    let global_cpu_usage = snap.global_usage;
+    let core_usages = &snap.core_usages[..];
+    let cpu_cur_mhz = snap.cpu_cur_mhz;
+    let cpu_min_mhz = snap.cpu_min_mhz;
+    let cpu_max_mhz = snap.cpu_max_mhz;
+    let cpu_temp = snap.cpu_temp;
     let mut cpu_block = Block::default()
         .title(" CPU ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
@@ -4060,47 +4261,27 @@ fn render_general_storage_card(frame: &mut Frame, area: Rect, disk_mounts: &[Mou
 /// # Arguments
 /// * `frame` - Terminal rendering frame buffer.
 /// * `area` - Target bounding box for the dashboard.
-/// * `sys_info` - Host system overview metadata.
-/// * `battery` - Optional laptop battery metrics.
-/// * `global_cpu_usage` - Total CPU utilization percentage.
-/// * `core_usages` - Per-core CPU load percentages.
-/// * `cpu_cur_mhz` - Current CPU clock frequency in MHz.
-/// * `cpu_min_mhz` - Minimum CPU clock frequency in MHz.
-/// * `cpu_max_mhz` - Maximum CPU clock frequency in MHz.
-/// * `cpu_temp` - CPU temperature in degrees Celsius.
+/// * `snap` - Snapshot supplying all displayed telemetry.
 /// * `cpu_model` - Marketing CPU model identifier string.
-/// * `mem` - Memory metrics.
-/// * `ram_info` - DMI memory capacity, speed, and DDR generation string.
-/// * `gpu` - GPU metrics.
-/// * `net_ifaces` - List of active network interfaces.
-/// * `disk_io` - Disk I/O metrics.
-/// * `disk_mounts` - Mounted partition list.
-/// * `processes` - List of active processes to scan for >30% resource usage.
 /// * `copied` - Whether the overview copy button feedback is currently active.
 /// * `sub_tab` - Active sub-card index when rendered in compact/overflow mode.
-#[allow(clippy::too_many_arguments)]
 pub fn render_general_tab(
     frame: &mut Frame,
     area: Rect,
-    sys_info: &SystemGeneralInfo,
-    battery: Option<&BatteryInfo>,
-    global_cpu_usage: f64,
-    core_usages: &[f64],
-    cpu_cur_mhz: f64,
-    cpu_min_mhz: f64,
-    cpu_max_mhz: f64,
-    cpu_temp: u32,
+    snap: &Snapshot,
     cpu_model: &str,
-    mem: &MemoryMetrics,
-    ram_info: &str,
-    gpu: &GpuMetrics,
-    net_ifaces: &[NetInterfaceInfo],
-    disk_io: &DiskIoInfo,
-    disk_mounts: &[MountInfo],
-    processes: &[ProcessInfo],
     copied: bool,
     sub_tab: usize,
 ) {
+    let battery = snap.battery.as_ref();
+    let core_usages = &snap.core_usages[..];
+    let mem = &snap.mem;
+    let ram_info = &snap.ram_info;
+    let gpu = &snap.gpu_metrics;
+    let net_ifaces = &snap.net_ifaces[..];
+    let disk_io = &snap.disk_io;
+    let disk_mounts = &snap.disk_mounts[..];
+    let processes = &snap.processes[..];
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -4140,9 +4321,7 @@ pub fn render_general_tab(
                         .direction(Direction::Horizontal)
                         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                         .split(body);
-                    render_general_overview_card(
-                        frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied,
-                    );
+                    render_general_overview_card(frame, chunks[0], snap, cpu_model, copied);
                     render_general_battery_card(frame, chunks[1], battery);
                 } else {
                     let chunks = Layout::default()
@@ -4152,9 +4331,7 @@ pub fn render_general_tab(
                             Constraint::Length(if battery.is_some() { 8 } else { 6 }),
                         ])
                         .split(body);
-                    render_general_overview_card(
-                        frame, chunks[0], sys_info, cpu_model, num_cores, ram_info, gpu, copied,
-                    );
+                    render_general_overview_card(frame, chunks[0], snap, cpu_model, copied);
                     render_general_battery_card(frame, chunks[1], battery);
                 }
             }
@@ -4166,17 +4343,7 @@ pub fn render_general_tab(
                         .split(body);
 
                     // Left: CPU taking full height
-                    render_general_cpu_card(
-                        frame,
-                        cols[0],
-                        global_cpu_usage,
-                        core_usages,
-                        cpu_cur_mhz,
-                        cpu_min_mhz,
-                        cpu_max_mhz,
-                        cpu_temp,
-                        cpu_model,
-                    );
+                    render_general_cpu_card(frame, cols[0], snap, cpu_model);
 
                     // Right: Memory, GPU, Network, IO
                     let right = Layout::default()
@@ -4203,17 +4370,7 @@ pub fn render_general_tab(
                             Constraint::Length(4),
                         ])
                         .split(body);
-                    render_general_cpu_card(
-                        frame,
-                        rows[0],
-                        global_cpu_usage,
-                        core_usages,
-                        cpu_cur_mhz,
-                        cpu_min_mhz,
-                        cpu_max_mhz,
-                        cpu_temp,
-                        cpu_model,
-                    );
+                    render_general_cpu_card(frame, rows[0], snap, cpu_model);
                     render_general_memory_card(frame, rows[1], mem, ram_info);
                     render_general_gpu_card(frame, rows[2], gpu);
                     render_general_net_card(frame, rows[3], net_ifaces);
@@ -4242,27 +4399,8 @@ pub fn render_general_tab(
             ])
             .split(columns[0]);
 
-        render_general_overview_card(
-            frame,
-            left_chunks[0],
-            sys_info,
-            cpu_model,
-            num_cores,
-            ram_info,
-            gpu,
-            copied,
-        );
-        render_general_cpu_card(
-            frame,
-            left_chunks[1],
-            global_cpu_usage,
-            core_usages,
-            cpu_cur_mhz,
-            cpu_min_mhz,
-            cpu_max_mhz,
-            cpu_temp,
-            cpu_model,
-        );
+        render_general_overview_card(frame, left_chunks[0], snap, cpu_model, copied);
+        render_general_cpu_card(frame, left_chunks[1], snap, cpu_model);
         render_general_processes_card(frame, left_chunks[2], processes, mem, gpu, num_cores);
 
         let battery_height = if battery.is_some() { 8 } else { 6 };
