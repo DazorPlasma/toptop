@@ -1773,11 +1773,84 @@ pub fn detect_ram_by_cpu(cpu_model: &str) -> Option<(&'static str, &'static str)
 ///
 /// # Returns
 /// Formatted string like `"16GB DDR4@3200MHz"` or `"32GB DDR5@5600MHz"`, or `"16GB [root permissions required]"`.
+fn probe_hardware_ram() -> Option<(String, String)> {
+    static HARDWARE_RAM: OnceLock<Option<(String, String)>> = OnceLock::new();
+    HARDWARE_RAM
+        .get_or_init(|| {
+            // 1. Try reading sysfs DMI raw entries if accessible
+            if let Some(info) = read_dmi_sysfs() {
+                return Some(info);
+            }
+
+            // 2. Try dmidecode directly (without sudo to avoid auth logs/password prompt spam)
+            for bin in &[
+                "dmidecode",
+                "/run/current-system/sw/bin/dmidecode",
+                "/usr/sbin/dmidecode",
+                "/sbin/dmidecode",
+            ] {
+                if let Ok(output) = std::process::Command::new(bin)
+                    .args(["-t", "17"])
+                    .output()
+                    && output.status.success()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let mut ram_type = String::new();
+                    let mut speed = String::new();
+
+                    for line in stdout.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("Type:")
+                            && !trimmed.contains("Error")
+                            && !trimmed.contains("Unknown")
+                        {
+                            let t = trimmed.trim_start_matches("Type:").trim();
+                            if t.starts_with("DDR") || t.starts_with("LPDDR") {
+                                ram_type = t.to_string();
+                            }
+                        }
+                        if (trimmed.starts_with("Speed:")
+                            || trimmed.starts_with("Configured Memory Speed:"))
+                            && !trimmed.contains("Unknown")
+                        {
+                            let s = if trimmed.starts_with("Configured Memory Speed:") {
+                                trimmed
+                                    .trim_start_matches("Configured Memory Speed:")
+                                    .trim()
+                            } else {
+                                trimmed.trim_start_matches("Speed:").trim()
+                            };
+                            let s_num: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                            if !s_num.is_empty() {
+                                speed = format!("{}MHz", s_num);
+                            }
+                        }
+                    }
+
+                    if !ram_type.is_empty() {
+                        return Some((ram_type, speed));
+                    }
+                }
+            }
+
+            None
+        })
+        .clone()
+}
+
+/// Queries hardware DMI table 17 via sysfs/dmidecode or uses CPU architecture heuristics
+/// to determine RAM generation (DDR4/DDR5) and rated clock speed in MHz.
+///
+/// # Arguments
+/// * `total_mb` - Total RAM in megabytes.
+/// * `cpu_model` - Processor model string used for heuristic fallback.
+///
+/// # Returns
+/// Formatted string like `"16GB DDR4@3200MHz"` or `"32GB DDR5@5600MHz"`, or `"16GB [root permissions required]"`.
 pub fn get_ram_info(total_mb: u64, cpu_model: &str) -> String {
     let total_gb = ((total_mb as f64) / 1024.0).round() as u64;
 
-    // 1. Try reading sysfs DMI raw entries if accessible
-    if let Some((ram_type, speed)) = read_dmi_sysfs() {
+    if let Some((ram_type, speed)) = probe_hardware_ram() {
         if !speed.is_empty() {
             return format!("{}GB {}@{}", total_gb, ram_type.to_uppercase(), speed);
         } else {
@@ -1785,64 +1858,7 @@ pub fn get_ram_info(total_mb: u64, cpu_model: &str) -> String {
         }
     }
 
-    // 2. Try dmidecode (direct or passwordless sudo)
-    for bin in &["dmidecode", "/usr/sbin/dmidecode", "/sbin/dmidecode"] {
-        let output = std::process::Command::new(bin)
-            .args(["-t", "17"])
-            .output()
-            .or_else(|_| {
-                std::process::Command::new("sudo")
-                    .args(["-n", bin, "-t", "17"])
-                    .output()
-            });
-
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut ram_type = String::new();
-            let mut speed = String::new();
-
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("Type:")
-                    && !trimmed.contains("Error")
-                    && !trimmed.contains("Unknown")
-                {
-                    let t = trimmed.trim_start_matches("Type:").trim();
-                    if t.starts_with("DDR") || t.starts_with("LPDDR") {
-                        ram_type = t.to_string();
-                    }
-                }
-                if (trimmed.starts_with("Speed:")
-                    || trimmed.starts_with("Configured Memory Speed:"))
-                    && !trimmed.contains("Unknown")
-                {
-                    let s = if trimmed.starts_with("Configured Memory Speed:") {
-                        trimmed
-                            .trim_start_matches("Configured Memory Speed:")
-                            .trim()
-                    } else {
-                        trimmed.trim_start_matches("Speed:").trim()
-                    };
-                    let s_num: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-                    if !s_num.is_empty() {
-                        speed = format!("{}MHz", s_num);
-                    }
-                }
-            }
-
-            if !ram_type.is_empty() {
-                if !speed.is_empty() {
-                    return format!("{}GB {}@{}", total_gb, ram_type.to_uppercase(), speed);
-                } else {
-                    return format!("{}GB {}", total_gb, ram_type.to_uppercase());
-                }
-            }
-        }
-    }
-
-    // 3. Fallback to CPU architecture heuristic if a reasonable match exists
+    // Fallback to CPU architecture heuristic if a reasonable match exists
     if let Some((ram_type, speed)) = detect_ram_by_cpu(cpu_model) {
         format!("{}GB {}@{}", total_gb, ram_type, speed)
     } else {
