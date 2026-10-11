@@ -19,7 +19,8 @@ use crate::{
         ProcessDetailInfo, ProcessErrorPopup, ProcessInfo, ProcessKillConfirmation,
         ProcessSortColumn, group_processes_for_simple_view, matches_process_search,
     },
-    snapshot::Snapshot,
+    process_network::NetworkSource,
+    snapshot::{MetricKind, Snapshot},
     system::{
         BatteryInfo, DiskIoInfo, GpuMetrics, MemoryMetrics, MountInfo, NetInterfaceInfo,
         PackageStorageCategory, SystemGeneralInfo, is_item_visible, read_power_plan,
@@ -99,6 +100,8 @@ pub struct ProcessView<'a> {
     pub total_mem_mb: u64,
     /// Logical core count, for CPU gradient scaling.
     pub num_cores: usize,
+    /// Coverage of the displayed per-process network rates.
+    pub net_source: NetworkSource,
 }
 
 /// One column of the process table; `width == 0` marks the flexible Name column.
@@ -156,9 +159,9 @@ pub(crate) fn process_columns(advanced: bool, show_pid: bool) -> Vec<ProcessColu
         width: 10,
     });
     columns.push(ProcessColumn {
-        title: "GPU",
+        title: "GPU eng",
         sort: ProcessSortColumn::Gpu,
-        width: 5,
+        width: 8,
     });
     columns.push(ProcessColumn {
         title: "VRAM",
@@ -635,15 +638,24 @@ pub fn render_process_tab(
         .collect();
 
     let header_cells = columns.iter().map(|col| {
+        let title = if col.sort == ProcessSortColumn::Net {
+            match view.net_source {
+                NetworkSource::TcpPayload => "TCP Net/s",
+                NetworkSource::PacketCapture => "Net/s TCP+UDP",
+                NetworkSource::Unavailable => "Net",
+            }
+        } else {
+            col.title
+        };
         if col.sort == current_sort_col {
             let (arrow, color) = if sort_ascending {
                 ("▲", Color::Rgb(0, 255, 255))
             } else {
                 ("▼", Color::Rgb(255, 255, 0))
             };
-            Cell::from(format!("{} {}", col.title, arrow)).style(Style::default().fg(color).bold())
+            Cell::from(format!("{} {}", title, arrow)).style(Style::default().fg(color).bold())
         } else {
-            Cell::from(col.title).style(Style::default().fg(Color::Rgb(255, 255, 255)))
+            Cell::from(title).style(Style::default().fg(Color::Rgb(255, 255, 255)))
         }
     });
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -666,7 +678,9 @@ pub fn render_process_tab(
             0.0
         };
 
-        let gpu_mem_pct = (p.gpu_mem_kb as f64 / (8.0 * 1024.0 * 1024.0) * 100.0).clamp(0.0, 100.0);
+        let gpu_mem_pct = p.gpu_mem_kb.map(|gpu_mem_kb| {
+            (gpu_mem_kb as f64 / (8.0 * 1024.0 * 1024.0) * 100.0).clamp(0.0, 100.0)
+        });
 
         let raw_cpu_color = if p.cpu_percent <= 0.0 {
             Color::Rgb(0, 85, 0)
@@ -682,17 +696,30 @@ pub fn render_process_tab(
         };
         let mem_color = darken_color(raw_mem_color, dim_factor);
 
-        let raw_gpu_color = if p.gpu_percent <= 0.0 {
-            Color::Rgb(0, 85, 0)
-        } else {
-            gradient_color(p.gpu_percent)
-        };
+        let gpu_text = p
+            .gpu_percent
+            .map(format_percent)
+            .unwrap_or_else(|| "N/A".to_string());
+        let raw_gpu_color = p
+            .gpu_percent
+            .map(|gpu_percent| {
+                if gpu_percent <= 0.0 {
+                    Color::Rgb(0, 85, 0)
+                } else {
+                    gradient_color(gpu_percent)
+                }
+            })
+            .unwrap_or(Color::Rgb(110, 110, 110));
         let gpu_color = darken_color(raw_gpu_color, dim_factor);
 
-        let raw_gpu_mem_color = if p.gpu_mem_kb == 0 {
-            Color::Rgb(0, 85, 0)
-        } else {
-            gradient_color(gpu_mem_pct * 2.0)
+        let gpu_mem_text = p
+            .gpu_mem_kb
+            .map(|gpu_mem_kb| format_bytes_dyn((gpu_mem_kb * 1024) as f64))
+            .unwrap_or_else(|| "N/A".to_string());
+        let raw_gpu_mem_color = match gpu_mem_pct {
+            Some(gpu_mem_pct) if gpu_mem_pct > 0.0 => gradient_color(gpu_mem_pct * 2.0),
+            Some(_) => Color::Rgb(0, 85, 0),
+            None => Color::Rgb(110, 110, 110),
         };
         let gpu_mem_color = darken_color(raw_gpu_mem_color, dim_factor);
 
@@ -709,17 +736,39 @@ pub fn render_process_tab(
             format_bytes_dyn(p.write_speed)
         );
 
-        let net_max = p.net_rx_speed.max(p.net_tx_speed);
-        let raw_net_color = if net_max <= 0.0 {
-            Color::Rgb(0, 85, 0)
-        } else {
-            gradient_color(io_gradient_pct(net_max))
+        let net_max = [p.net_rx_speed, p.net_tx_speed]
+            .into_iter()
+            .flatten()
+            .fold(None, |max: Option<f64>, value| {
+                Some(max.map(|max| max.max(value)).unwrap_or(value))
+            });
+        let raw_net_color = match net_max {
+            Some(net_max) if net_max > 0.0 => gradient_color(io_gradient_pct(net_max)),
+            Some(_) => Color::Rgb(0, 85, 0),
+            None => Color::Rgb(110, 110, 110),
         };
         let net_color = darken_color(raw_net_color, dim_factor);
+        let net_rx_text = p
+            .net_rx_speed
+            .map(format_bytes_dyn)
+            .unwrap_or_else(|| "N/A".to_string());
+        let net_tx_text = p
+            .net_tx_speed
+            .map(format_bytes_dyn)
+            .unwrap_or_else(|| "N/A".to_string());
+        let rx_partial = if p.net_partial && p.net_rx_speed.is_some() {
+            "+"
+        } else {
+            ""
+        };
+        let tx_partial = if p.net_partial && p.net_tx_speed.is_some() {
+            "+"
+        } else {
+            ""
+        };
         let net_text = format!(
-            "{} ↓ / {} ↑",
-            format_bytes_dyn(p.net_rx_speed),
-            format_bytes_dyn(p.net_tx_speed)
+            "{}{} ↓ / {}{} ↑",
+            net_rx_text, rx_partial, net_tx_text, tx_partial
         );
 
         let mut cells = Vec::with_capacity(11);
@@ -727,8 +776,8 @@ pub fn render_process_tab(
             cells.push(Cell::from(p.pid.to_string()).style(Style::default().fg(text_color)));
         }
         if advanced_view {
-            cells.push(Cell::from(p.user.clone()).style(Style::default().fg(text_color)));
-            cells.push(Cell::from(p.name.clone()).style(Style::default().fg(text_color)));
+            cells.push(Cell::from(p.user.to_string()).style(Style::default().fg(text_color)));
+            cells.push(Cell::from(p.name.to_string()).style(Style::default().fg(text_color)));
             cells.push(Cell::from(p.state.clone()).style(Style::default().fg(text_color)));
             cells.push(Cell::from(p.threads.to_string()).style(Style::default().fg(text_color)));
             cells.push(
@@ -738,13 +787,8 @@ pub fn render_process_tab(
                 Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64))
                     .style(Style::default().fg(mem_color)),
             );
-            cells.push(
-                Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)),
-            );
-            cells.push(
-                Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64))
-                    .style(Style::default().fg(gpu_mem_color)),
-            );
+            cells.push(Cell::from(gpu_text.clone()).style(Style::default().fg(gpu_color)));
+            cells.push(Cell::from(gpu_mem_text.clone()).style(Style::default().fg(gpu_mem_color)));
             cells.push(Cell::from(io_text).style(Style::default().fg(io_color)));
             cells.push(Cell::from(net_text).style(Style::default().fg(net_color)));
         } else {
@@ -756,13 +800,8 @@ pub fn render_process_tab(
                 Cell::from(format_bytes_dyn((p.rss_kb * 1024) as f64))
                     .style(Style::default().fg(mem_color)),
             );
-            cells.push(
-                Cell::from(format_percent(p.gpu_percent)).style(Style::default().fg(gpu_color)),
-            );
-            cells.push(
-                Cell::from(format_bytes_dyn((p.gpu_mem_kb * 1024) as f64))
-                    .style(Style::default().fg(gpu_mem_color)),
-            );
+            cells.push(Cell::from(gpu_text).style(Style::default().fg(gpu_color)));
+            cells.push(Cell::from(gpu_mem_text).style(Style::default().fg(gpu_mem_color)));
             cells.push(Cell::from(io_text).style(Style::default().fg(io_color)));
             cells.push(Cell::from(net_text).style(Style::default().fg(net_color)));
         }
@@ -820,14 +859,23 @@ pub fn render_process_detail(
     let total_mem = snap.mem.total_mem_mb;
     let num_cores = snap.core_usages.len().max(1);
 
+    let detail_source_note = if detail.pid_reused {
+        "PID reused; live details omitted"
+    } else if detail.snapshot_is_historical {
+        "historical snapshot only"
+    } else if !detail.live_metadata_available {
+        "process unavailable in /proc"
+    } else {
+        "latest snapshot | current /proc details"
+    };
     let main_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
         .title(
             Line::from(format!(
-                " Process Details: {} (PID: {}) ('Esc' / 'q' / 'Enter' Back, 'c' Term, 't' Kill) ",
-                detail.info.comm, detail.info.pid
+                " Process Details: {} (PID: {}) [{}] ('Esc' / 'q' / 'Enter' Back, 'c' Term, 't' Kill) ",
+                detail.info.comm, detail.info.pid, detail_source_note
             ))
             .fg(Color::Rgb(255, 255, 255))
             .bold(),
@@ -876,11 +924,17 @@ pub fn render_process_detail(
     ));
     exec_lines.push(format!("State:          {}", detail.info.state));
     exec_lines.push(format!("Threads:        {}", detail.info.threads));
-    exec_lines.push(format!(
-        "Priority:       {} (Nice: {})",
-        detail.priority, detail.nice
-    ));
-    if detail.voluntary_ctxt_switches > 0 || detail.nonvoluntary_ctxt_switches > 0 {
+    if detail.snapshot_is_historical || !detail.live_metadata_available || detail.pid_reused {
+        exec_lines.push("Priority:       N/A (not in snapshot)".to_string());
+    } else {
+        exec_lines.push(format!(
+            "Priority:       {} (Nice: {})",
+            detail.priority, detail.nice
+        ));
+    }
+    if detail.snapshot_is_historical || !detail.live_metadata_available || detail.pid_reused {
+        exec_lines.push("Context Sw:     N/A (not in snapshot)".to_string());
+    } else if detail.voluntary_ctxt_switches > 0 || detail.nonvoluntary_ctxt_switches > 0 {
         exec_lines.push(format!(
             "Context Sw:     {} vol / {} non-vol",
             detail.voluntary_ctxt_switches, detail.nonvoluntary_ctxt_switches
@@ -888,7 +942,14 @@ pub fn render_process_detail(
     }
 
     let exec_block = Block::default()
-        .title(" Execution & Identity ".fg(Color::Rgb(170, 170, 170)))
+        .title(
+            if detail.snapshot_is_historical {
+                " Identity (snapshot) "
+            } else {
+                " Identity (snapshot and current /proc) "
+            }
+            .fg(Color::Rgb(170, 170, 170)),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
@@ -914,7 +975,7 @@ pub fn render_process_detail(
         }
     }
 
-    // Card 2: CPU & Memory Breakdown
+    // Card 2: Snapshot CPU/RSS, plus live VM details only in live mode.
     let total_mem_kb = (total_mem as f64) * 1024.0;
     let mem_pct = if total_mem_kb > 0.0 {
         (detail.info.rss_kb as f64 / total_mem_kb) * 100.0
@@ -935,35 +996,75 @@ pub fn render_process_detail(
         format_bytes_dyn((detail.info.rss_kb * 1024) as f64),
         mem_col,
     ));
-    if detail.info.pss_kb > 0 {
+    mem_lines.push((
+        "Proportional (PSS): ".to_string(),
+        detail
+            .info
+            .pss_kb
+            .map(|pss_kb| format_bytes_dyn((pss_kb * 1024) as f64))
+            .unwrap_or_else(|| "N/A".to_string()),
+        Color::Rgb(180, 180, 180),
+    ));
+    if detail.snapshot_is_historical || !detail.live_metadata_available || detail.pid_reused {
+        let unavailable = if detail.snapshot_is_historical {
+            "N/A (not in snapshot)"
+        } else {
+            "N/A"
+        };
         mem_lines.push((
-            "Proportional:   ".to_string(),
-            format_bytes_dyn((detail.info.pss_kb * 1024) as f64),
-            Color::Rgb(180, 180, 180),
+            "Current VmSize:  ".to_string(),
+            unavailable.to_string(),
+            Color::Rgb(140, 140, 140),
         ));
-    }
-    if detail.vm_size_kb > 0 {
         mem_lines.push((
-            "Virtual (VmSize): ".to_string(),
+            "Current Swap:   ".to_string(),
+            unavailable.to_string(),
+            Color::Rgb(140, 140, 140),
+        ));
+        mem_lines.push((
+            "Current Peak RSS: ".to_string(),
+            unavailable.to_string(),
+            Color::Rgb(140, 140, 140),
+        ));
+        mem_lines.push((
+            "Current Data/Stack: ".to_string(),
+            unavailable.to_string(),
+            Color::Rgb(140, 140, 140),
+        ));
+    } else if detail.vm_size_kb > 0 {
+        mem_lines.push((
+            "Current VmSize:  ".to_string(),
             format_bytes_dyn((detail.vm_size_kb * 1024) as f64),
             Color::Rgb(180, 180, 180),
         ));
     }
-    if detail.vm_swap_kb > 0 {
+    if !detail.snapshot_is_historical
+        && detail.live_metadata_available
+        && !detail.pid_reused
+        && detail.vm_swap_kb > 0
+    {
         mem_lines.push((
-            "Swap Usage:     ".to_string(),
+            "Current Swap:   ".to_string(),
             format_bytes_dyn((detail.vm_swap_kb * 1024) as f64),
             Color::Rgb(255, 128, 0),
         ));
     }
-    if detail.vm_hwm_kb > 0 {
+    if !detail.snapshot_is_historical
+        && detail.live_metadata_available
+        && !detail.pid_reused
+        && detail.vm_hwm_kb > 0
+    {
         mem_lines.push((
-            "Peak RSS (HWM): ".to_string(),
+            "Current Peak RSS: ".to_string(),
             format_bytes_dyn((detail.vm_hwm_kb * 1024) as f64),
             Color::Rgb(150, 150, 150),
         ));
     }
-    if detail.vm_data_kb > 0 {
+    if !detail.snapshot_is_historical
+        && detail.live_metadata_available
+        && !detail.pid_reused
+        && detail.vm_data_kb > 0
+    {
         mem_lines.push((
             "Data / Stack:   ".to_string(),
             format!(
@@ -976,7 +1077,14 @@ pub fn render_process_detail(
     }
 
     let mem_block = Block::default()
-        .title(" CPU & Memory Breakdown ".fg(Color::Rgb(170, 170, 170)))
+        .title(
+            if detail.snapshot_is_historical {
+                " CPU & Memory (snapshot) "
+            } else {
+                " CPU & Memory (snapshot and current /proc) "
+            }
+            .fg(Color::Rgb(170, 170, 170)),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
@@ -1027,26 +1135,66 @@ pub fn render_process_detail(
     ));
     io_lines.push((
         "Open FDs:       ".to_string(),
-        format!("{} file descriptors", detail.open_fds),
+        if detail.snapshot_is_historical {
+            "N/A (not in snapshot)".to_string()
+        } else if detail.live_metadata_available && !detail.pid_reused {
+            format!("{} file descriptors (now)", detail.open_fds)
+        } else {
+            "N/A".to_string()
+        },
         Color::Rgb(200, 200, 200),
     ));
-    if detail.info.gpu_percent > 0.0 || detail.info.gpu_mem_kb > 0 {
-        io_lines.push((
-            "GPU Usage:      ".to_string(),
-            format_percent(detail.info.gpu_percent),
-            gradient_color(detail.info.gpu_percent),
-        ));
-        io_lines.push((
-            "GPU VRAM:       ".to_string(),
-            format_bytes_dyn((detail.info.gpu_mem_kb * 1024) as f64),
-            gradient_color(
-                (detail.info.gpu_mem_kb as f64 / (8.0 * 1024.0 * 1024.0) * 100.0).clamp(0.0, 100.0),
-            ),
-        ));
-    }
+    let net_source = match snap.process_net_source {
+        NetworkSource::TcpPayload => "TCP payload",
+        NetworkSource::PacketCapture => "TCP/UDP capture",
+        NetworkSource::Unavailable => "unavailable",
+    };
+    let net_value = match (detail.info.net_rx_speed, detail.info.net_tx_speed) {
+        (Some(rx), Some(tx)) => format!(
+            "{} ↓ / {} ↑ /s ({net_source})",
+            format_bytes_dyn(rx),
+            format_bytes_dyn(tx)
+        ),
+        _ => format!("N/A ({net_source})"),
+    };
+    io_lines.push((
+        "Network:        ".to_string(),
+        net_value,
+        Color::Rgb(140, 140, 140),
+    ));
+    io_lines.push((
+        "Peak GPU engine:".to_string(),
+        detail
+            .info
+            .gpu_percent
+            .map(format_percent)
+            .unwrap_or_else(|| "N/A".to_string()),
+        detail
+            .info
+            .gpu_percent
+            .map(gradient_color)
+            .unwrap_or(Color::Rgb(140, 140, 140)),
+    ));
+    io_lines.push((
+        "GPU VRAM:       ".to_string(),
+        detail
+            .info
+            .gpu_mem_kb
+            .map(|gpu_mem_kb| format_bytes_dyn((gpu_mem_kb * 1024) as f64))
+            .unwrap_or_else(|| "N/A".to_string()),
+        detail
+            .info
+            .gpu_mem_kb
+            .map(|gpu_mem_kb| {
+                gradient_color(
+                    (gpu_mem_kb as f64 / (8.0 * 1024.0 * 1024.0) * 100.0).clamp(0.0, 100.0),
+                )
+            })
+            .unwrap_or(Color::Rgb(140, 140, 140)),
+    ));
 
     let io_block = Block::default()
-        .title(" I/O & GPU Telemetry ".fg(Color::Rgb(170, 170, 170)))
+        .title(" I/O & GPU (process snapshot) ".fg(Color::Rgb(170, 170, 170)))
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
@@ -1074,7 +1222,14 @@ pub fn render_process_detail(
 
     // Card 4: Executable Binary & Working Directory Paths
     let paths_block = Block::default()
-        .title(" Executable & Working Directory ".fg(Color::Rgb(170, 170, 170)))
+        .title(
+            if detail.snapshot_is_historical {
+                " Executable & Working Directory (not captured) "
+            } else {
+                " Executable & Working Directory (current /proc) "
+            }
+            .fg(Color::Rgb(170, 170, 170)),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
@@ -1084,11 +1239,23 @@ pub fn render_process_detail(
     if paths_inner.height > 0 {
         let exe_str = if !detail.exe_path.is_empty() {
             &detail.exe_path
+        } else if detail.snapshot_is_historical {
+            "N/A (not in snapshot)"
+        } else if detail.pid_reused {
+            "N/A (PID reused)"
+        } else if !detail.live_metadata_available {
+            "N/A (process exited)"
         } else {
             "N/A (Kernel Thread or Permission Denied)"
         };
         let cwd_str = if !detail.cwd_path.is_empty() {
             &detail.cwd_path
+        } else if detail.snapshot_is_historical {
+            "N/A (not in snapshot)"
+        } else if detail.pid_reused {
+            "N/A (PID reused)"
+        } else if !detail.live_metadata_available {
+            "N/A (process exited)"
         } else {
             "N/A"
         };
@@ -1114,7 +1281,10 @@ pub fn render_process_detail(
 
     // Card 5: Full Command Line Invocation
     let cmd_block = Block::default()
-        .title(" Full Command Line ".fg(Color::Rgb(170, 170, 170)))
+        .title(
+            " Full Command Line (current /proc or snapshot fallback) "
+                .fg(Color::Rgb(170, 170, 170)),
+        )
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 60)));
@@ -1137,7 +1307,7 @@ pub fn render_process_detail(
 /// * `snap` - Snapshot supplying CPU/memory telemetry and their histories.
 /// * `cpu_model` - Marketing CPU model identifier string.
 pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_model: &str) {
-    let cpu_history = &snap.history.cpu;
+    let cpu_history = snap.history.series(MetricKind::Cpu);
     let core_usages = &snap.core_usages[..];
     let cpu_cur_mhz = snap.cpu_cur_mhz;
     let cpu_min_mhz = snap.cpu_min_mhz;
@@ -1145,8 +1315,8 @@ pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_mo
     let cpu_temp = snap.cpu_temp;
     let ram_temp = snap.ram_temp;
     let mem = &snap.mem;
-    let mem_history = &snap.history.mem;
-    let swap_history = &snap.history.swap;
+    let mem_history = snap.history.series(MetricKind::Mem);
+    let swap_history = snap.history.series(MetricKind::Swap);
     let ram_info = &snap.ram_info;
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1183,7 +1353,7 @@ pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_mo
         None,
         Some(cpu_model),
         Color::Rgb(60, 60, 60),
-        cpu_history,
+        &cpu_history,
     );
 
     let cores_block = Block::default()
@@ -1341,7 +1511,7 @@ pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_mo
             None,
             Some(ram_info),
             Color::Rgb(60, 60, 60),
-            mem_history,
+            &mem_history,
         );
 
         render_gradient_chart(
@@ -1351,7 +1521,7 @@ pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_mo
             None,
             Some(&swap_label),
             Color::Rgb(60, 60, 60),
-            swap_history,
+            &swap_history,
         );
 
         // When merged, if ram temp is N/A (None), don't render it; distribute width evenly among 3 bars
@@ -1474,7 +1644,7 @@ pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_mo
             None,
             Some(ram_info),
             Color::Rgb(60, 60, 60),
-            mem_history,
+            &mem_history,
         );
 
         render_gradient_chart(
@@ -1484,7 +1654,7 @@ pub fn render_cpu_ram_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, cpu_mo
             None,
             Some(&swap_label),
             Color::Rgb(60, 60, 60),
-            swap_history,
+            &swap_history,
         );
 
         let mem_block = Block::default()
@@ -1641,8 +1811,8 @@ pub fn is_gpu_overflow(area: Rect, gpu_metrics: &GpuMetrics) -> bool {
 /// * `sub_tab` - Active sub-tab index (0: GPU Utilization, 1: VRAM History) when in tabbed view.
 pub fn render_gpu_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, sub_tab: usize) {
     let gpu_metrics = &snap.gpu_metrics;
-    let gpu_history = &snap.history.gpu;
-    let gpu_vram_history = &snap.history.gpu_vram;
+    let gpu_history = snap.history.series(MetricKind::Gpu);
+    let gpu_vram_history = snap.history.series(MetricKind::GpuVram);
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -1717,7 +1887,7 @@ pub fn render_gpu_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, sub_tab: u
                     Some((&gpu_freq_label, gpu_freq_color)),
                     Some(&gpu_label),
                     Color::Rgb(60, 60, 60),
-                    gpu_history,
+                    &gpu_history,
                 );
             }
             1 => {
@@ -1728,7 +1898,7 @@ pub fn render_gpu_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, sub_tab: u
                     None,
                     Some(&vram_label),
                     Color::Rgb(60, 60, 60),
-                    gpu_vram_history,
+                    &gpu_vram_history,
                 );
             }
             _ => {}
@@ -1746,7 +1916,7 @@ pub fn render_gpu_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, sub_tab: u
             Some((&gpu_freq_label, gpu_freq_color)),
             Some(&gpu_label),
             Color::Rgb(60, 60, 60),
-            gpu_history,
+            &gpu_history,
         );
 
         render_gradient_chart(
@@ -1756,7 +1926,7 @@ pub fn render_gpu_tab(frame: &mut Frame, area: Rect, snap: &Snapshot, sub_tab: u
             None,
             Some(&vram_label),
             Color::Rgb(60, 60, 60),
-            gpu_vram_history,
+            &gpu_vram_history,
         );
     }
 
@@ -2039,8 +2209,8 @@ pub fn render_network_tab(
     conn_scroll_offset: usize,
 ) {
     let net_ifaces = &snap.net_ifaces[..];
-    let net_rx_history = &snap.history.net_rx;
-    let net_tx_history = &snap.history.net_tx;
+    let net_rx_history = snap.history.series(MetricKind::NetRx);
+    let net_tx_history = snap.history.series(MetricKind::NetTx);
     let connections_res = &snap.net_connections;
     let body_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2075,7 +2245,7 @@ pub fn render_network_tab(
         None,
         Some(&rx_label),
         Color::Rgb(60, 60, 60),
-        net_rx_history,
+        &net_rx_history,
     );
 
     render_gradient_chart(
@@ -2085,7 +2255,7 @@ pub fn render_network_tab(
         None,
         Some(&tx_label),
         Color::Rgb(60, 60, 60),
-        net_tx_history,
+        &net_tx_history,
     );
 
     // Top-Right: Interfaces details
@@ -2451,8 +2621,8 @@ pub fn render_disks_tab(
 ) {
     let disk_io = &snap.disk_io;
     let disk_mounts = &snap.disk_mounts[..];
-    let disk_read_history = &snap.history.disk_read;
-    let disk_write_history = &snap.history.disk_write;
+    let disk_read_history = snap.history.series(MetricKind::DiskRead);
+    let disk_write_history = snap.history.series(MetricKind::DiskWrite);
     let box_tab = disks.box_tab;
     if area.height == 0 || area.width == 0 {
         return;
@@ -2504,7 +2674,7 @@ pub fn render_disks_tab(
                         None,
                         Some(&disk_read_label),
                         Color::Rgb(60, 60, 60),
-                        disk_read_history,
+                        &disk_read_history,
                     );
                     render_gradient_chart(
                         frame,
@@ -2513,7 +2683,7 @@ pub fn render_disks_tab(
                         None,
                         Some(&disk_write_label),
                         Color::Rgb(60, 60, 60),
-                        disk_write_history,
+                        &disk_write_history,
                     );
                 } else {
                     let graph_chunks = Layout::default()
@@ -2527,7 +2697,7 @@ pub fn render_disks_tab(
                         None,
                         Some(&disk_read_label),
                         Color::Rgb(60, 60, 60),
-                        disk_read_history,
+                        &disk_read_history,
                     );
                     render_gradient_chart(
                         frame,
@@ -2536,7 +2706,7 @@ pub fn render_disks_tab(
                         None,
                         Some(&disk_write_label),
                         Color::Rgb(60, 60, 60),
-                        disk_write_history,
+                        &disk_write_history,
                     );
                 }
             }
@@ -2588,7 +2758,7 @@ pub fn render_disks_tab(
             None,
             Some(&disk_read_label),
             Color::Rgb(60, 60, 60),
-            disk_read_history,
+            &disk_read_history,
         );
 
         render_gradient_chart(
@@ -2598,7 +2768,7 @@ pub fn render_disks_tab(
             None,
             Some(&disk_write_label),
             Color::Rgb(60, 60, 60),
-            disk_write_history,
+            &disk_write_history,
         );
 
         render_physical_disks_card(frame, top_chunks[1], disk_io);
@@ -3827,7 +3997,7 @@ fn render_general_processes_card(
             false,
             "",
         );
-        let mut heavy_procs: Vec<(&ProcessInfo, f64, f64, f64)> = grouped_procs
+        let mut heavy_procs: Vec<(&ProcessInfo, f64, Option<f64>, f64)> = grouped_procs
             .iter()
             .filter_map(|p| {
                 let all_core_cpu_pct = if num_cores > 0 {
@@ -3841,21 +4011,23 @@ fn render_general_processes_card(
                     0.0
                 };
                 let gpu_vram_pct = if gpu.vram_total_mb > 0 {
-                    (p.gpu_mem_kb as f64 / (gpu.vram_total_mb as f64 * 1024.0)) * 100.0
+                    p.gpu_mem_kb.map(|gpu_mem_kb| {
+                        (gpu_mem_kb as f64 / (gpu.vram_total_mb as f64 * 1024.0)) * 100.0
+                    })
                 } else {
-                    0.0
+                    None
                 };
 
                 let is_heavy_cpu = all_core_cpu_pct >= 50.0;
                 let is_heavy_mem = mem_pct >= 30.0;
-                let is_heavy_gpu = p.gpu_percent >= 30.0;
-                let is_heavy_vram = gpu_vram_pct >= 30.0;
+                let is_heavy_gpu = p.gpu_percent.is_some_and(|value| value >= 30.0);
+                let is_heavy_vram = gpu_vram_pct.is_some_and(|value| value >= 30.0);
 
                 if is_heavy_cpu || is_heavy_mem || is_heavy_gpu || is_heavy_vram {
                     let max_pct = all_core_cpu_pct
                         .max(mem_pct)
-                        .max(p.gpu_percent)
-                        .max(gpu_vram_pct);
+                        .max(p.gpu_percent.unwrap_or(0.0))
+                        .max(gpu_vram_pct.unwrap_or(0.0));
                     Some((p, mem_pct, gpu_vram_pct, max_pct))
                 } else {
                     None
@@ -3884,8 +4056,8 @@ fn render_general_processes_card(
             let hdr_pid = "PID";
             let hdr_name = "NAME";
             let hdr_cpu = "CPU%";
-            let hdr_mem = "MEM%";
-            let hdr_gpu = "GPU%";
+            let hdr_mem = "RAM%";
+            let hdr_gpu = "GPU eng";
             let hdr_vram = "VRAM%";
 
             let name_w = (heavy_inner.width.saturating_sub(7 + 8 + 8 + 8 + 8 + 2) as usize).max(8);
@@ -3915,7 +4087,7 @@ fn render_general_processes_card(
                     break;
                 }
 
-                let mut name_display = p.name.clone();
+                let mut name_display = p.name.to_string();
                 if name_display.chars().count() > name_w {
                     name_display = format!(
                         "{}…",
@@ -3929,8 +4101,13 @@ fn render_general_processes_card(
                 let pid_str = format!("{:<7}", p.pid);
                 let cpu_val_str = format!("{:>6.1}% ", p.cpu_percent);
                 let mem_val_str = format!("{:>6.1}% ", mem_pct);
-                let gpu_val_str = format!("{:>6.1}% ", p.gpu_percent);
-                let vram_val_str = format!("{:>6.1}%", gpu_vram_pct);
+                let gpu_val_str = p
+                    .gpu_percent
+                    .map(|value| format!("{:>6.1}% ", value))
+                    .unwrap_or_else(|| format!("{:>7} ", "N/A"));
+                let vram_val_str = gpu_vram_pct
+                    .map(|value| format!("{:>6.1}%", value))
+                    .unwrap_or_else(|| format!("{:>7}", "N/A"));
 
                 let mut col = heavy_inner.x;
                 // PID
@@ -4003,11 +4180,11 @@ fn render_general_processes_card(
                     }
                 }
                 // GPU%
-                let gpu_color = if p.gpu_percent >= 30.0 {
-                    gradient_color(p.gpu_percent.min(100.0))
-                } else {
-                    Color::Rgb(140, 140, 140)
-                };
+                let gpu_color = p
+                    .gpu_percent
+                    .filter(|value| *value >= 30.0)
+                    .map(|value| gradient_color(value.min(100.0)))
+                    .unwrap_or(Color::Rgb(140, 140, 140));
                 for ch in gpu_val_str.chars() {
                     if col < heavy_inner.right() {
                         frame.buffer_mut()[(col, row_y)]
@@ -4017,11 +4194,10 @@ fn render_general_processes_card(
                     }
                 }
                 // VRAM%
-                let vram_color = if gpu_vram_pct >= 30.0 {
-                    gradient_color(gpu_vram_pct.min(100.0))
-                } else {
-                    Color::Rgb(140, 140, 140)
-                };
+                let vram_color = gpu_vram_pct
+                    .filter(|value| *value >= 30.0)
+                    .map(|value| gradient_color(value.min(100.0)))
+                    .unwrap_or(Color::Rgb(140, 140, 140));
                 for ch in vram_val_str.chars() {
                     if col < heavy_inner.right() {
                         frame.buffer_mut()[(col, row_y)]
@@ -4064,7 +4240,11 @@ fn render_general_gpu_card(frame: &mut Frame, area: Rect, gpu: &GpuMetrics) {
         let gpu_temp_color = gradient_color(gpu_temp_pct);
         let gpu_temp_str = format!("{}°C", gpu.temp_c);
 
-        let gpu_pct_str = format!("{:.1}% [", gpu.utilization_pct);
+        let gpu_pct_str = if gpu.utilization_available {
+            format!("{:.1}% [", gpu.utilization_pct)
+        } else {
+            "N/A [".to_string()
+        };
         let gpu_end_str = "]".to_string();
 
         draw_styled_bar(

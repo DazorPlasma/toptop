@@ -108,18 +108,21 @@ impl App {
     /// Snapshot data and the table cursor are borrowed through disjoint fields
     /// so the stateful widget can update its selection during rendering.
     fn draw_process_table(&mut self, frame: &mut Frame, body: Rect) {
-        let (processes, total_mem_mb, num_cores) = match self.snapshots.get(self.snapshot_idx) {
-            Some(snap) => (
-                &snap.processes,
-                snap.mem.total_mem_mb,
-                snap.core_usages.len().max(1),
-            ),
-            None => (
-                &self.live.processes,
-                self.live.mem.total_mem_mb,
-                self.live.core_usages.len().max(1),
-            ),
-        };
+        let (processes, total_mem_mb, num_cores, net_source) =
+            match self.snapshots.get(self.snapshot_idx) {
+                Some(snap) => (
+                    &snap.processes,
+                    snap.mem.total_mem_mb,
+                    snap.core_usages.len().max(1),
+                    snap.process_net_source,
+                ),
+                None => (
+                    &self.live.processes,
+                    self.live.mem.total_mem_mb,
+                    self.live.core_usages.len().max(1),
+                    self.live.process_net_source,
+                ),
+            };
 
         let view = ui::ProcessView {
             processes,
@@ -131,6 +134,7 @@ impl App {
             ascending: self.procs.ascending,
             total_mem_mb,
             num_cores,
+            net_source,
         };
         ui::render_process_tab(frame, body, &view, &mut self.procs.table_state);
     }
@@ -148,15 +152,18 @@ impl App {
             // The process exited between capture and inspection; show a stub.
             dummy_proc = ProcessInfo {
                 pid: detail_pid,
-                comm: format!("PID {detail_pid}"),
-                name: format!("PID {detail_pid}"),
+                comm: format!("PID {detail_pid}").into(),
+                name: format!("PID {detail_pid}").into(),
                 state: "Exited".to_string(),
                 ..ProcessInfo::default()
             };
             &dummy_proc
         };
 
-        let detail = crate::process::read_process_detail(proc_info, &proc_map);
+        let snapshot_is_historical =
+            self.paused || self.snapshot_idx.saturating_add(1) < self.snapshots.len();
+        let detail =
+            crate::process::read_process_detail(proc_info, &proc_map, snapshot_is_historical);
         ui::render_process_detail(frame, body, &detail, snap);
     }
 }

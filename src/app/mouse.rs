@@ -15,6 +15,7 @@ impl App {
         if self.error_popup.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.error_popup = None;
+                self.needs_redraw = true;
             }
             return;
         }
@@ -27,8 +28,10 @@ impl App {
                 };
                 if hit(yes) {
                     self.execute_kill_confirmation();
+                    self.needs_redraw = true;
                 } else if hit(no) {
                     self.kill_confirmation = None;
+                    self.needs_redraw = true;
                 }
             }
             return;

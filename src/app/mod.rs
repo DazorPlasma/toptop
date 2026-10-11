@@ -27,7 +27,8 @@ use crate::{
         directly_matches_search, group_processes_for_simple_view, matches_process_search,
         process_search_score, read_processes, sort_processes, validate_process_target,
     },
-    snapshot::{HISTORY_LEN, MetricSample, Snapshot},
+    process_network::ProcessNetworkCollector,
+    snapshot::{MetricSample, Snapshot},
     system::{
         CpuTicks, DnsResolver, PackageStorageCategory, PackageStorageItem, calculate_usage,
         get_cpu_model, get_ram_info, get_users, is_item_visible, read_battery, read_cpu_freq_info,
@@ -177,6 +178,10 @@ pub(crate) struct App {
     prev_disk: HashMap<String, (u64, u64)>,
     /// Previous per-process counters used to compute rate deltas.
     prev_procs: HashMap<u32, ProcessInfo>,
+    /// Socket diagnostics and optional privileged packet capture.
+    process_network: ProcessNetworkCollector,
+    /// Start instant of the previous process sampling pass.
+    last_process_sample: Instant,
 
     // Time travel -----------------------------------------------------------------
     /// Historical snapshot ring (bounded by [`MAX_SNAPSHOTS`]).
@@ -274,7 +279,10 @@ impl App {
 
         let mem = read_memory(&mut io_buf);
         let mut prev_procs = HashMap::new();
+        let process_sample_at = Instant::now();
         let mut processes = read_processes(&mut prev_procs, &users, 0.0);
+        let mut process_network = ProcessNetworkCollector::new();
+        let process_net_source = process_network.sample(&mut processes);
         sort_processes(&mut processes, ProcessSortColumn::Mem, false);
 
         let gpu_metrics = read_gpu_metrics();
@@ -284,38 +292,43 @@ impl App {
         let ram_info = get_ram_info(mem.total_mem_mb, &cpu_model);
         let (cpu_cur_mhz, cpu_min_mhz, cpu_max_mhz) = read_cpu_freq_info();
 
-        let mut live = Snapshot {
-            sys_info,
-            battery,
-            global_usage,
-            core_usages,
-            cpu_cur_mhz,
-            cpu_min_mhz,
-            cpu_max_mhz,
-            cpu_temp: read_cpu_temp(),
-            ram_temp: read_ram_temp(),
-            mem,
-            ram_info,
-            gpu_metrics,
-            net_ifaces,
-            net_connections,
-            disk_io,
-            disk_mounts,
-            processes,
-            history: Default::default(),
-        };
+        let mut live = Snapshot::default();
+        live.sys_info = sys_info;
+        live.battery = battery;
+        live.global_usage = global_usage;
+        live.core_usages = core_usages;
+        live.cpu_cur_mhz = cpu_cur_mhz;
+        live.cpu_min_mhz = cpu_min_mhz;
+        live.cpu_max_mhz = cpu_max_mhz;
+        live.cpu_temp = read_cpu_temp();
+        live.ram_temp = read_ram_temp();
+        live.mem = mem;
+        live.ram_info = ram_info;
+        live.gpu_metrics = gpu_metrics;
+        live.net_ifaces = net_ifaces;
+        live.net_connections = net_connections;
+        live.disk_io = disk_io;
+        live.disk_mounts = disk_mounts;
+        live.processes = processes;
+        live.process_net_source = process_net_source;
 
         // Seed the newest history slot so the first frame shows a live data point
         // where telemetry was already available at startup.
-        live.history.cpu[HISTORY_SEED] = Some(live.global_usage);
-        live.history.mem[HISTORY_SEED] = Some(live.mem_used_pct());
-        live.history.swap[HISTORY_SEED] = Some(live.swap_used_pct());
-        live.history.gpu[HISTORY_SEED] = Some(live.gpu_metrics.utilization_pct);
-        live.history.gpu_vram[HISTORY_SEED] = Some(live.vram_used_pct());
+        live.history.seed(
+            live.global_usage,
+            live.mem_used_pct(),
+            live.swap_used_pct(),
+            live.gpu_metrics
+                .utilization_available
+                .then_some(live.gpu_metrics.utilization_pct),
+            live.vram_used_pct(),
+        );
 
         // Freeze the startup readings as the first historical snapshot so
         // time travel works before the first tick lands.
-        let snapshots = vec![live.clone()];
+        let mut first_snapshot = live.historical_copy();
+        first_snapshot.materialize_history();
+        let snapshots = vec![first_snapshot];
 
         let (storage_tx, storage_rx) = channel();
         spawn_storage_scanner(storage_tx);
@@ -340,6 +353,8 @@ impl App {
             prev_net,
             prev_disk,
             prev_procs,
+            process_network,
+            last_process_sample: process_sample_at,
             snapshots,
             snapshot_idx: 0,
             paused: false,
@@ -503,7 +518,13 @@ impl App {
         self.live.sys_info = read_system_general_info();
         self.live.battery = read_battery();
 
-        self.live.processes = read_processes(&mut self.prev_procs, &self.users, dt);
+        let process_sample_at = Instant::now();
+        let process_dt = process_sample_at
+            .duration_since(self.last_process_sample)
+            .as_secs_f64();
+        self.live.processes = read_processes(&mut self.prev_procs, &self.users, process_dt);
+        self.live.process_net_source = self.process_network.sample(&mut self.live.processes);
+        self.last_process_sample = process_sample_at;
         sort_processes(
             &mut self.live.processes,
             self.procs.sort_col,
@@ -551,12 +572,15 @@ impl App {
         self.live.disk_mounts = read_disk_mounts();
         self.live.disk_io = read_disk_io(&mut self.prev_disk, dt);
 
-        self.live.history.shift();
         self.live.history.push(MetricSample {
             cpu: self.live.global_usage,
             mem: self.live.mem_used_pct(),
             swap: self.live.swap_used_pct(),
-            gpu: self.live.gpu_metrics.utilization_pct,
+            gpu: self
+                .live
+                .gpu_metrics
+                .utilization_available
+                .then_some(self.live.gpu_metrics.utilization_pct),
             gpu_vram: self.live.vram_used_pct(),
             net_rx: rx_pct,
             net_tx: tx_pct,
@@ -564,15 +588,23 @@ impl App {
             disk_write: io_gradient_pct(self.live.disk_io.write_speed),
         });
 
-        self.snapshots.push(self.live.clone());
-        if self.snapshots.len() > MAX_SNAPSHOTS {
-            self.snapshots.remove(0);
-            if self.paused {
-                self.snapshot_idx = self.snapshot_idx.saturating_sub(1);
-            }
-        }
         if !self.paused {
-            self.snapshot_idx = self.snapshots.len().saturating_sub(1);
+            // Keep only the viewed frame expanded. Every other frame retains
+            // its lossless compact archive of processes and connections.
+            self.snapshots[self.snapshot_idx].compact_history();
+        }
+        append_snapshot(
+            &mut self.snapshots,
+            &mut self.snapshot_idx,
+            self.paused,
+            self.live.historical_copy(),
+        );
+        if !self.paused {
+            sort_processes(
+                &mut self.snapshots[self.snapshot_idx].processes,
+                self.procs.sort_col,
+                self.procs.ascending,
+            );
         }
 
         self.last_tick = Instant::now();
@@ -596,40 +628,54 @@ impl App {
     fn select_tab(&mut self, tab: Tab) {
         self.current_tab = tab;
         self.procs.selected_detail = None;
+        self.needs_redraw = true;
     }
 
     /// Toggles pause; unpausing jumps to the latest snapshot and restarts the tick clock.
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         if !self.paused {
-            self.snapshot_idx = self.snapshots.len().saturating_sub(1);
+            self.activate_snapshot(self.snapshots.len().saturating_sub(1));
             self.last_tick = Instant::now();
+        }
+    }
+
+    /// Expands the selected frame and compacts the frame being left.
+    fn activate_snapshot(&mut self, index: usize) {
+        if index != self.snapshot_idx {
+            self.snapshots[self.snapshot_idx].compact_history();
+            self.snapshot_idx = index;
+            self.snapshots[self.snapshot_idx].materialize_history();
+            sort_processes(
+                &mut self.snapshots[self.snapshot_idx].processes,
+                self.procs.sort_col,
+                self.procs.ascending,
+            );
         }
     }
 
     /// Steps back one snapshot in time, pausing polling.
     fn travel_back(&mut self) {
         self.paused = true;
-        self.snapshot_idx = self.snapshot_idx.saturating_sub(1);
+        self.activate_snapshot(self.snapshot_idx.saturating_sub(1));
     }
 
     /// Steps forward one snapshot in time, pausing polling.
     fn travel_forward(&mut self) {
         self.paused = true;
         if self.snapshot_idx + 1 < self.snapshots.len() {
-            self.snapshot_idx += 1;
+            self.activate_snapshot(self.snapshot_idx + 1);
         }
     }
 
-    /// Re-applies the current sort to the live process list and every stored snapshot.
+    /// Re-applies the current sort to expanded process lists. Archived frames
+    /// are sorted on expansion using the then-current preference.
     fn resort_processes(&mut self) {
-        for snap in &mut self.snapshots {
-            sort_processes(
-                &mut snap.processes,
-                self.procs.sort_col,
-                self.procs.ascending,
-            );
-        }
+        sort_processes(
+            &mut self.snapshots[self.snapshot_idx].processes,
+            self.procs.sort_col,
+            self.procs.ascending,
+        );
         sort_processes(
             &mut self.live.processes,
             self.procs.sort_col,
@@ -780,8 +826,13 @@ impl App {
             }
         }
         std::thread::sleep(KILL_SETTLE);
-        let dt = self.last_tick.elapsed().as_secs_f64().max(0.001);
-        self.live.processes = read_processes(&mut self.prev_procs, &self.users, dt);
+        let process_sample_at = Instant::now();
+        let process_dt = process_sample_at
+            .duration_since(self.last_process_sample)
+            .as_secs_f64();
+        self.live.processes = read_processes(&mut self.prev_procs, &self.users, process_dt);
+        self.live.process_net_source = self.process_network.sample(&mut self.live.processes);
+        self.last_process_sample = process_sample_at;
         sort_processes(
             &mut self.live.processes,
             self.procs.sort_col,
@@ -905,8 +956,31 @@ impl App {
     }
 }
 
-/// Index of the freshest sample inside each history series.
-const HISTORY_SEED: usize = HISTORY_LEN - 1;
+/// Appends a frozen frame, evicts at the 300-frame cap, and expands the selected frame.
+fn append_snapshot(
+    snapshots: &mut Vec<Snapshot>,
+    snapshot_idx: &mut usize,
+    paused: bool,
+    snapshot: Snapshot,
+) {
+    snapshots.push(snapshot);
+    if snapshots.len() > MAX_SNAPSHOTS {
+        snapshots.remove(0);
+        if paused {
+            *snapshot_idx = snapshot_idx.saturating_sub(1);
+        }
+    }
+    if !paused {
+        *snapshot_idx = snapshots.len().saturating_sub(1);
+    }
+    snapshots[*snapshot_idx].materialize_history();
+    debug_assert!(
+        snapshots
+            .iter()
+            .enumerate()
+            .all(|(index, frame)| index == *snapshot_idx || frame.history_is_compact())
+    );
+}
 
 /// Spawns the periodic background package-storage scanning thread.
 fn spawn_storage_scanner(tx: Sender<Vec<PackageStorageCategory>>) {
@@ -942,6 +1016,55 @@ fn all_category() -> PackageStorageCategory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_cap_preserves_selected_frame_until_it_is_evicted() {
+        let frames = || {
+            (0..MAX_SNAPSHOTS)
+                .map(|i| {
+                    Snapshot {
+                        global_usage: i as f64,
+                        ..Default::default()
+                    }
+                    .historical_copy()
+                })
+                .collect::<Vec<_>>()
+        };
+        let next = |value: usize| {
+            Snapshot {
+                global_usage: value as f64,
+                ..Default::default()
+            }
+            .historical_copy()
+        };
+
+        let mut live_frames = frames();
+        let mut live_idx = MAX_SNAPSHOTS - 1;
+        append_snapshot(&mut live_frames, &mut live_idx, false, next(300));
+        assert_eq!(live_frames.len(), MAX_SNAPSHOTS);
+        assert_eq!(live_frames[0].global_usage, 1.0);
+        assert_eq!(live_frames[live_idx].global_usage, 300.0);
+        assert_eq!(live_idx, MAX_SNAPSHOTS - 1);
+
+        let mut paused_frames = frames();
+        let mut paused_idx = 150;
+        append_snapshot(&mut paused_frames, &mut paused_idx, true, next(300));
+        assert_eq!(paused_idx, 149);
+        assert_eq!(paused_frames[paused_idx].global_usage, 150.0);
+        assert!(paused_frames.last().unwrap().history_is_compact());
+
+        let mut oldest_frames = frames();
+        let mut oldest_idx = 0;
+        append_snapshot(&mut oldest_frames, &mut oldest_idx, true, next(300));
+        assert_eq!(oldest_idx, 0);
+        assert_eq!(oldest_frames[oldest_idx].global_usage, 1.0);
+        for value in 301..=305 {
+            append_snapshot(&mut oldest_frames, &mut oldest_idx, true, next(value));
+        }
+        assert_eq!(oldest_frames.len(), MAX_SNAPSHOTS);
+        assert_eq!(oldest_frames[0].global_usage, 6.0);
+        assert_eq!(oldest_frames.last().unwrap().global_usage, 305.0);
+    }
 
     #[test]
     fn test_snapshot_navigation_and_clamping() {

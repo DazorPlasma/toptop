@@ -15,6 +15,8 @@ static ALLOCATOR: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
 mod app;
 /// Process telemetry and table sorting module.
 mod process;
+/// Per-process TCP diagnostics and privileged packet-capture sampling.
+mod process_network;
 /// Point-in-time telemetry snapshots and history buffers.
 mod snapshot;
 /// System telemetry and hardware probe module.

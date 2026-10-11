@@ -4,6 +4,8 @@
   makeWrapper,
   dust,
   mesa-demos,
+  iproute2,
+  nethogs,
 }:
 rustPlatform.buildRustPackage {
   pname = "toptop";
@@ -21,7 +23,7 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     wrapProgram $out/bin/toptop \
-      --prefix PATH : ${lib.makeBinPath [dust mesa-demos]}
+      --prefix PATH : ${lib.makeBinPath [dust mesa-demos iproute2 nethogs]}
   '';
 
   meta = with lib; {

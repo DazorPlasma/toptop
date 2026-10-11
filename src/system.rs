@@ -5,7 +5,7 @@
 //! `/sys/class/net`, and `/proc/diskstats`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -715,6 +715,8 @@ pub struct GpuMetrics {
     pub pcie_link: String,
     /// GPU core busy percentage (0.0 to 100.0).
     pub utilization_pct: f64,
+    /// Whether the driver supplied a GPU busy reading.
+    pub utilization_available: bool,
     /// Allocated dedicated VRAM memory in megabytes.
     pub vram_used_mb: u64,
     /// Total available dedicated VRAM capacity in megabytes.
@@ -861,6 +863,7 @@ pub fn read_gpu_metrics() -> GpuMetrics {
         memory_vendor: String::new(),
         pcie_link: String::new(),
         utilization_pct: 0.0,
+        utilization_available: false,
         vram_used_mb: 0,
         vram_total_mb: 0,
         gtt_used_mb: 0,
@@ -938,6 +941,7 @@ pub fn read_gpu_metrics() -> GpuMetrics {
                         && let Ok(busy) = busy_str.trim().parse::<f64>()
                     {
                         metrics.utilization_pct = busy;
+                        metrics.utilization_available = true;
                     }
 
                     if let Ok(total_str) = fs::read_to_string(dev_path.join("mem_info_vram_total"))
@@ -1118,7 +1122,7 @@ pub fn read_gpu_metrics() -> GpuMetrics {
                         metrics.max_mhz = 2500.0;
                     }
 
-                    if metrics.vram_total_mb > 0 || metrics.utilization_pct > 0.0 {
+                    if metrics.vram_total_mb > 0 || metrics.utilization_available {
                         return metrics;
                     }
                 }
@@ -1789,9 +1793,7 @@ fn probe_hardware_ram() -> Option<(String, String)> {
                 "/usr/sbin/dmidecode",
                 "/sbin/dmidecode",
             ] {
-                if let Ok(output) = std::process::Command::new(bin)
-                    .args(["-t", "17"])
-                    .output()
+                if let Ok(output) = std::process::Command::new(bin).args(["-t", "17"]).output()
                     && output.status.success()
                 {
                     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3375,9 +3377,19 @@ pub struct DnsResolver {
     /// Static IP-to-hostname map loaded from `/etc/hostname`, `/etc/hosts`, and `/proc/net/fib_trie`.
     static_hosts: HashMap<IpAddr, String>,
     /// Thread-safe map of cached resolved hostnames.
-    cache: Arc<Mutex<HashMap<IpAddr, Option<String>>>>,
+    cache: Arc<Mutex<DnsCache>>,
     /// Channel sender for requesting async reverse DNS resolution.
     req_tx: Sender<IpAddr>,
+}
+
+const DNS_CACHE_LIMIT: usize = 2048;
+const DNS_PENDING_LIMIT: usize = 128;
+
+#[derive(Default)]
+struct DnsCache {
+    resolved: HashMap<IpAddr, Option<String>>,
+    insertion_order: VecDeque<IpAddr>,
+    pending: HashSet<IpAddr>,
 }
 
 impl Default for DnsResolver {
@@ -3390,30 +3402,24 @@ impl DnsResolver {
     /// Creates a new background DNS resolver worker.
     pub fn new() -> Self {
         let static_hosts = get_local_hosts_map();
-        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let cache = Arc::new(Mutex::new(DnsCache::default()));
         let (req_tx, req_rx): (Sender<IpAddr>, Receiver<IpAddr>) = channel();
         let cache_clone = Arc::clone(&cache);
 
         std::thread::Builder::new()
             .name("dns-resolver".to_string())
             .spawn(move || {
-                let mut requested: HashSet<IpAddr> = HashSet::new();
                 while let Ok(ip) = req_rx.recv() {
-                    if requested.contains(&ip) {
-                        continue;
-                    }
-                    requested.insert(ip);
-
-                    if ip.is_loopback() || ip.is_unspecified() {
-                        if let Ok(mut c) = cache_clone.lock() {
-                            c.insert(ip, Some("localhost".to_string()));
-                        }
-                        continue;
-                    }
-
                     let resolved = reverse_dns_lookup(ip);
                     if let Ok(mut c) = cache_clone.lock() {
-                        c.insert(ip, resolved);
+                        c.pending.remove(&ip);
+                        if c.resolved.len() >= DNS_CACHE_LIMIT
+                            && let Some(oldest) = c.insertion_order.pop_front()
+                        {
+                            c.resolved.remove(&oldest);
+                        }
+                        c.insertion_order.push_back(ip);
+                        c.resolved.insert(ip, resolved);
                     }
                 }
             })
@@ -3434,12 +3440,25 @@ impl DnsResolver {
         if let Some(host) = self.static_hosts.get(&ip) {
             return Some(host.clone());
         }
-        if let Ok(c) = self.cache.lock()
-            && let Some(cached) = c.get(&ip)
-        {
-            return cached.clone();
+        if let Ok(mut c) = self.cache.lock() {
+            if let Some(cached) = c.resolved.get(&ip) {
+                return cached.clone();
+            }
+            if !c.pending.insert(ip) {
+                return None;
+            }
+            if c.pending.len() > DNS_PENDING_LIMIT {
+                c.pending.remove(&ip);
+                return None;
+            }
+        } else {
+            return None;
         }
-        let _ = self.req_tx.send(ip);
+        if self.req_tx.send(ip).is_err()
+            && let Ok(mut c) = self.cache.lock()
+        {
+            c.pending.remove(&ip);
+        }
         None
     }
 }

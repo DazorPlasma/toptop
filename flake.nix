@@ -56,6 +56,8 @@
             openssl
             dust
             mesa-demos
+            iproute2
+            nethogs
           ];
 
           env = {

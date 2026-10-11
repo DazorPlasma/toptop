@@ -318,8 +318,8 @@ impl App {
             let targets: Vec<ProcessTarget> = if target.grouped_pids.is_empty() {
                 vec![ProcessTarget {
                     pid: target.pid,
-                    comm: target.comm.clone(),
-                    name: target.name.clone(),
+                    comm: target.comm.to_string(),
+                    name: target.name.to_string(),
                 }]
             } else {
                 target
@@ -328,13 +328,13 @@ impl App {
                     .map(|&pid| match proc_map.get(&pid) {
                         Some(p) => ProcessTarget {
                             pid,
-                            comm: p.comm.clone(),
-                            name: p.name.clone(),
+                            comm: p.comm.to_string(),
+                            name: p.name.to_string(),
                         },
                         None => ProcessTarget {
                             pid,
-                            comm: target.comm.clone(),
-                            name: target.name.clone(),
+                            comm: target.comm.to_string(),
+                            name: target.name.to_string(),
                         },
                     })
                     .collect()
@@ -355,8 +355,8 @@ impl App {
             .find(|p| p.pid == detail_pid)
             .map(|p| ProcessTarget {
                 pid: p.pid,
-                comm: p.comm.clone(),
-                name: p.name.clone(),
+                comm: p.comm.to_string(),
+                name: p.name.to_string(),
             });
         if let Some(target) = target {
             let display_name = target.name.clone();

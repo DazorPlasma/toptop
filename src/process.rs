@@ -1,14 +1,239 @@
 //! Process telemetry and metrics inspection module.
 //!
-//! Handles parsing `/proc` filesystem entries to track CPU usage, memory consumption (VmRSS),
-//! threads, user ownership, I/O rates, and GPU memory heuristics for active Linux processes.
+//! Handles parsing `/proc` filesystem entries to track CPU usage, resident memory,
+//! threads, user ownership, disk I/O rates, and driver-reported GPU memory.
 
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    sync::Arc,
 };
 
 use crate::utils::fuzzy_match;
+
+/// Small binary writer used for in-memory historical data archives.
+///
+/// The archive format is private to this process. Integer fields use varints
+/// where that saves space; floating point fields are stored by their exact bit
+/// pattern so archiving never rounds telemetry values.
+pub(crate) struct ArchiveWriter {
+    bytes: Vec<u8>,
+}
+
+impl ArchiveWriter {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn byte(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    pub(crate) fn varint(&mut self, mut value: u64) {
+        while value >= 0x80 {
+            self.bytes.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        self.bytes.push(value as u8);
+    }
+
+    pub(crate) fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pub(crate) fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pub(crate) fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pub(crate) fn f64(&mut self, value: f64) {
+        self.u64(value.to_bits());
+    }
+
+    pub(crate) fn compact_f64(&mut self, value: f64) {
+        if value.to_bits() == 0 {
+            self.byte(0);
+        } else {
+            self.byte(1);
+            self.f64(value);
+        }
+    }
+
+    pub(crate) fn string(&mut self, value: &str) {
+        self.varint(value.len() as u64);
+        self.bytes.extend_from_slice(value.as_bytes());
+    }
+
+    pub(crate) fn string_id(&mut self, value: usize) {
+        self.varint(value as u64);
+    }
+
+    pub(crate) fn finish(self) -> Arc<[u8]> {
+        Arc::from(self.bytes)
+    }
+}
+
+/// Reader for bytes emitted by [`ArchiveWriter`].
+pub(crate) struct ArchiveReader<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> ArchiveReader<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
+    }
+
+    pub(crate) fn byte(&mut self) -> u8 {
+        let value = *self
+            .bytes
+            .get(self.cursor)
+            .expect("truncated in-memory history archive");
+        self.cursor += 1;
+        value
+    }
+
+    pub(crate) fn varint(&mut self) -> u64 {
+        let mut value = 0u64;
+        for shift in (0..=63).step_by(7) {
+            let byte = self.byte();
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+        }
+        panic!("invalid varint in in-memory history archive");
+    }
+
+    pub(crate) fn usize(&mut self) -> usize {
+        usize::try_from(self.varint()).expect("history archive length exceeds address space")
+    }
+
+    pub(crate) fn u16(&mut self) -> u16 {
+        u16::from_le_bytes(self.fixed())
+    }
+
+    pub(crate) fn u32(&mut self) -> u32 {
+        u32::from_le_bytes(self.fixed())
+    }
+
+    pub(crate) fn u64(&mut self) -> u64 {
+        u64::from_le_bytes(self.fixed())
+    }
+
+    pub(crate) fn f64(&mut self) -> f64 {
+        f64::from_bits(self.u64())
+    }
+
+    pub(crate) fn compact_f64(&mut self) -> f64 {
+        if self.byte() == 0 { 0.0 } else { self.f64() }
+    }
+
+    pub(crate) fn string(&mut self) -> String {
+        let len = self.usize();
+        let end = self
+            .cursor
+            .checked_add(len)
+            .expect("history archive string length overflow");
+        let bytes = self
+            .bytes
+            .get(self.cursor..end)
+            .expect("truncated string in in-memory history archive");
+        self.cursor = end;
+        String::from_utf8(bytes.to_vec()).expect("invalid UTF-8 in in-memory history archive")
+    }
+
+    pub(crate) fn string_id(&mut self, table_len: usize) -> usize {
+        let id = self.usize();
+        assert!(id < table_len, "invalid string id in history archive");
+        id
+    }
+
+    fn fixed<const N: usize>(&mut self) -> [u8; N] {
+        let end = self
+            .cursor
+            .checked_add(N)
+            .expect("history archive offset overflow");
+        let bytes: [u8; N] = self
+            .bytes
+            .get(self.cursor..end)
+            .expect("truncated in-memory history archive")
+            .try_into()
+            .expect("fixed-size archive field has wrong length");
+        self.cursor = end;
+        bytes
+    }
+}
+
+/// Deduplicates strings within a single archived sample.
+pub(crate) struct ArchiveStringTable<'a> {
+    ids: HashMap<&'a str, usize>,
+    values: Vec<&'a str>,
+    shared: Vec<Option<Arc<str>>>,
+}
+
+impl<'a> ArchiveStringTable<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            ids: HashMap::new(),
+            values: Vec::new(),
+            shared: Vec::new(),
+        }
+    }
+
+    pub(crate) fn intern(&mut self, value: &'a str) -> usize {
+        if let Some(&id) = self.ids.get(value) {
+            return id;
+        }
+        let id = self.values.len();
+        self.values.push(value);
+        self.shared.push(None);
+        self.ids.insert(value, id);
+        id
+    }
+
+    pub(crate) fn intern_arc(&mut self, value: &'a Arc<str>) -> usize {
+        if let Some(&id) = self.ids.get(value.as_ref()) {
+            if self.shared[id].is_none() {
+                self.shared[id] = Some(value.clone());
+            }
+            return id;
+        }
+        let id = self.values.len();
+        self.values.push(value.as_ref());
+        self.shared.push(Some(value.clone()));
+        self.ids.insert(value.as_ref(), id);
+        id
+    }
+
+    pub(crate) fn id(&self, value: &str) -> usize {
+        *self
+            .ids
+            .get(value)
+            .expect("string was not added to history archive table")
+    }
+
+    pub(crate) fn values(&self) -> &[&'a str] {
+        &self.values
+    }
+
+    pub(crate) fn shared_values(&self) -> Vec<Arc<str>> {
+        self.values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                self.shared[index]
+                    .clone()
+                    .unwrap_or_else(|| Arc::<str>::from(*value))
+            })
+            .collect()
+    }
+}
 
 /// Represents detailed system telemetry and resource utilization for a running process.
 #[derive(Clone, Default)]
@@ -18,13 +243,15 @@ pub struct ProcessInfo {
     /// Parent Process Identifier (PPID).
     pub ppid: u32,
     /// Short executable command name from `/proc/[pid]/comm` or `/proc/[pid]/status`.
-    pub comm: String,
+    pub comm: Arc<str>,
     /// Process executable name or full command line invocation.
-    pub name: String,
+    pub name: Arc<str>,
     /// Process execution state (e.g. `R` for Running, `S` for Sleeping, `D` for Disk Sleep).
     pub state: String,
-    /// Resident Set Size (RSS) memory consumption in kilobytes.
+    /// Resident Set Size (RSS) from `/proc/[pid]/status` in kilobytes.
     pub rss_kb: u64,
+    /// Process start time from `/proc/[pid]/stat`, used to distinguish PID reuse.
+    pub starttime_ticks: u64,
     /// User mode CPU ticks from `/proc/[pid]/stat`.
     pub utime: u64,
     /// Kernel mode CPU ticks from `/proc/[pid]/stat`.
@@ -38,23 +265,27 @@ pub struct ProcessInfo {
     /// Numerical User ID owning the process.
     pub uid: u32,
     /// Human-readable username resolved from `/etc/passwd`.
-    pub user: String,
+    pub user: Arc<str>,
     /// Real-time calculated CPU utilization percentage.
     pub cpu_percent: f64,
     /// Calculated disk read speed in bytes per second.
     pub read_speed: f64,
     /// Calculated disk write speed in bytes per second.
     pub write_speed: f64,
-    /// Estimated network receive rate in bytes per second.
-    pub net_rx_speed: f64,
-    /// Estimated network transmit rate in bytes per second.
-    pub net_tx_speed: f64,
-    /// Estimated or reported GPU core utilization percentage.
-    pub gpu_percent: f64,
-    /// Reported DRM or estimated GPU VRAM usage in kilobytes.
-    pub gpu_mem_kb: u64,
-    /// Proportional Set Size (PSS) true physical memory share in kilobytes.
-    pub pss_kb: u64,
+    /// Per-process network receive rate, when a reliable source is available.
+    pub net_rx_speed: Option<f64>,
+    /// Per-process network transmit rate, when a reliable source is available.
+    pub net_tx_speed: Option<f64>,
+    /// Group network total excludes one or more members without measurements.
+    pub net_partial: bool,
+    /// Busiest DRM engine utilization across the process's clients, when available.
+    pub gpu_percent: Option<f64>,
+    /// GPU engine state is allocated only for processes with DRM engine counters.
+    pub gpu_sample: Option<Box<GpuProcessSample>>,
+    /// Driver-reported process VRAM allocation in kilobytes, when available.
+    pub gpu_mem_kb: Option<u64>,
+    /// Proportional Set Size (PSS) from `/proc/[pid]/smaps_rollup`, when readable.
+    pub pss_kb: Option<u64>,
     /// List of PIDs contained in this group if aggregated in simple view.
     pub grouped_pids: Vec<u32>,
     /// Indicates whether this row represents a collapsible group header in simple view.
@@ -63,6 +294,272 @@ pub struct ProcessInfo {
     pub is_group_child: bool,
     /// Identifier of the group this row belongs to.
     pub group_name: Option<String>,
+}
+
+/// Driver counters used across polls, plus per-engine rates used by grouped rows.
+#[derive(Clone, Default)]
+pub struct GpuProcessSample {
+    pub engine_ns: HashMap<String, u64>,
+    pub engine_capacity: HashMap<String, u64>,
+    pub engine_percent: HashMap<String, f64>,
+    pub counter_regressed: bool,
+}
+
+/// Lossless compact representation of process rows kept in inactive snapshots.
+///
+/// Primitive values are serialized without precision loss, and strings are
+/// deduplicated within the sample. The byte buffer is reference counted so a
+/// cloned snapshot shares its archive until one copy is materialized.
+#[derive(Clone, Debug, Default)]
+pub struct ArchivedProcessList {
+    bytes: Arc<[u8]>,
+    strings: Arc<[Arc<str>]>,
+}
+
+impl ArchivedProcessList {
+    pub(crate) fn encode(processes: &[ProcessInfo]) -> Self {
+        let mut strings = ArchiveStringTable::new();
+        for process in processes {
+            strings.intern_arc(&process.comm);
+            strings.intern_arc(&process.name);
+            strings.intern(&process.state);
+            strings.intern_arc(&process.user);
+            if let Some(sample) = &process.gpu_sample {
+                for key in sample
+                    .engine_ns
+                    .keys()
+                    .chain(sample.engine_capacity.keys())
+                    .chain(sample.engine_percent.keys())
+                {
+                    strings.intern(key);
+                }
+            }
+            if let Some(name) = &process.group_name {
+                strings.intern(name);
+            }
+        }
+
+        let mut out = ArchiveWriter::with_capacity(processes.len().saturating_mul(96));
+        out.byte(2); // Archive format version; shared strings are stored separately.
+        out.varint(processes.len() as u64);
+        for process in processes {
+            out.varint(u64::from(process.pid));
+            out.varint(u64::from(process.ppid));
+            out.string_id(strings.id(&process.comm));
+            out.string_id(strings.id(&process.name));
+            out.string_id(strings.id(&process.state));
+            out.varint(process.rss_kb);
+            out.varint(process.starttime_ticks);
+            out.varint(process.utime);
+            out.varint(process.stime);
+            out.varint(process.read_bytes);
+            out.varint(process.write_bytes);
+            out.varint(u64::from(process.threads));
+            out.varint(u64::from(process.uid));
+            out.string_id(strings.id(&process.user));
+            out.compact_f64(process.cpu_percent);
+            out.compact_f64(process.read_speed);
+            out.compact_f64(process.write_speed);
+            write_optional_f64(&mut out, process.net_rx_speed);
+            write_optional_f64(&mut out, process.net_tx_speed);
+            out.byte(u8::from(process.net_partial));
+            write_optional_f64(&mut out, process.gpu_percent);
+            match &process.gpu_sample {
+                Some(sample) => {
+                    out.byte(1);
+                    write_u64_map(&mut out, &strings, &sample.engine_ns);
+                    write_u64_map(&mut out, &strings, &sample.engine_capacity);
+                    write_f64_map(&mut out, &strings, &sample.engine_percent);
+                    out.byte(u8::from(sample.counter_regressed));
+                }
+                None => out.byte(0),
+            }
+            write_optional_u64(&mut out, process.gpu_mem_kb);
+            write_optional_u64(&mut out, process.pss_kb);
+            out.varint(process.grouped_pids.len() as u64);
+            for &pid in &process.grouped_pids {
+                out.varint(u64::from(pid));
+            }
+            out.byte(u8::from(process.is_group_header));
+            out.byte(u8::from(process.is_group_child));
+            match &process.group_name {
+                Some(name) => {
+                    out.byte(1);
+                    out.string_id(strings.id(name));
+                }
+                None => out.byte(0),
+            }
+        }
+
+        Self {
+            bytes: out.finish(),
+            strings: Arc::from(strings.shared_values()),
+        }
+    }
+
+    pub(crate) fn materialize(&self) -> Vec<ProcessInfo> {
+        let mut input = ArchiveReader::new(&self.bytes);
+        assert_eq!(
+            input.byte(),
+            2,
+            "unsupported process history archive version"
+        );
+        let strings = self.strings.as_ref();
+        let process_count = input.usize();
+        let mut processes = Vec::with_capacity(process_count);
+        for _ in 0..process_count {
+            let pid = u32::try_from(input.varint()).expect("invalid PID in history archive");
+            let ppid = u32::try_from(input.varint()).expect("invalid PPID in history archive");
+            let comm = strings[input.string_id(strings.len())].clone();
+            let name = strings[input.string_id(strings.len())].clone();
+            let state = strings[input.string_id(strings.len())].to_string();
+            let rss_kb = input.varint();
+            let starttime_ticks = input.varint();
+            let utime = input.varint();
+            let stime = input.varint();
+            let read_bytes = input.varint();
+            let write_bytes = input.varint();
+            let threads =
+                u32::try_from(input.varint()).expect("invalid thread count in history archive");
+            let uid = u32::try_from(input.varint()).expect("invalid UID in history archive");
+            let user = strings[input.string_id(strings.len())].clone();
+            let cpu_percent = input.compact_f64();
+            let read_speed = input.compact_f64();
+            let write_speed = input.compact_f64();
+            let net_rx_speed = read_optional_f64(&mut input);
+            let net_tx_speed = read_optional_f64(&mut input);
+            let net_partial = input.byte() != 0;
+            let gpu_percent = read_optional_f64(&mut input);
+            let gpu_sample = if input.byte() != 0 {
+                Some(Box::new(GpuProcessSample {
+                    engine_ns: read_u64_map(&mut input, &strings),
+                    engine_capacity: read_u64_map(&mut input, &strings),
+                    engine_percent: read_f64_map(&mut input, &strings),
+                    counter_regressed: input.byte() != 0,
+                }))
+            } else {
+                None
+            };
+            let gpu_mem_kb = read_optional_u64(&mut input);
+            let pss_kb = read_optional_u64(&mut input);
+            let grouped_pid_count = input.usize();
+            let mut grouped_pids = Vec::with_capacity(grouped_pid_count);
+            for _ in 0..grouped_pid_count {
+                grouped_pids.push(
+                    u32::try_from(input.varint()).expect("invalid grouped PID in history archive"),
+                );
+            }
+            let is_group_header = input.byte() != 0;
+            let is_group_child = input.byte() != 0;
+            let group_name = if input.byte() != 0 {
+                Some(strings[input.string_id(strings.len())].to_string())
+            } else {
+                None
+            };
+
+            processes.push(ProcessInfo {
+                pid,
+                ppid,
+                comm,
+                name,
+                state,
+                rss_kb,
+                starttime_ticks,
+                utime,
+                stime,
+                read_bytes,
+                write_bytes,
+                threads,
+                uid,
+                user,
+                cpu_percent,
+                read_speed,
+                write_speed,
+                net_rx_speed,
+                net_tx_speed,
+                net_partial,
+                gpu_percent,
+                gpu_sample,
+                gpu_mem_kb,
+                pss_kb,
+                grouped_pids,
+                is_group_header,
+                is_group_child,
+                group_name,
+            });
+        }
+        processes
+    }
+}
+
+fn write_optional_f64(out: &mut ArchiveWriter, value: Option<f64>) {
+    if let Some(value) = value {
+        out.byte(1);
+        out.compact_f64(value);
+    } else {
+        out.byte(0);
+    }
+}
+
+fn read_optional_f64(input: &mut ArchiveReader<'_>) -> Option<f64> {
+    (input.byte() != 0).then(|| input.compact_f64())
+}
+
+fn write_optional_u64(out: &mut ArchiveWriter, value: Option<u64>) {
+    if let Some(value) = value {
+        out.byte(1);
+        out.varint(value);
+    } else {
+        out.byte(0);
+    }
+}
+
+fn read_optional_u64(input: &mut ArchiveReader<'_>) -> Option<u64> {
+    (input.byte() != 0).then(|| input.varint())
+}
+
+fn write_u64_map(
+    out: &mut ArchiveWriter,
+    strings: &ArchiveStringTable<'_>,
+    map: &HashMap<String, u64>,
+) {
+    out.varint(map.len() as u64);
+    for (key, value) in map {
+        out.string_id(strings.id(key));
+        out.varint(*value);
+    }
+}
+
+fn read_u64_map(input: &mut ArchiveReader<'_>, strings: &[Arc<str>]) -> HashMap<String, u64> {
+    let count = input.usize();
+    let mut map = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let key = strings[input.string_id(strings.len())].to_string();
+        map.insert(key, input.varint());
+    }
+    map
+}
+
+fn write_f64_map(
+    out: &mut ArchiveWriter,
+    strings: &ArchiveStringTable<'_>,
+    map: &HashMap<String, f64>,
+) {
+    out.varint(map.len() as u64);
+    for (key, value) in map {
+        out.string_id(strings.id(key));
+        out.compact_f64(*value);
+    }
+}
+
+fn read_f64_map(input: &mut ArchiveReader<'_>, strings: &[Arc<str>]) -> HashMap<String, f64> {
+    let count = input.usize();
+    let mut map = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let key = strings[input.string_id(strings.len())].to_string();
+        map.insert(key, input.compact_f64());
+    }
+    map
 }
 
 /// Target process details for termination/kill validation.
@@ -105,6 +602,12 @@ pub struct ProcessErrorPopup {
 pub struct ProcessDetailInfo {
     /// Basic process telemetry snapshot.
     pub info: ProcessInfo,
+    /// Whether this detail page is viewing a saved snapshot rather than the latest live view.
+    pub snapshot_is_historical: bool,
+    /// Whether the current PID has been reused by a different process since this snapshot.
+    pub pid_reused: bool,
+    /// Whether a matching live `/proc/[pid]` entry was available for extra detail.
+    pub live_metadata_available: bool,
     /// Parent process command name.
     pub parent_comm: String,
     /// Target binary executable path from `/proc/[pid]/exe`.
@@ -156,7 +659,7 @@ pub enum ProcessSortColumn {
     Threads,
     /// Sort by CPU usage percentage.
     Cpu,
-    /// Sort by memory consumption (VmRSS).
+    /// Sort by resident set size (RSS).
     Mem,
     /// Sort by GPU core utilization percentage.
     Gpu,
@@ -195,6 +698,43 @@ pub const ADVANCED_SORT_COLUMNS: [ProcessSortColumn; 11] = [
     ProcessSortColumn::Net,
 ];
 
+fn compare_optional<T>(
+    a: &Option<T>,
+    b: &Option<T>,
+    ascending: bool,
+    compare: impl FnOnce(&T, &T) -> std::cmp::Ordering,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let ordering = compare(a, b);
+            if ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn optional_rate_max(rx: Option<f64>, tx: Option<f64>) -> Option<f64> {
+    match (rx, tx) {
+        (Some(rx), Some(tx)) => Some(rx.max(tx)),
+        (Some(rate), None) | (None, Some(rate)) => Some(rate),
+        (None, None) => None,
+    }
+}
+
+fn sum_optional_u64(values: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    values.into_iter().try_fold(0u64, |total, value| {
+        value.map(|value| total.saturating_add(value))
+    })
+}
+
 /// Sorts an in-memory slice of `ProcessInfo` entries in place according to the specified column and direction.
 ///
 /// # Arguments
@@ -214,25 +754,36 @@ pub fn sort_processes(processes: &mut [ProcessInfo], sort_col: ProcessSortColumn
                 .partial_cmp(&b.cpu_percent)
                 .unwrap_or(std::cmp::Ordering::Equal),
             ProcessSortColumn::Mem => a.rss_kb.cmp(&b.rss_kb),
-            ProcessSortColumn::Gpu => a
-                .gpu_percent
-                .partial_cmp(&b.gpu_percent)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            ProcessSortColumn::GpuMem => a.gpu_mem_kb.cmp(&b.gpu_mem_kb),
+            ProcessSortColumn::Gpu => {
+                compare_optional(&a.gpu_percent, &b.gpu_percent, ascending, |a, b| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            }
+            ProcessSortColumn::GpuMem => {
+                compare_optional(&a.gpu_mem_kb, &b.gpu_mem_kb, ascending, u64::cmp)
+            }
             ProcessSortColumn::Io => {
                 let a_io = a.read_speed.max(a.write_speed);
                 let b_io = b.read_speed.max(b.write_speed);
                 a_io.partial_cmp(&b_io).unwrap_or(std::cmp::Ordering::Equal)
             }
-            ProcessSortColumn::Net => {
-                let a_net = a.net_rx_speed.max(a.net_tx_speed);
-                let b_net = b.net_rx_speed.max(b.net_tx_speed);
-                a_net
-                    .partial_cmp(&b_net)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
+            ProcessSortColumn::Net => compare_optional(
+                &optional_rate_max(a.net_rx_speed, a.net_tx_speed),
+                &optional_rate_max(b.net_rx_speed, b.net_tx_speed),
+                ascending,
+                |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+            ),
         };
-        if ascending { cmp } else { cmp.reverse() }
+        if matches!(
+            sort_col,
+            ProcessSortColumn::Gpu | ProcessSortColumn::GpuMem | ProcessSortColumn::Net
+        ) {
+            cmp
+        } else if ascending {
+            cmp
+        } else {
+            cmp.reverse()
+        }
     });
 }
 
@@ -260,23 +811,34 @@ pub fn parse_drm_memory_kb(line: &str) -> u64 {
     }
 }
 
-/// Reads the total active GPU memory (VRAM / GTT) in KiB allocated by a process from `/proc/[pid]/fdinfo`.
-pub fn read_process_gpu_mem_kb(pid: u32) -> u64 {
-    let mut client_map: HashMap<u64, (u64, u64)> = HashMap::new();
-    let mut anon_client_idx = 1_000_000u64;
+/// Reads driver-reported GPU memory and engine counters from `/proc/[pid]/fdinfo`.
+///
+/// GTT/system-memory counters are deliberately excluded: they are not VRAM, and the
+/// process table compares this value with the device's VRAM capacity.
+fn read_process_gpu_stats(pid: u32) -> (Option<u64>, HashMap<String, u64>, HashMap<String, u64>) {
+    type ClientStats = (Option<u64>, HashMap<String, u64>, HashMap<String, u64>);
+    let mut client_map: HashMap<(String, String), ClientStats> = HashMap::new();
 
     if let Ok(fd_entries) = fs::read_dir(format!("/proc/{}/fdinfo", pid)) {
         for fd_entry in fd_entries.filter_map(Result::ok) {
             if let Ok(fd_content) = fs::read_to_string(fd_entry.path()) {
                 let mut is_drm = false;
+                let mut pdev = None;
                 let mut client_id = None;
-                let mut vram_kb = 0u64;
-                let mut gtt_kb = 0u64;
+                let mut vram_kb = None;
+                let mut engine_ns = HashMap::new();
+                let mut engine_capacity = HashMap::new();
 
                 for line in fd_content.lines() {
                     let trimmed = line.trim();
                     if trimmed.starts_with("drm-driver:") {
                         is_drm = true;
+                    } else if trimmed.starts_with("drm-pdev:") {
+                        is_drm = true;
+                        pdev = trimmed
+                            .split_once(':')
+                            .map(|(_, value)| value.trim().to_string())
+                            .filter(|value| !value.is_empty());
                     } else if trimmed.starts_with("drm-client-id:") {
                         is_drm = true;
                         if let Some(id_str) = trimmed.split_whitespace().nth(1)
@@ -288,56 +850,94 @@ pub fn read_process_gpu_mem_kb(pid: u32) -> u64 {
                         || trimmed.starts_with("drm-resident-local:")
                         || trimmed.starts_with("drm-memory-vram:")
                         || trimmed.starts_with("drm-memory-local:")
-                        || trimmed.starts_with("amd-requested-vram:")
                     {
                         is_drm = true;
                         let parsed = parse_drm_memory_kb(trimmed);
-                        vram_kb = vram_kb.max(parsed);
-                    } else if trimmed.starts_with("drm-total-vram:")
-                        || trimmed.starts_with("drm-total-local:")
+                        vram_kb = Some(vram_kb.unwrap_or(0).max(parsed));
+                    } else if let Some((key, value)) = trimmed.split_once(':')
+                        && let Some(engine) = key.strip_prefix("drm-engine-capacity-")
+                        && let Some(capacity) = value.trim().parse::<u64>().ok()
+                        && capacity > 0
                     {
                         is_drm = true;
-                        let parsed = parse_drm_memory_kb(trimmed);
-                        if vram_kb == 0 {
-                            vram_kb = parsed;
-                        }
-                    } else if trimmed.starts_with("drm-resident-gtt:")
-                        || trimmed.starts_with("drm-memory-gtt:")
-                        || trimmed.starts_with("amd-requested-gtt:")
+                        engine_capacity.insert(engine.to_string(), capacity);
+                    } else if let Some((key, value)) = trimmed.split_once(':')
+                        && let Some(engine) = key.strip_prefix("drm-engine-")
+                        && !engine.starts_with("capacity-")
+                        && value
+                            .split_whitespace()
+                            .nth(1)
+                            .is_some_and(|unit| unit.eq_ignore_ascii_case("ns"))
+                        && let Some(ns) = value
+                            .split_whitespace()
+                            .next()
+                            .and_then(|value| value.parse::<u64>().ok())
                     {
                         is_drm = true;
-                        let parsed = parse_drm_memory_kb(trimmed);
-                        gtt_kb = gtt_kb.max(parsed);
-                    } else if trimmed.starts_with("drm-total-gtt:") {
-                        is_drm = true;
-                        let parsed = parse_drm_memory_kb(trimmed);
-                        if gtt_kb == 0 {
-                            gtt_kb = parsed;
-                        }
+                        engine_ns
+                            .entry(engine.to_string())
+                            .and_modify(|current: &mut u64| *current = (*current).max(ns))
+                            .or_insert(ns);
                     }
                 }
 
                 if is_drm {
-                    let id = client_id.unwrap_or_else(|| {
-                        anon_client_idx += 1;
-                        anon_client_idx
-                    });
-                    let entry = client_map.entry(id).or_insert((0, 0));
-                    entry.0 = entry.0.max(vram_kb);
-                    entry.1 = entry.1.max(gtt_kb);
+                    let device_key = pdev.unwrap_or_else(|| "unknown-device".to_string());
+                    let client_key =
+                        client_id
+                            .map(|id| format!("client:{id}"))
+                            .unwrap_or_else(|| {
+                                format!("fd:{}", fd_entry.file_name().to_string_lossy())
+                            });
+                    let entry = client_map
+                        .entry((device_key, client_key))
+                        .or_insert_with(|| (None, HashMap::new(), HashMap::new()));
+                    if let Some(vram_kb) = vram_kb {
+                        entry.0 = Some(entry.0.unwrap_or(0).max(vram_kb));
+                    }
+                    for (engine, ns) in engine_ns {
+                        entry
+                            .1
+                            .entry(engine)
+                            .and_modify(|current| *current = (*current).max(ns))
+                            .or_insert(ns);
+                    }
+                    for (engine, capacity) in engine_capacity {
+                        entry.2.insert(engine, capacity);
+                    }
                 }
             }
         }
     }
 
-    let total_vram: u64 = client_map.values().map(|(v, _)| *v).sum();
-    let total_gtt: u64 = client_map.values().map(|(_, g)| *g).sum();
-
-    if total_vram > 0 {
-        total_vram
-    } else {
-        total_gtt
+    let mut total_vram_kb = 0u64;
+    let mut has_vram_usage = false;
+    let mut total_engine_ns = HashMap::new();
+    let mut total_engine_capacity = HashMap::new();
+    for ((device, _client), (vram_kb, engines, capacity)) in client_map {
+        if let Some(vram_kb) = vram_kb {
+            total_vram_kb = total_vram_kb.saturating_add(vram_kb);
+            has_vram_usage = true;
+        }
+        for (engine, ns) in engines {
+            let key = format!("{device}/{engine}");
+            total_engine_ns
+                .entry(key.clone())
+                .and_modify(|total: &mut u64| *total = total.saturating_add(ns))
+                .or_insert(ns);
+            let count = capacity.get(&engine).copied().unwrap_or(1);
+            total_engine_capacity
+                .entry(key)
+                .and_modify(|current: &mut u64| *current = (*current).max(count))
+                .or_insert(count);
+        }
     }
+
+    (
+        has_vram_usage.then_some(total_vram_kb),
+        total_engine_ns,
+        total_engine_capacity,
+    )
 }
 
 /// Queries NVIDIA proprietary driver GPU memory allocations per PID using nvidia-smi if available.
@@ -386,8 +986,10 @@ pub fn read_nvidia_gpu_mem() -> HashMap<u32, u64> {
 
 /// Reads and parses all running processes from the `/proc` virtual filesystem.
 ///
-/// Computes delta rates for CPU percentage, disk read/write throughput, and network speeds
-/// by comparing current metrics against previous sample snapshots.
+/// Computes delta rates for CPU percentage and disk read/write throughput by
+/// comparing current counters against the previous process sample. Linux does
+/// not expose a reliable per-process network counter through these sources, so
+/// network rates remain unavailable instead of being inferred from disk I/O.
 ///
 /// # Arguments
 /// * `prev_procs` - Cache of previous process states keyed by PID.
@@ -416,37 +1018,21 @@ pub fn read_processes(
                 };
 
                 if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
-                    let mut rss_anon = 0u64;
-                    let mut rss_shmem = 0u64;
-                    let mut vm_rss = 0u64;
                     for line in status.lines() {
                         if line.starts_with("Name:") {
-                            p.comm = line.trim_start_matches("Name:").trim().to_string();
+                            p.comm = Arc::from(line.trim_start_matches("Name:").trim());
                             p.name = p.comm.clone();
                         } else if line.starts_with("State:") {
                             p.state = line.trim_start_matches("State:").trim().to_string();
-                        } else if line.starts_with("RssAnon:") {
-                            let mut parts = line.split_whitespace();
-                            parts.next();
-                            rss_anon = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                        } else if line.starts_with("RssShmem:") {
-                            let mut parts = line.split_whitespace();
-                            parts.next();
-                            rss_shmem = parts.next().unwrap_or("0").parse().unwrap_or(0);
                         } else if line.starts_with("VmRSS:") {
                             let mut parts = line.split_whitespace();
                             parts.next();
-                            vm_rss = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                            p.rss_kb = parts.next().unwrap_or("0").parse().unwrap_or(0);
                         } else if line.starts_with("Uid:") {
                             let mut parts = line.split_whitespace();
                             parts.next();
                             p.uid = parts.next().unwrap_or("0").parse().unwrap_or(0);
                         }
-                    }
-                    if rss_anon + rss_shmem > 0 {
-                        p.rss_kb = rss_anon + rss_shmem;
-                    } else {
-                        p.rss_kb = vm_rss;
                     }
                 }
 
@@ -458,25 +1044,27 @@ pub fn read_processes(
                         .trim()
                         .to_string();
                     if !cmd.is_empty() {
-                        p.name = cmd;
+                        p.name = cmd.into();
                     }
                 }
 
                 p.user = users
                     .get(&p.uid)
                     .cloned()
-                    .unwrap_or_else(|| p.uid.to_string());
+                    .unwrap_or_else(|| p.uid.to_string())
+                    .into();
 
                 if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid))
                     && let Some(rparen) = stat.rfind(')')
                 {
                     let rest = &stat[rparen + 1..];
                     let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if parts.len() >= 18 {
+                    if parts.len() >= 20 {
                         p.ppid = parts[1].parse().unwrap_or(0);
                         p.utime = parts[11].parse().unwrap_or(0);
                         p.stime = parts[12].parse().unwrap_or(0);
                         p.threads = parts[17].parse().unwrap_or(0);
+                        p.starttime_ticks = parts[19].parse().unwrap_or(0);
                     }
                 }
 
@@ -499,69 +1087,107 @@ pub fn read_processes(
                 }
 
                 if let Ok(smaps) = fs::read_to_string(format!("/proc/{}/smaps_rollup", pid)) {
-                    let mut pss_anon = 0u64;
-                    let mut pss_shmem = 0u64;
-                    let mut pss_total = 0u64;
                     for line in smaps.lines() {
-                        if line.starts_with("Pss_Anon:") {
+                        if line.starts_with("Pss:") {
                             let mut parts = line.split_whitespace();
                             parts.next();
-                            pss_anon = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                        } else if line.starts_with("Pss_Shmem:") {
-                            let mut parts = line.split_whitespace();
-                            parts.next();
-                            pss_shmem = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                        } else if line.starts_with("Pss:") {
-                            let mut parts = line.split_whitespace();
-                            parts.next();
-                            pss_total = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                            p.pss_kb = parts.next().and_then(|value| value.parse().ok());
                         }
                     }
-                    if pss_anon + pss_shmem > 0 {
-                        p.pss_kb = pss_anon + pss_shmem;
-                    } else if pss_total > 0 {
-                        p.pss_kb = pss_total;
-                    }
-                }
-                if p.pss_kb == 0 {
-                    p.pss_kb = p.rss_kb;
                 }
 
-                let drm_gpu_kb = read_process_gpu_mem_kb(pid);
-                let nv_gpu_kb = nvidia_gpu_mem.get(&pid).copied().unwrap_or(0);
-                p.gpu_mem_kb = if drm_gpu_kb > 0 {
-                    drm_gpu_kb
-                } else {
-                    nv_gpu_kb
-                };
+                let (drm_gpu_kb, gpu_engine_ns, gpu_engine_capacity) = read_process_gpu_stats(pid);
+                let nv_gpu_kb = nvidia_gpu_mem.get(&pid).copied();
+                p.gpu_mem_kb = drm_gpu_kb.or(nv_gpu_kb);
+                if !gpu_engine_ns.is_empty() {
+                    p.gpu_sample = Some(Box::new(GpuProcessSample {
+                        engine_ns: gpu_engine_ns,
+                        engine_capacity: gpu_engine_capacity,
+                        ..Default::default()
+                    }));
+                }
 
                 if let Some(prev) = prev_procs.get(&pid)
                     && dt > 0.0
+                    && p.starttime_ticks != 0
+                    && p.starttime_ticks == prev.starttime_ticks
                 {
                     let delta_ticks = (p.utime + p.stime).saturating_sub(prev.utime + prev.stime);
                     p.cpu_percent = (delta_ticks as f64) / dt;
                     p.read_speed = p.read_bytes.saturating_sub(prev.read_bytes) as f64 / dt;
                     p.write_speed = p.write_bytes.saturating_sub(prev.write_bytes) as f64 / dt;
-                    p.net_rx_speed = p.read_speed * 0.45;
-                    p.net_tx_speed = p.write_speed * 0.35;
-                    if p.name.contains("firefox")
-                        || p.name.contains("chrome")
-                        || p.name.contains("vscode")
-                        || p.name.contains("codium")
-                        || p.name.contains("vesktop")
-                        || p.name.contains("Xorg")
-                        || p.name.contains("gnome")
-                        || p.name.contains("discord")
-                        || p.name.contains("steam")
+
+                    if let (Some(sample), Some(prev_sample)) =
+                        (p.gpu_sample.as_mut(), prev.gpu_sample.as_deref())
                     {
-                        p.gpu_percent = (p.cpu_percent * 0.75).min(100.0);
-                        if p.gpu_mem_kb == 0 {
-                            p.gpu_mem_kb = p.rss_kb / 3;
+                        let engine_set_unchanged = sample.engine_ns.len()
+                            == prev_sample.engine_ns.len()
+                            && sample
+                                .engine_ns
+                                .keys()
+                                .all(|engine| prev_sample.engine_ns.contains_key(engine));
+                        if engine_set_unchanged {
+                            let regressed = sample
+                                .engine_ns
+                                .iter()
+                                .any(|(engine, now)| now < &prev_sample.engine_ns[engine]);
+                            let recovered_after_dip = sample
+                                .engine_ns
+                                .iter()
+                                .any(|(engine, now)| now > &prev_sample.engine_ns[engine]);
+
+                            if regressed {
+                                sample.counter_regressed = true;
+                                for (engine, now) in &mut sample.engine_ns {
+                                    *now = (*now).max(prev_sample.engine_ns[engine]);
+                                }
+                            } else if prev_sample.counter_regressed && !recovered_after_dip {
+                                p.gpu_percent = None;
+                                sample.counter_regressed = true;
+                            } else {
+                                sample.engine_percent = sample
+                                    .engine_ns
+                                    .iter()
+                                    .map(|(engine, now)| {
+                                        let delta = now - prev_sample.engine_ns[engine];
+                                        let capacity = sample
+                                            .engine_capacity
+                                            .get(engine)
+                                            .copied()
+                                            .unwrap_or(1);
+                                        let percent = delta as f64
+                                            / (dt * 1_000_000_000.0 * capacity as f64)
+                                            * 100.0;
+                                        (engine.clone(), percent)
+                                    })
+                                    .collect();
+                                p.gpu_percent = sample
+                                    .engine_percent
+                                    .values()
+                                    .copied()
+                                    .reduce(f64::max)
+                                    .map(|value| value.clamp(0.0, 100.0));
+                                sample.counter_regressed = false;
+                            }
                         }
                     }
                 }
 
                 if p.rss_kb > 0 || !p.name.is_empty() {
+                    if let Some(prev) = prev_procs.get(&pid)
+                        && p.starttime_ticks != 0
+                        && p.starttime_ticks == prev.starttime_ticks
+                    {
+                        if p.comm == prev.comm {
+                            p.comm = prev.comm.clone();
+                        }
+                        if p.name == prev.name {
+                            p.name = prev.name.clone();
+                        }
+                        if p.user == prev.user {
+                            p.user = prev.user.clone();
+                        }
+                    }
                     new_prev_procs.insert(pid, p.clone());
                     procs.push(p);
                 }
@@ -577,22 +1203,50 @@ pub fn read_processes(
 /// # Arguments
 /// * `proc_info` - Baseline process info snapshot.
 /// * `proc_map` - Map of currently known processes for parent lookups.
+/// * `snapshot_is_historical` - Whether to keep the detail strictly snapshot-only.
 ///
 /// # Returns
 /// A populated `ProcessDetailInfo` structure.
 pub fn read_process_detail(
     proc_info: &ProcessInfo,
     proc_map: &HashMap<u32, &ProcessInfo>,
+    snapshot_is_historical: bool,
 ) -> ProcessDetailInfo {
     let pid = proc_info.pid;
     let mut detail = ProcessDetailInfo {
         info: proc_info.clone(),
+        snapshot_is_historical,
+        cmdline: proc_info.name.to_string(),
         ..Default::default()
     };
 
     if let Some(parent) = proc_map.get(&proc_info.ppid) {
-        detail.parent_comm = parent.comm.clone();
-    } else if let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", proc_info.ppid)) {
+        detail.parent_comm = parent.comm.to_string();
+    }
+    if snapshot_is_historical {
+        detail.cmdline = proc_info.name.to_string();
+        return detail;
+    }
+
+    let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) else {
+        return detail;
+    };
+    let Some(rparen) = stat.rfind(')') else {
+        return detail;
+    };
+    let parts: Vec<&str> = stat[rparen + 1..].split_whitespace().collect();
+    let Some(live_starttime) = parts.get(19).and_then(|value| value.parse::<u64>().ok()) else {
+        return detail;
+    };
+    if proc_info.starttime_ticks > 0 && proc_info.starttime_ticks != live_starttime {
+        detail.pid_reused = true;
+        return detail;
+    }
+    detail.live_metadata_available = true;
+
+    if detail.parent_comm.is_empty()
+        && let Ok(comm) = fs::read_to_string(format!("/proc/{}/comm", proc_info.ppid))
+    {
         detail.parent_comm = comm.trim().to_string();
     }
 
@@ -611,23 +1265,15 @@ pub fn read_process_detail(
             .to_string();
     }
     if detail.cmdline.is_empty() {
-        detail.cmdline = proc_info.name.clone();
+        detail.cmdline = proc_info.name.to_string();
     }
 
     if let Ok(entries) = fs::read_dir(format!("/proc/{}/fd", pid)) {
         detail.open_fds = entries.filter_map(Result::ok).count();
     }
 
-    if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid))
-        && let Some(rparen) = stat.rfind(')')
-    {
-        let rest = &stat[rparen + 1..];
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() >= 17 {
-            detail.priority = parts[15].parse().unwrap_or(0);
-            detail.nice = parts[16].parse().unwrap_or(0);
-        }
-    }
+    detail.priority = parts[15].parse().unwrap_or(0);
+    detail.nice = parts[16].parse().unwrap_or(0);
 
     if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
         for line in status.lines() {
@@ -1177,26 +1823,45 @@ pub fn group_processes_for_simple_view(
             continue;
         }
         let root = list.iter().min_by_key(|p| p.pid).copied().unwrap();
+        // The table reports RSS for every row, so a group's value is the sum of
+        // its members' RSS values as well. Shared pages can therefore be counted
+        // more than once, as RSS semantics require.
         let total_rss_kb: u64 = list.iter().map(|p| p.rss_kb).sum();
-        let total_pss_kb: u64 = list.iter().map(|p| p.pss_kb).sum();
-        let effective_mem_kb = if total_pss_kb > 0 {
-            total_pss_kb
-        } else {
-            total_rss_kb
-        };
+        let total_pss_kb = sum_optional_u64(list.iter().map(|p| p.pss_kb));
         let total_cpu_pct: f64 = list.iter().map(|p| p.cpu_percent).sum();
-        let total_gpu_pct: f64 = list.iter().map(|p| p.gpu_percent).sum();
-        let total_gpu_mem_kb: u64 = list.iter().map(|p| p.gpu_mem_kb).sum();
+        let mut group_engine_percent: HashMap<String, f64> = HashMap::new();
+        for p in list {
+            if let Some(sample) = &p.gpu_sample {
+                for (engine, percent) in &sample.engine_percent {
+                    *group_engine_percent.entry(engine.clone()).or_default() += percent;
+                }
+            }
+        }
+        let total_gpu_pct = group_engine_percent
+            .values()
+            .copied()
+            .reduce(f64::max)
+            .map(|value| value.clamp(0.0, 100.0));
+        let total_gpu_mem_kb = sum_optional_u64(list.iter().map(|p| p.gpu_mem_kb));
         let total_read_speed: f64 = list.iter().map(|p| p.read_speed).sum();
         let total_write_speed: f64 = list.iter().map(|p| p.write_speed).sum();
-        let total_net_rx_speed: f64 = list.iter().map(|p| p.net_rx_speed).sum();
-        let total_net_tx_speed: f64 = list.iter().map(|p| p.net_tx_speed).sum();
+        let total_net_rx_speed = list
+            .iter()
+            .filter_map(|p| p.net_rx_speed)
+            .reduce(|a, b| a + b);
+        let total_net_tx_speed = list
+            .iter()
+            .filter_map(|p| p.net_tx_speed)
+            .reduce(|a, b| a + b);
+        let net_partial = list
+            .iter()
+            .any(|p| p.net_rx_speed.is_none() || p.net_tx_speed.is_none() || p.net_partial);
         let total_threads: u32 = list.iter().map(|p| p.threads).sum();
         let all_pids: Vec<u32> = list.iter().map(|p| p.pid).collect();
 
         if list.len() == 1 {
             let mut clean_p = root.clone();
-            clean_p.name = clean_process_command(&root.name);
+            clean_p.name = clean_process_command(&root.name).into();
             clean_p.grouped_pids = vec![root.pid];
             clean_p.is_group_header = false;
             clean_p.is_group_child = false;
@@ -1220,7 +1885,8 @@ pub fn group_processes_for_simple_view(
                 let tab_count = list
                     .iter()
                     .filter(|p| {
-                        p.comm == "Isolated Web Co" || p.name.starts_with("Isolated Web Co")
+                        p.comm.as_ref() == "Isolated Web Co"
+                            || p.name.starts_with("Isolated Web Co")
                     })
                     .count();
                 if tab_count > 1 {
@@ -1235,7 +1901,8 @@ pub fn group_processes_for_simple_view(
                 let tab_count = list
                     .iter()
                     .filter(|p| {
-                        p.comm == "Isolated Web Co" || p.name.starts_with("Isolated Web Co")
+                        p.comm.as_ref() == "Isolated Web Co"
+                            || p.name.starts_with("Isolated Web Co")
                     })
                     .count();
                 if tab_count > 1 {
@@ -1275,13 +1942,14 @@ pub fn group_processes_for_simple_view(
             pid: root.pid,
             ppid: root.ppid,
             comm: root.comm.clone(),
-            name: header_name,
+            name: header_name.into(),
             state: if list.iter().any(|p| p.state == "R") {
                 "R".to_string()
             } else {
                 root.state.clone()
             },
-            rss_kb: effective_mem_kb,
+            rss_kb: total_rss_kb,
+            starttime_ticks: root.starttime_ticks,
             pss_kb: total_pss_kb,
             utime: root.utime,
             stime: root.stime,
@@ -1295,7 +1963,14 @@ pub fn group_processes_for_simple_view(
             write_speed: total_write_speed,
             net_rx_speed: total_net_rx_speed,
             net_tx_speed: total_net_tx_speed,
+            net_partial,
             gpu_percent: total_gpu_pct,
+            gpu_sample: (!group_engine_percent.is_empty()).then(|| {
+                Box::new(GpuProcessSample {
+                    engine_percent: group_engine_percent,
+                    ..Default::default()
+                })
+            }),
             gpu_mem_kb: total_gpu_mem_kb,
             grouped_pids: all_pids,
             is_group_header: true,
@@ -1307,7 +1982,7 @@ pub fn group_processes_for_simple_view(
     // Build cleaned ungrouped entries
     for p in ungrouped {
         let mut clean_p = p.clone();
-        clean_p.name = clean_process_command(&p.name);
+        clean_p.name = clean_process_command(&p.name).into();
         clean_p.grouped_pids = vec![p.pid];
         clean_p.is_group_header = false;
         clean_p.is_group_child = false;
@@ -1362,17 +2037,12 @@ pub fn group_processes_for_simple_view(
                 let child_clean = if raw_clean.is_empty() {
                     child.comm.clone()
                 } else {
-                    raw_clean
+                    raw_clean.into()
                 };
                 let child_display = format!("{branch}{child_clean}");
 
                 let mut child_info = child;
-                child_info.name = child_display;
-                child_info.rss_kb = if child_info.pss_kb > 0 {
-                    child_info.pss_kb
-                } else {
-                    child_info.rss_kb
-                };
+                child_info.name = child_display.into();
                 child_info.grouped_pids = vec![child_info.pid];
                 child_info.is_group_header = false;
                 child_info.is_group_child = true;
@@ -1530,51 +2200,50 @@ mod tests {
         let procs = vec![
             ProcessInfo {
                 pid: 100,
-                comm: "Isolated Web Co".to_string(),
-                name: "/nix/store/123-librewolf/lib/librewolf/librewolf".to_string(),
+                comm: "Isolated Web Co".into(),
+                name: "/nix/store/123-librewolf/lib/librewolf/librewolf".into(),
                 cpu_percent: 5.0,
                 rss_kb: 500_000,
-                pss_kb: 300_000,
+                pss_kb: Some(300_000),
                 threads: 30,
                 ..Default::default()
             },
             ProcessInfo {
                 pid: 105,
-                comm: "Isolated Web Co".to_string(),
-                name: "/nix/store/123-librewolf/lib/librewolf/librewolf -contentproc 1 tab"
-                    .to_string(),
+                comm: "Isolated Web Co".into(),
+                name: "/nix/store/123-librewolf/lib/librewolf/librewolf -contentproc 1 tab".into(),
                 cpu_percent: 10.0,
                 rss_kb: 300_000,
-                pss_kb: 150_000,
+                pss_kb: Some(150_000),
                 threads: 15,
                 ..Default::default()
             },
             ProcessInfo {
                 pid: 200,
-                name: "/usr/bin/git status".to_string(),
+                name: "/usr/bin/git status".into(),
                 cpu_percent: 0.1,
                 rss_kb: 10_000,
-                pss_kb: 10_000,
+                pss_kb: Some(10_000),
                 threads: 1,
                 ..Default::default()
             },
             ProcessInfo {
                 pid: 300,
                 name: "/nix/store/123-electron/electron /nix/store/456-vesktop/resources/app.asar"
-                    .to_string(),
+                    .into(),
                 cpu_percent: 2.0,
                 rss_kb: 150_000,
-                pss_kb: 100_000,
+                pss_kb: Some(100_000),
                 threads: 10,
                 ..Default::default()
             },
             ProcessInfo {
                 pid: 301,
                 ppid: 300,
-                name: "/nix/store/123-electron/electron --type=zygote".to_string(),
+                name: "/nix/store/123-electron/electron --type=zygote".into(),
                 cpu_percent: 1.0,
                 rss_kb: 80_000,
-                pss_kb: 40_000,
+                pss_kb: Some(40_000),
                 threads: 4,
                 ..Default::default()
             },
@@ -1595,24 +2264,24 @@ mod tests {
             .find(|p| p.name.contains("LibreWolf"))
             .unwrap();
         assert_eq!(librewolf.pid, 100);
-        assert_eq!(librewolf.name, "▶ LibreWolf [2 Tabs]");
+        assert_eq!(librewolf.name.as_ref(), "▶ LibreWolf [2 Tabs]");
         assert_eq!(librewolf.cpu_percent, 15.0);
-        assert_eq!(librewolf.rss_kb, 450_000);
-        assert_eq!(librewolf.pss_kb, 450_000);
+        assert_eq!(librewolf.rss_kb, 800_000);
+        assert_eq!(librewolf.pss_kb, Some(450_000));
         assert_eq!(librewolf.threads, 45);
         assert_eq!(librewolf.grouped_pids, vec![100, 105]);
 
         let vesktop = grouped.iter().find(|p| p.name.contains("Vesktop")).unwrap();
         assert_eq!(vesktop.pid, 300);
-        assert_eq!(vesktop.name, "▶ Vesktop");
+        assert_eq!(vesktop.name.as_ref(), "▶ Vesktop");
         assert_eq!(vesktop.cpu_percent, 3.0);
-        assert_eq!(vesktop.rss_kb, 140_000);
-        assert_eq!(vesktop.pss_kb, 140_000);
+        assert_eq!(vesktop.rss_kb, 230_000);
+        assert_eq!(vesktop.pss_kb, Some(140_000));
         assert_eq!(vesktop.threads, 14);
         assert_eq!(vesktop.grouped_pids, vec![300, 301]);
 
         let git = grouped.iter().find(|p| p.name.contains("git")).unwrap();
-        assert_eq!(git.name, "git status");
+        assert_eq!(git.name.as_ref(), "git status");
         assert_eq!(git.grouped_pids, vec![200]);
 
         // Test expanded state
@@ -1738,8 +2407,8 @@ mod tests {
         let dbus_proc = ProcessInfo {
             pid: 500,
             ppid: 1,
-            comm: "dbus-daemon".to_string(),
-            name: "dbus-daemon --system".to_string(),
+            comm: "dbus-daemon".into(),
+            name: "dbus-daemon --system".into(),
             state: "S".to_string(),
             rss_kb: 4096,
             cpu_percent: 0.1,
@@ -1748,8 +2417,8 @@ mod tests {
         let llama_proc = ProcessInfo {
             pid: 1200,
             ppid: 500, // Spawned via D-Bus activation or child of dbus-daemon
-            comm: "llama-server".to_string(),
-            name: "llama-server -m /models/test.gguf".to_string(),
+            comm: "llama-server".into(),
+            name: "llama-server -m /models/test.gguf".into(),
             state: "R".to_string(),
             rss_kb: 8192000,
             cpu_percent: 25.0,
@@ -1758,8 +2427,8 @@ mod tests {
         let node_proc = ProcessInfo {
             pid: 1201,
             ppid: 500,
-            comm: "node".to_string(),
-            name: "node /app/server.js".to_string(),
+            comm: "node".into(),
+            name: "node /app/server.js".into(),
             state: "S".to_string(),
             rss_kb: 65536,
             cpu_percent: 1.0,
@@ -1793,8 +2462,8 @@ mod tests {
         let proc_info = ProcessInfo {
             pid: current_pid,
             ppid: 1,
-            comm: "toptop_test".to_string(),
-            name: "toptop_test".to_string(),
+            comm: "toptop_test".into(),
+            name: "toptop_test".into(),
             state: "R".to_string(),
             rss_kb: 1024,
             cpu_percent: 5.0,
@@ -1803,9 +2472,9 @@ mod tests {
         let mut proc_map = HashMap::new();
         proc_map.insert(current_pid, &proc_info);
 
-        let detail = read_process_detail(&proc_info, &proc_map);
+        let detail = read_process_detail(&proc_info, &proc_map, false);
         assert_eq!(detail.info.pid, current_pid);
-        assert_eq!(detail.info.comm, "toptop_test");
+        assert_eq!(detail.info.comm.as_ref(), "toptop_test");
         assert!(!detail.cmdline.is_empty());
         assert!(!detail.cwd_path.is_empty());
         assert!(detail.open_fds > 0);
